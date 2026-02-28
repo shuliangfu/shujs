@@ -23,18 +23,50 @@
 
 ### 🔗 一、整体依赖关系
 
-```text
-运行时核心 (已有) → 转译 strip (已有)
-                        ↓
-    ┌───────────────────┼───────────────────┐
-    ↓                   ↓                   ↓
-package.json 解析      shu:build 服务端     shu:test 单元 (已有)
-+ 裸说明符→路径            ↓                   ↓
-    ↓                   shu:build 客户端     浏览器测试运行
-    └──────→ shu:build bundle ←──────────────┘
-              (bundle 需解析 node_modules)
-    ↓
-shu install（下载、写 node_modules，可晚于「解析」）
+```mermaid
+flowchart TB
+  subgraph 已有["✅ 已有"]
+    direction TB
+    A["运行时核心<br/>━━━━━━━━━━━━━━━━<br/>engine.zig / vm.zig / bindings / io_core<br/>JSC、require、ESM、run_options、权限<br/>事件循环；Darwin kqueue / Linux io_uring / Windows IOCP"]
+    B["转译 strip<br/>━━━━━━━━━━━━━━━━<br/>transpiler/strip_types.zig<br/>TS/TSX 类型擦除：: Type、泛型等<br/>供 shu run 与 shu:module.stripTypeScriptTypes 使用"]
+    A --> B
+  end
+
+  B --> C
+  B --> D
+  B --> T1
+
+  subgraph 解析链["📦 解析链"]
+    direction TB
+    C["package.json 解析<br/>━━━━━━━━━━━━━━━━<br/>package/manifest.zig：load、结构定义<br/>解析 main / exports / dependencies<br/>与 require、build 共用解析能力"]
+    C2["裸说明符→路径<br/>━━━━━━━━━━━━━━━━<br/>沿父目录查 node_modules/&lt;spec&gt;<br/>包内入口需 manifest 解析 main/exports<br/>resolveRequest、与 build --bundle 对齐"]
+    C --> C2
+  end
+
+  subgraph 构建链["🔨 构建链"]
+    direction TB
+    D["shu:build 服务端<br/>━━━━━━━━━━━━━━━━<br/>shu build entry -o out<br/>单入口 strip 后写出 JS，不读 package.json<br/>验收：shu run dist/main.js 可执行"]
+    E["shu:build 客户端<br/>━━━━━━━━━━━━━━━━<br/>--target=browser；JSX 转译<br/>产出可被浏览器加载的 ESM/CJS<br/>供浏览器测试与前端入口使用"]
+    D --> E
+  end
+
+  subgraph 测试链["🧪 测试链"]
+    direction TB
+    T1["shu:test 单元<br/>━━━━━━━━━━━━━━━━<br/>describe / it / test、runner.zig<br/>beforeAll、afterAll、skip、todo、only、run()<br/>buildJobList DFS、Promise 驱动"]
+    T2["浏览器测试运行<br/>━━━━━━━━━━━━━━━━<br/>shu test --browser<br/>先 build 再启动无头浏览器<br/>结果 window.__shuBrowserTestResults 或 postMessage"]
+    T1 --> T2
+  end
+
+  C2 --> F
+  E --> F
+  T2 --> F
+
+  subgraph 汇聚["📋 打包与安装"]
+    direction TB
+    F["shu:build bundle<br/>━━━━━━━━━━━━━━━━<br/>解析 import 建依赖图；裸说明符调 package 解析<br/>strip + 拓扑合并；支持 --external<br/>依赖：能解析 node_modules 内包入口（main/exports）"]
+    G["shu install<br/>━━━━━━━━━━━━━━━━<br/>可晚于「解析」；下载 dependencies、锁文件、tarball<br/>解压写入 node_modules<br/>与「解析已有 node_modules」可并行排期"]
+    F --> G
+  end
 ```
 
 - [ ] **build 单文件**（服务端/客户端）：只读入口做 strip/JSX，**不依赖** package.json。
