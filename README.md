@@ -192,7 +192,6 @@ flowchart TB
 | [ ] | **src/transpiler/** | 类型擦除 strip_types、ts 转译、jsx | strip 已有；ts/jsx 占位 |
 | [ ] | **src/bundler/** | 打包：ast、parse、emit | 占位，依赖 parser + transpiler |
 | [x] | **src/runtime/** | 运行时：引擎、绑定、模块、io_core、compat | 核心已有 |
-| [x] | **src/test/** | Zig 单元测试（runner、expect、jest_api、browser） | 已有，供 `zig build test` |
 
 **runtime 子目录**：bindings、compat(bun/deno/node)、engine、io_core、modules(shu/node/bun/deno)、vm、jsc 等；modules/shu 下各内置模块（fs、server、test、timers…）随功能迭代。
 
