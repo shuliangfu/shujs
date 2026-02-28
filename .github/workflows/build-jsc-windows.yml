@@ -1,0 +1,81 @@
+# 在 GitHub 提供的 Windows runner 上构建 WebKit JavaScriptCore（jsc-only），产出供 shu 在 Windows 上链接用的 include/ 与 lib/。
+# 无 Windows 本机时：推送到 GitHub 后，到 Actions 页选择 "Build JSC for Windows" → "Run workflow" 触发；
+# 构建完成后在该次运行的页面底部 "Artifacts" 里下载 install-windows.zip，解压到 Windows 本机后 zig build -Djsc_prefix=解压路径。
+# 参考：https://docs.webkit.org/Ports/WindowsPort.html
+
+name: Build JSC for Windows
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout shu-core
+        uses: actions/checkout@v4
+        with:
+          path: shu-core
+
+      # 使用 partial clone + 单分支 + 浅克隆，减少初始传输；checkout 阶段再拉取文件内容（总下载量仍较大，但分步进行）
+      - name: Clone WebKit (partial, shallow)
+        run: |
+          git clone --depth 1 --filter=blob:none --single-branch https://github.com/WebKit/WebKit.git "$env:GITHUB_WORKSPACE\WebKit"
+        working-directory: ${{ github.workspace }}
+
+      - name: Populate WebKit working tree (fetch blobs)
+        run: |
+          cd "$env:GITHUB_WORKSPACE\WebKit" && git checkout -f HEAD
+        working-directory: ${{ github.workspace }}
+
+      # WebKit Windows 构建依赖 vcpkg（工具链与依赖）；需先安装并设置 VCPKG_ROOT（Windows 用 .bat 引导，无 .ps1）
+      - name: Install vcpkg
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/Microsoft/vcpkg.git "$env:GITHUB_WORKSPACE\vcpkg"
+          Push-Location "$env:GITHUB_WORKSPACE\vcpkg"
+          cmd /c bootstrap-vcpkg.bat
+          Pop-Location
+          echo "VCPKG_ROOT=$env:GITHUB_WORKSPACE\vcpkg" >> $env:GITHUB_ENV
+
+      # WebKit Windows 端口使用 clang-cl 并依赖 clang_rt.builtins；需安装 LLVM（含 compiler-rt）
+      - name: Install build dependencies (Chocolatey)
+        shell: pwsh
+        run: |
+          choco install -y cmake ninja perl python ruby gperf llvm
+          refreshenv
+        continue-on-error: true
+
+      # 加载 VS 开发者环境（clang-cl 会调用 MSVC 的 link/lib，仍需 VS 环境）
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Set WebKit env and build JSC
+        shell: pwsh
+        env:
+          WEBKIT_SRC: ${{ github.workspace }}\WebKit
+          OUTPUT_DIR: ${{ github.workspace }}\install-windows
+          VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+          # 强制使用 clang-cl，否则 WebKit 会用到 MSVC cl 且找不到 clang_rt.builtins
+          CC: clang-cl
+          CXX: clang-cl
+        run: |
+          # Chocolatey 的 bin 与 LLVM bin 需在 PATH 前，以便找到 Ninja 和 clang-cl
+          $llvmBin = "C:\Program Files\LLVM\bin"
+          if (Test-Path $llvmBin) { $env:Path = "$llvmBin;C:\ProgramData\chocolatey\bin;$env:Path" }
+          else { $env:Path = "C:\ProgramData\chocolatey\bin;$env:Path" }
+          $env:WEBKIT_OUTPUTDIR = "$env:WEBKIT_SRC\WebKitBuild"
+          if (Test-Path "$env:WEBKIT_SRC\WebKitLibraries\win") {
+            $env:WEBKIT_LIBRARIES = "$env:WEBKIT_SRC\WebKitLibraries\win"
+          }
+          & "$env:GITHUB_WORKSPACE\shu-core\deps\build-jsc-for-windows.ps1"
+
+      - name: Upload install-windows
+        uses: actions/upload-artifact@v4
+        with:
+          name: install-windows
+          path: ${{ github.workspace }}/install-windows
+          if-no-files-found: warn

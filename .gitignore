@@ -1,0 +1,48 @@
+# Zig 构建产物（.zig-cache 为 zig build 默认缓存目录，带点）
+zig-out/
+.zig-cache/
+zig-cache/
+# 静态库（如手动的 zig build-lib 产生的 libmain.a）
+*.a
+libmain.a
+
+# 依赖与包
+node_modules/
+deps/.bun-webkit-tmp/
+deps/README.md
+# Windows JSC 调试符号（超过 GitHub 100MB 限制，链接不需要）
+deps/**/*.pdb
+
+# Deno 缓存
+.deno/
+
+# 构建输出
+dist/
+build/
+out/
+
+# 锁文件（若需纳入版本控制可删除此行）
+# bun.lock
+# package-lock.json
+
+# 环境与本地配置
+.env
+.env.local
+*.local
+
+# 编辑器与系统
+.cursor
+.DS_Store
+*.swp
+*.swo
+*~
+Thumbs.db
+
+# 测试与覆盖率
+coverage/
+*.profraw
+*.profdata
+
+# 日志
+*.log
+logs/

@@ -1,0 +1,117 @@
+# 自动构建 Mac / Linux / Windows 版 shu，并随 Release 发布
+# 触发：推送 main 上的 tag（如 v1.0.0）→ 构建并创建 Release 上传产物；或手动 Run workflow
+# 依赖：deps/install-linux、deps/install-windows 已提交；Mac 用系统 JSC，直接 zig build
+
+name: Publish
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch: {}
+
+jobs:
+  build-mac:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: "0.15.2"
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Stage artifact
+        run: |
+          mkdir -p staging
+          cp zig-out/bin/shu staging/shu-macos-$(uname -m)
+
+      - name: Upload shu-macos
+        uses: actions/upload-artifact@v4
+        with:
+          name: shu-macos
+          path: staging/
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: "0.15.2"
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Stage artifact
+        run: |
+          mkdir -p staging
+          cp zig-out/bin/shu staging/shu-linux-x86_64
+
+      - name: Upload shu-linux
+        uses: actions/upload-artifact@v4
+        with:
+          name: shu-linux
+          path: staging/
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: "0.15.2"
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path staging | Out-Null
+          Copy-Item "zig-out\bin\shu.exe" "staging\shu-windows-x86_64.exe"
+
+      - name: Upload shu-windows
+        uses: actions/upload-artifact@v4
+        with:
+          name: shu-windows
+          path: staging/
+
+  upload-release:
+    needs: [build-mac, build-linux, build-windows]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: find artifacts -type f
+
+      - name: Create Release and upload
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          files: |
+            artifacts/shu-macos/*
+            artifacts/shu-linux/*
+            artifacts/shu-windows/*
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

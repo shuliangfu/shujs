@@ -1,0 +1,16 @@
+# i18n-ally 自定义框架：识别 Zig 运行时自用 i18n（i18n.t / i18n.fmt）
+# 文档: https://github.com/lokalise/i18n-ally/wiki/Custom-Framework
+# monopoly: true 表示仅启用此自定义框架，禁用 react/i18next/general 等内置框架
+monopoly: true
+
+languageIds:
+  - zig
+
+# key 均为第一参数，与 t("key") 一致，便于扩展识别
+usageMatchRegex:
+  - '[^\\w\\d]i18n\\.t\\(\"({key})\"\\)'
+  - '[^\\w\\d]i18n\\.fmt\\(\"({key})\"[^)]*\\)'
+
+refactorTemplates:
+  - 'i18n.t("$1")'
+  - 'i18n.fmt("$1", allocator, .{})'
