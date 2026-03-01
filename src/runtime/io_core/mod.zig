@@ -41,6 +41,44 @@ pub const MappedFileWritable = @import("mmap.zig").MappedFileWritable;
 pub const mapFileReadOnly = @import("mmap.zig").mapFileReadOnly;
 pub const mapFileReadWrite = @import("mmap.zig").mapFileReadWrite;
 
+// 统一文件/目录 API（同步 + AsyncFileIO）；Linux/Darwin/Windows 三种 AsyncFileIO 实现均在 file.zig 内，由 mod 统一导出
+const file = @import("file.zig");
+pub const File = file.File;
+pub const Dir = file.Dir;
+pub const FileOpenFlags = file.FileOpenFlags;
+pub const FileCreateFlags = file.FileCreateFlags;
+pub const DirOpenOptions = file.DirOpenOptions;
+pub const DirSymLinkFlags = file.DirSymLinkFlags;
+pub const DirCopyFileOptions = file.DirCopyFileOptions;
+pub const FileOpenError = file.FileOpenError;
+pub const openFileAbsolute = file.openFileAbsolute;
+pub const createFileAbsolute = file.createFileAbsolute;
+pub const openDirAbsolute = file.openDirAbsolute;
+pub const openDirCwd = file.openDirCwd;
+pub const realpath = file.realpath;
+pub const makeDirAbsolute = file.makeDirAbsolute;
+pub const makePathAbsolute = file.makePathAbsolute;
+pub const deleteFileAbsolute = file.deleteFileAbsolute;
+pub const deleteDirAbsolute = file.deleteDirAbsolute;
+pub const renameAbsolute = file.renameAbsolute;
+pub const accessAbsolute = file.accessAbsolute;
+pub const readLinkAbsolute = file.readLinkAbsolute;
+pub const symLinkAbsolute = file.symLinkAbsolute;
+pub const max_path_bytes = file.max_path_bytes;
+pub const copyFileAbsolute = file.copyFileAbsolute;
+pub const deleteTreeAbsolute = file.deleteTreeAbsolute;
+pub const pathDirname = file.pathDirname;
+pub const pathBasename = file.pathBasename;
+pub const pathExtension = file.pathExtension;
+pub const pathIsAbsolute = file.pathIsAbsolute;
+pub const pathJoin = file.pathJoin;
+pub const pathResolve = file.pathResolve;
+pub const pathRelative = file.pathRelative;
+/// 从 std.io.Reader 分块读取最多 max_bytes，避免 gzip 等解压流触发 Writer.rebase；供 registry 等 HTTP 响应体读取。调用方 free 返回的切片。
+pub const readReaderUpTo = file.readReaderUpTo;
+/// 异步文件 I/O：submitReadFile/submitWriteFile + pollCompletions 返回 tag=file_read/file_write；三平台实现均在 file.zig 内
+pub const AsyncFileIO = file.AsyncFileIO;
+
 // 按 OS 选择实现，编译时只包含当前平台
 const backend = switch (builtin.os.tag) {
     .linux => @import("linux.zig"),
@@ -54,6 +92,3 @@ pub const HighPerfIO = backend.HighPerfIO;
 
 /// 零拷贝：文件 → 网络（Linux sendfile / Darwin sendfile / Windows TransmitFile），符合 00-性能规范 §3.4、§4
 pub const sendFile = backend.sendFile;
-
-/// 异步文件 I/O：submitReadFile/submitWriteFile + pollCompletions 返回 tag=file_read/file_write；Linux 用独立 io_uring，Darwin/Windows 用工作线程
-pub const AsyncFileIO = backend.AsyncFileIO;

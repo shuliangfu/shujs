@@ -94,11 +94,16 @@ pub fn main() !void {
         return;
     }
     if (std.mem.eql(u8, subcommand, "install") or std.mem.eql(u8, subcommand, "-i")) {
-        try cli_install.install(allocator, parse_result.parsed, parse_result.positional);
+        cli_install.install(allocator, parse_result.parsed, parse_result.positional) catch {
+            // 错误信息已由 install 打印，此处仅退出码，避免 Debug 下打印错误栈
+            std.process.exit(1);
+        };
         return;
     }
     if (std.mem.eql(u8, subcommand, "add")) {
-        try cli_add.add(allocator, parse_result.parsed, parse_result.positional);
+        cli_add.add(allocator, parse_result.parsed, parse_result.positional) catch {
+            std.process.exit(1);
+        };
         return;
     }
     if (std.mem.eql(u8, subcommand, "build")) {

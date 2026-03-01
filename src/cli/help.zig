@@ -1,7 +1,16 @@
-// shu help 子命令：集中输出全局用法与各子命令简要说明
-// 支持 shu help、shu help <subcommand>；--help 仍由 main 与各子命令处理
-// 输出格式对齐 deno -h：分组 Commands（Execution / Dependency / Tooling 等）
-// 在 TTY 下使用 ANSI 颜色美化；管道/重定向时自动禁用颜色
+//! shu help 子命令（cli/help.zig）
+//!
+//! 职责
+//!   - 集中输出全局用法与各子命令简要说明：shu help、shu help <subcommand>；--help 仍由 main 与各子命令各自处理。
+//!   - 输出格式对齐 deno -h：Usage、Options（--allow-all、各 --allow-*、--help）、分组 Commands（Execution / Dependency / Tooling 等）。
+//!   - 在 TTY 下使用 ANSI 颜色美化（SGR）；管道/重定向时自动禁用颜色。
+//!
+//! 主要 API
+//!   - printGlobalUsage()：打印主 help（Usage、Options、Commands 等）；供子命令 help 或 main 调用。
+//!   - help(allocator, positional)：子命令入口；若有 positional[0] 则打印该子命令说明，否则调用 printGlobalUsage()。
+//!
+//! 约定
+//!   - 所有面向用户的文案为英文；版本号从 version.zig 引用。
 
 const std = @import("std");
 const version = @import("version.zig");
@@ -31,7 +40,7 @@ const CmdHelp = struct { name: []const u8, desc: []const u8 };
 
 // --- 按 deno 风格分组 ---
 const Execution = [_]CmdHelp{
-    .{ .name = "run", .desc = "Run a .js/.ts/.tsx file or package.json script" },
+    .{ .name = "run", .desc = "Run a .js / .ts / .tsx file or package.json script" },
     .{ .name = "eval", .desc = "Evaluate code string (like node -e)" },
     .{ .name = "repl", .desc = "Start interactive REPL" },
     .{ .name = "task", .desc = "Run or list package.json scripts (alias: tasks)" },
@@ -111,10 +120,14 @@ pub fn printGlobalUsage() !void {
     try out.print("{s}Usage{s}: {s}shu [OPTIONS] [COMMAND]{s}\n\n", .{ sgr.cyan, sgr.reset, sgr.dim, sgr.reset });
     try out.print("{s}Options{s}:\n", .{ sgr.cyan, sgr.reset });
     try out.print("  {s}--version, -v{s}     Print version\n", .{ sgr.yellow, sgr.reset });
+    try out.print("  {s}--allow-all, -A{s}   Allow all permissions (Deno-aligned)\n", .{ sgr.yellow, sgr.reset });
     try out.print("  {s}--allow-net{s}       Allow network access\n", .{ sgr.yellow, sgr.reset });
     try out.print("  {s}--allow-read{s}      Allow file system read\n", .{ sgr.yellow, sgr.reset });
     try out.print("  {s}--allow-env{s}       Allow environment access\n", .{ sgr.yellow, sgr.reset });
     try out.print("  {s}--allow-write{s}     Allow file system write\n", .{ sgr.yellow, sgr.reset });
+    try out.print("  {s}--allow-run{s}       Allow running subprocesses\n", .{ sgr.yellow, sgr.reset });
+    try out.print("  {s}--allow-hrtime{s}    Allow high-resolution time\n", .{ sgr.yellow, sgr.reset });
+    try out.print("  {s}--allow-ffi{s}       Allow loading dynamic libraries\n", .{ sgr.yellow, sgr.reset });
     try out.print("  {s}--help, -h{s}        Show this help\n\n", .{ sgr.yellow, sgr.reset });
     try out.print("{s}Commands{s}:\n\n", .{ sgr.cyan, sgr.reset });
 

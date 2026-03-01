@@ -1,5 +1,5 @@
 // Shu.system 壳命令：exec(cmd [, options])、execSync(cmd [, options])
-// 执行 shell 命令，缓冲 stdout/stderr，返回 { stdout, stderr, code }；需 --allow-exec
+// 执行 shell 命令，缓冲 stdout/stderr，返回 { stdout, stderr, code }；需 --allow-run
 
 const std = @import("std");
 const jsc = @import("jsc");
@@ -71,7 +71,7 @@ pub fn register(ctx: jsc.JSGlobalContextRef, system_obj: jsc.JSObjectRef) void {
     common.setMethod(ctx, system_obj, "execSync", execSyncCallback);
 }
 
-/// Shu.system.exec(cmd [, options])：异步，返回 Promise<{ stdout, stderr, code }>；需 --allow-exec
+/// Shu.system.exec(cmd [, options])：异步，返回 Promise<{ stdout, stderr, code }>；需 --allow-run
 fn execCallback(
     ctx: jsc.JSContextRef,
     _: jsc.JSObjectRef,
@@ -81,8 +81,8 @@ fn execCallback(
     _: [*]jsc.JSValueRef,
 ) callconv(.c) jsc.JSValueRef {
     const opts = globals.current_run_options orelse return jsc.JSValueMakeUndefined(ctx);
-    if (!opts.permissions.allow_exec) {
-        errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.system.exec requires --allow-exec" }) catch {};
+    if (!opts.permissions.allow_run) {
+        errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.system.exec requires --allow-run" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
     if (argumentCount == 0) return jsc.JSValueMakeUndefined(ctx);
@@ -100,7 +100,7 @@ fn execCallback(
     return jsc.JSEvaluateScript(ctx, script_ref, null, null, 1, null);
 }
 
-/// Shu.system.execSync(cmd [, options])：同步，返回 { stdout, stderr, code }；需 --allow-exec
+/// Shu.system.execSync(cmd [, options])：同步，返回 { stdout, stderr, code }；需 --allow-run
 fn execSyncCallback(
     ctx: jsc.JSContextRef,
     _: jsc.JSObjectRef,
@@ -110,8 +110,8 @@ fn execSyncCallback(
     _: [*]jsc.JSValueRef,
 ) callconv(.c) jsc.JSValueRef {
     const opts = globals.current_run_options orelse return jsc.JSValueMakeUndefined(ctx);
-    if (!opts.permissions.allow_exec) {
-        errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.system.execSync requires --allow-exec" }) catch {};
+    if (!opts.permissions.allow_run) {
+        errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.system.execSync requires --allow-run" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
     if (argumentCount == 0) return jsc.JSValueMakeUndefined(ctx);

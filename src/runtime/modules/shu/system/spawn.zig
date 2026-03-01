@@ -1,5 +1,5 @@
 // Shu.system 子进程（流式）：spawn(options)、spawnSync(options)
-// 当前实现与 run 一致：同步收集 stdout/stderr，返回 { status, stdout, stderr }；需 --allow-exec
+// 当前实现与 run 一致：同步收集 stdout/stderr，返回 { status, stdout, stderr }；需 --allow-run
 
 const std = @import("std");
 const jsc = @import("jsc");
@@ -40,7 +40,7 @@ pub fn register(ctx: jsc.JSGlobalContextRef, system_obj: jsc.JSObjectRef) void {
     common.setMethod(ctx, system_obj, "spawnSync", spawnSyncCallback);
 }
 
-/// Shu.system.spawn(options)：异步，返回 Promise<{ status, stdout, stderr }>；需 --allow-exec
+/// Shu.system.spawn(options)：异步，返回 Promise<{ status, stdout, stderr }>；需 --allow-run
 fn spawnCallback(
     ctx: jsc.JSContextRef,
     _: jsc.JSObjectRef,
@@ -50,8 +50,8 @@ fn spawnCallback(
     _: [*]jsc.JSValueRef,
 ) callconv(.c) jsc.JSValueRef {
     const opts = globals.current_run_options orelse return jsc.JSValueMakeUndefined(ctx);
-    if (!opts.permissions.allow_exec) {
-        errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.system.spawn requires --allow-exec" }) catch {};
+    if (!opts.permissions.allow_run) {
+        errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.system.spawn requires --allow-run" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
     if (argumentCount == 0) return jsc.JSValueMakeUndefined(ctx);
@@ -63,7 +63,7 @@ fn spawnCallback(
     return jsc.JSObjectCallAsFunction(ctx, fn_obj, null, 1, arguments, null);
 }
 
-/// Shu.system.spawnSync(options)：同步，返回 { status, stdout, stderr }；需 --allow-exec
+/// Shu.system.spawnSync(options)：同步，返回 { status, stdout, stderr }；需 --allow-run
 fn spawnSyncCallback(
     ctx: jsc.JSContextRef,
     _: jsc.JSObjectRef,
@@ -73,8 +73,8 @@ fn spawnSyncCallback(
     _: [*]jsc.JSValueRef,
 ) callconv(.c) jsc.JSValueRef {
     const opts = globals.current_run_options orelse return jsc.JSValueMakeUndefined(ctx);
-    if (!opts.permissions.allow_exec) {
-        errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.system.spawnSync requires --allow-exec" }) catch {};
+    if (!opts.permissions.allow_run) {
+        errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.system.spawnSync requires --allow-run" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
     if (argumentCount == 0) return jsc.JSValueMakeUndefined(ctx);

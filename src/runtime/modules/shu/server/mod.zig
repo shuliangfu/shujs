@@ -296,13 +296,13 @@ fn serverCallback(
         return jsc.JSValueMakeUndefined(ctx);
     }
 
-    // options.workers：cluster 模式时主进程 fork 若干 worker，各 worker 同端口 listen（需 --allow-exec）
+    // options.workers：cluster 模式时主进程 fork 若干 worker，各 worker 同端口 listen（需 --allow-run）
     var workers_u = options.getOptionalNumber(ctx, options_obj, "workers", 1);
     if (workers_u < 1) workers_u = 1;
     if (workers_u > 64) workers_u = 64;
     const workers: usize = workers_u;
     const is_cluster_worker = (std.posix.getenv("SHU_CLUSTER_WORKER") != null);
-    const is_cluster_master = (workers > 1 and !is_cluster_worker and opts.permissions.allow_exec);
+    const is_cluster_master = (workers > 1 and !is_cluster_worker and opts.permissions.allow_run);
 
     const ws_options = options.getOptionalWebSocket(ctx, options_obj);
     const ws_registry = std.AutoHashMap(u32, WsSendEntry).init(allocator);

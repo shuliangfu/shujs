@@ -1,5 +1,5 @@
 // Shu.system 直接执行程序：run(options)、runSync(options)
-// options: { cmd: string[], cwd?, env?, stdout?, stderr?, timeout? }，不经过 shell；需 --allow-exec
+// options: { cmd: string[], cwd?, env?, stdout?, stderr?, timeout? }，不经过 shell；需 --allow-run
 
 const std = @import("std");
 const jsc = @import("jsc");
@@ -92,7 +92,7 @@ pub fn register(ctx: jsc.JSGlobalContextRef, system_obj: jsc.JSObjectRef) void {
     common.setMethod(ctx, system_obj, "runSync", runSyncCallback);
 }
 
-/// Shu.system.run(options)：异步，返回 Promise<{ status, stdout?, stderr? }>；需 --allow-exec
+/// Shu.system.run(options)：异步，返回 Promise<{ status, stdout?, stderr? }>；需 --allow-run
 fn runCallback(
     ctx: jsc.JSContextRef,
     _: jsc.JSObjectRef,
@@ -102,8 +102,8 @@ fn runCallback(
     _: [*]jsc.JSValueRef,
 ) callconv(.c) jsc.JSValueRef {
     const opts = globals.current_run_options orelse return jsc.JSValueMakeUndefined(ctx);
-    if (!opts.permissions.allow_exec) {
-        errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.system.run requires --allow-exec" }) catch {};
+    if (!opts.permissions.allow_run) {
+        errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.system.run requires --allow-run" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
     if (argumentCount == 0) return jsc.JSValueMakeUndefined(ctx);
@@ -116,7 +116,7 @@ fn runCallback(
     return result;
 }
 
-/// Shu.system.runSync(options)：同步，返回 { status, stdout, stderr }；需 --allow-exec
+/// Shu.system.runSync(options)：同步，返回 { status, stdout, stderr }；需 --allow-run
 fn runSyncCallback(
     ctx: jsc.JSContextRef,
     _: jsc.JSObjectRef,
@@ -126,8 +126,8 @@ fn runSyncCallback(
     _: [*]jsc.JSValueRef,
 ) callconv(.c) jsc.JSValueRef {
     const opts = globals.current_run_options orelse return jsc.JSValueMakeUndefined(ctx);
-    if (!opts.permissions.allow_exec) {
-        errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.system.runSync requires --allow-exec" }) catch {};
+    if (!opts.permissions.allow_run) {
+        errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.system.runSync requires --allow-run" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
     if (argumentCount == 0) return jsc.JSValueMakeUndefined(ctx);

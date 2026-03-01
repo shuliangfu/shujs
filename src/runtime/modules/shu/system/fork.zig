@@ -1,5 +1,5 @@
 // Shu.system fork：fork(modulePath [, args] [, options]) — Node 式
-// 启动子 Shu 进程运行指定脚本，通过 stdin/stdout 做 length-prefix IPC；需 --allow-exec
+// 启动子 Shu 进程运行指定脚本，通过 stdin/stdout 做 length-prefix IPC；需 --allow-run
 
 const std = @import("std");
 const jsc = @import("jsc");
@@ -84,8 +84,8 @@ fn forkCallback(
     _: [*]jsc.JSValueRef,
 ) callconv(.c) jsc.JSValueRef {
     const opts = globals.current_run_options orelse return jsc.JSValueMakeUndefined(ctx);
-    if (!opts.permissions.allow_exec) {
-        errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.system.fork requires --allow-exec" }) catch {};
+    if (!opts.permissions.allow_run) {
+        errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.system.fork requires --allow-run" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
     if (argumentCount == 0) return jsc.JSValueMakeUndefined(ctx);

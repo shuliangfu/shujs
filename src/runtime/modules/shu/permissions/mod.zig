@@ -4,7 +4,7 @@
 //
 // | API | 兼容 | 说明 |
 // |-----|------|------|
-// | has(scope?) | ✅ 已实现 | scope 为 'fs.read'/'fs.write'/'net'/'env'/'child' 等，映射到 --allow-read/--allow-write/--allow-net/--allow-env/--allow-exec |
+// | has(scope?) | ✅ 已实现 | scope 为 'fs.read'/'fs.write'/'net'/'env'/'child'/'run'/'hrtime'/'ffi' 等，与 Deno 对齐（--allow-run/--allow-hrtime/--allow-ffi）
 // | request(scope?) | ✅ 已实现 | 同 has，返回 { state: 'granted'|'denied' }；不改变权限，仅查询 |
 //
 
@@ -33,18 +33,21 @@ fn scopeGranted(scope: []const u8) bool {
         3 => {
             if (std.mem.eql(u8, scope, "net")) return p.allow_net;
             if (std.mem.eql(u8, scope, "env")) return p.allow_env;
+            if (std.mem.eql(u8, scope, "ffi")) return p.allow_ffi;
+            if (std.mem.eql(u8, scope, "run")) return p.allow_run;
             return false;
         },
         4 => {
             if (std.mem.eql(u8, scope, "read")) return p.allow_read;
-            if (std.mem.eql(u8, scope, "exec")) return p.allow_exec;
+            if (std.mem.eql(u8, scope, "exec")) return p.allow_run;
             return false;
         },
         5 => {
             if (std.mem.eql(u8, scope, "write")) return p.allow_write;
-            if (std.mem.eql(u8, scope, "child")) return p.allow_exec;
+            if (std.mem.eql(u8, scope, "child")) return p.allow_run;
             return false;
         },
+        6 => return std.mem.eql(u8, scope, "hrtime") and p.allow_hrtime,
         7 => return std.mem.eql(u8, scope, "fs.read") and p.allow_read,
         8 => {
             if (std.mem.eql(u8, scope, "fs.write")) return p.allow_write;
@@ -67,7 +70,7 @@ fn hasCallback(
     if (argumentCount < 1) {
         const opts = globals.current_run_options orelse return jsc.JSValueMakeBoolean(ctx, false);
         const p = opts.permissions;
-        const any = p.allow_read or p.allow_write or p.allow_net or p.allow_env or p.allow_exec;
+        const any = p.allow_read or p.allow_write or p.allow_net or p.allow_env or p.allow_run or p.allow_hrtime or p.allow_ffi;
         return jsc.JSValueMakeBoolean(ctx, any);
     }
     const scope = getScopeArg(ctx, argumentCount, arguments) orelse return jsc.JSValueMakeBoolean(ctx, false);
@@ -86,7 +89,7 @@ fn requestCallback(
     const granted = if (argumentCount < 1) blk: {
         const opts = globals.current_run_options orelse break :blk false;
         const p = opts.permissions;
-        break :blk p.allow_read or p.allow_write or p.allow_net or p.allow_env or p.allow_exec;
+        break :blk p.allow_read or p.allow_write or p.allow_net or p.allow_env or p.allow_run or p.allow_hrtime or p.allow_ffi;
     } else blk: {
         const scope = getScopeArg(ctx, argumentCount, arguments) orelse break :blk false;
         break :blk scopeGranted(scope);

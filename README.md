@@ -112,7 +112,7 @@ flowchart TB
 | [x] | **vm.zig** | VM 封装、run(source, entry_path) 按入口扩展名走 ESM 或 CJS |
 | [x] | **bindings** | 全局 API 注册（console、定时器、fetch、process、__dirname/__filename、Shu.*、Buffer、require、Bun.*、node:* 等） |
 | [x] | **run_options / permission** | 工作目录、argv、权限（allow_net/read/env/write/exec）、locale、is_forked |
-| [x] | **io_core** | 高并发 I/O：Darwin（kqueue）、Linux（io_uring）、Windows（IOCP）；ChunkAllocator、ThreadLocalChunkCache；SIMD 头部扫描（indexOfCrLfCrLf）；零拷贝解析与全链路不复制头部（见 `docs/IO_CORE_ROADMAP.md`） |
+| [x] | **io_core** | 高并发 I/O：Darwin（kqueue）、Linux（io_uring）、Windows（IOCP）；ChunkAllocator、ThreadLocalChunkCache；SIMD 头部扫描（indexOfCrLfCrLf）；零拷贝解析与全链路不复制头部 |
 
 ---
 
@@ -328,7 +328,7 @@ T8 cli check/lint/fmt（可选）
 
 | 操作 | 命令 |
 |------|------|
-| **构建** | `zig build`（需 Zig 0.15+；非 macOS 需 `-Djsc_prefix=<path>` 提供 WebKit JSC，见 `docs/PLATFORM_AND_JSC.md`） |
+| **构建** | `zig build`（需 Zig 0.15+；非 macOS 需 `-Djsc_prefix=<path>` 提供 WebKit JSC） |
 | **运行脚本** | `./zig-out/bin/shu run <entry>`（支持 `.js` / `.ts` / `.tsx`，TS 类型擦除后执行） |
 | **单元测试** | `zig build test`；运行时测试可用 `shu run path/to/test.mjs` 或后续 `shu test` |
 

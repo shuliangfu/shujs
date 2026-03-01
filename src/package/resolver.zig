@@ -1,9 +1,10 @@
 // 裸说明符解析：import map → node_modules → main/exports
 // 参考：docs/PACKAGE_DESIGN.md §2、§4
 // 与 require/mod.zig、esm_loader 对接，返回绝对路径供加载
-// TODO: migrate to io_core (rule §3.0); current dir/file existence checks via std.fs (openDirAbsolute, openFile)
+// 文件/目录与路径解析经 io_core（§3.0）
 
 const std = @import("std");
+const io_core = @import("io_core");
 const manifest = @import("manifest.zig");
 const export_map = @import("export_map.zig");
 const cache = @import("cache.zig");
@@ -27,7 +28,7 @@ fn findProjectRoot(allocator: std.mem.Allocator, start_dir: []const u8) ?[]const
     var dir = allocator.dupe(u8, start_dir) catch return null;
     defer allocator.free(dir);
     while (true) {
-        var d = std.fs.openDirAbsolute(dir, .{}) catch break;
+        var d = io_core.openDirAbsolute(dir, .{}) catch break;
         defer d.close();
         if (d.openFile("package.json", .{}) catch null) |file| {
             file.close();
@@ -45,7 +46,7 @@ fn findProjectRoot(allocator: std.mem.Allocator, start_dir: []const u8) ?[]const
             file.close();
             return allocator.dupe(u8, dir) catch null;
         }
-        const parent = std.fs.path.dirname(dir) orelse break;
+        const parent = io_core.pathDirname(dir) orelse break;
         if (std.mem.eql(u8, parent, dir)) break;
         const new_dir = allocator.dupe(u8, parent) catch break;
         allocator.free(dir);
@@ -60,12 +61,12 @@ fn findNodeModulesPackage(allocator: std.mem.Allocator, parent_dir: []const u8, 
     var dir = allocator.dupe(u8, parent_dir) catch return null;
     defer allocator.free(dir);
     while (true) {
-        const nm_path = std.fs.path.join(allocator, &.{ dir, "node_modules", specifier }) catch return null;
+        const nm_path = io_core.pathJoin(allocator, &.{ dir, "node_modules", specifier }) catch return null;
         defer allocator.free(nm_path);
-        var dir_handle = std.fs.openDirAbsolute(dir, .{}) catch break;
+        var dir_handle = io_core.openDirAbsolute(dir, .{}) catch break;
         defer dir_handle.close();
         var nm_handle = dir_handle.openDir("node_modules", .{}) catch {
-            const parent = std.fs.path.dirname(dir) orelse break;
+            const parent = io_core.pathDirname(dir) orelse break;
             if (std.mem.eql(u8, parent, dir)) break;
             const new_dir = allocator.dupe(u8, parent) catch break;
             allocator.free(dir);
@@ -74,7 +75,7 @@ fn findNodeModulesPackage(allocator: std.mem.Allocator, parent_dir: []const u8, 
         };
         defer nm_handle.close();
         var sub = nm_handle.openDir(specifier, .{}) catch {
-            const parent = std.fs.path.dirname(dir) orelse break;
+            const parent = io_core.pathDirname(dir) orelse break;
             if (std.mem.eql(u8, parent, dir)) break;
             const new_dir = allocator.dupe(u8, parent) catch break;
             allocator.free(dir);
@@ -82,7 +83,7 @@ fn findNodeModulesPackage(allocator: std.mem.Allocator, parent_dir: []const u8, 
             continue;
         };
         sub.close();
-        return std.fs.path.resolve(allocator, &.{ nm_path }) catch return null;
+        return io_core.pathResolve(allocator, &.{ nm_path }) catch return null;
     }
     return null;
 }
@@ -116,12 +117,12 @@ fn resolvePackageEntry(
         const entry_rel = try export_map.resolve(allocator, exp, subpath, condition);
         if (entry_rel) |res| {
             defer if (res.caller_owns) allocator.free(res.path);
-            return std.fs.path.join(allocator, &.{ pkg_dir, res.path });
+            return io_core.pathJoin(allocator, &.{ pkg_dir, res.path });
         }
     }
     if (subpath.len > 0) return error.PackagePathNotExported;
-    if (m.main) |main_val| return std.fs.path.join(allocator, &.{ pkg_dir, main_val });
-    return std.fs.path.join(allocator, &.{ pkg_dir, "index.js" });
+    if (m.main) |main_val| return io_core.pathJoin(allocator, &.{ pkg_dir, main_val });
+    return io_core.pathJoin(allocator, &.{ pkg_dir, "index.js" });
 }
 
 /// 解析说明符为绝对文件路径。顺序：协议/内置不处理；import map；相对/绝对路径；https:（仅支持，从缓存解析）；jsr:；裸说明符 node_modules + main/exports。http:// 不支持。
@@ -151,8 +152,8 @@ pub fn resolve(
         }
     }
 
-    if (path_part.len >= 1 and (path_part[0] == '.' or std.fs.path.isAbsolute(path_part))) {
-        const file_path = try std.fs.path.resolve(allocator, &.{ parent_dir, path_part });
+    if (path_part.len >= 1 and (path_part[0] == '.' or io_core.pathIsAbsolute(path_part))) {
+        const file_path = try io_core.pathResolve(allocator, &.{ parent_dir, path_part });
         errdefer allocator.free(file_path);
         const cache_key = if (query.len == 0) file_path else try std.mem.concat(allocator, u8, &.{ file_path, query });
         return .{ .file_path = file_path, .cache_key = cache_key };

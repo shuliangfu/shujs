@@ -64,10 +64,10 @@
 | Shu.fs | `Shu.fs.mkdirRecursive(path)` / `Shu.fs.mkdirRecursiveSync(path)` | 异步 Promise\<void\> / 同步递归创建目录（mkdir -p 风格） | `shu/fs.zig` | `--allow-write` |
 | Shu.fs | `Shu.fs.rmdirRecursive(path)` / `Shu.fs.rmdirRecursiveSync(path)` | 异步 Promise\<void\> / 同步递归删除目录及内容（rm -rf 风格） | `shu/fs.zig` | `--allow-write` |
 | Shu.path | `join`、`resolve`、`dirname`、`basename`、`extname`、`normalize`、`isAbsolute`、`relative`、`parse`、`format`、`root`、`name`、`toNamespacedPath`、`filePathToUrl`、`urlToFilePath`、`sep`、`delimiter`、`posix`、`win32` | 路径工具 | `shu/path.zig` | 无 |
-| Shu.system | `Shu.system.exec(cmd)` / `execSync(cmd)` | 通过 shell 执行命令，返回 `{ stdout, stderr, code }` | `shu/system/exec.zig` | `--allow-exec` |
-| Shu.system | `Shu.system.run(options)` / `runSync(options)` | 不经过 shell 执行（options.cmd 数组、cwd），返回 `{ status, stdout, stderr }` | `shu/system/run.zig` | `--allow-exec` |
-| Shu.system | `Shu.system.spawn(options)` / `spawnSync(options)` | 同 run，当前实现与 run 一致 | `shu/system/spawn.zig` | `--allow-exec` |
-| Shu.system | `Shu.system.fork(modulePath [, args] [, options])` | Node 式多进程：启动子 Shu 进程，返回 `{ send, kill, receiveSync }`，子进程内 `process.send`/`receiveSync` | `shu/system/fork.zig` + `fork_parent.zig` + `fork_child.zig` | `--allow-exec`，env SHU_FORKED 自动设置 |
+| Shu.system | `Shu.system.exec(cmd)` / `execSync(cmd)` | 通过 shell 执行命令，返回 `{ stdout, stderr, code }` | `shu/system/exec.zig` | `--allow-run` |
+| Shu.system | `Shu.system.run(options)` / `runSync(options)` | 不经过 shell 执行（options.cmd 数组、cwd），返回 `{ status, stdout, stderr }` | `shu/system/run.zig` | `--allow-run` |
+| Shu.system | `Shu.system.spawn(options)` / `spawnSync(options)` | 同 run，当前实现与 run 一致 | `shu/system/spawn.zig` | `--allow-run` |
+| Shu.system | `Shu.system.fork(modulePath [, args] [, options])` | Node 式多进程：启动子 Shu 进程，返回 `{ send, kill, receiveSync }`，子进程内 `process.send`/`receiveSync` | `shu/system/fork.zig` + `fork_parent.zig` + `fork_child.zig` | `--allow-run`，env SHU_FORKED 自动设置 |
 | Shu.thread | `Shu.thread.spawn(scriptPath [, options])` | 多线程：在新线程中运行脚本，返回 `{ send, receiveSync, join }`，工作线程内 `process.send`/`receiveSync` | `shu/thread.zig` + `thread_worker.zig` | 无 |
 | Shu | `Shu.crond(expression, callback)` | 计划任务：六段 cron 表达式（秒 分 时 日 月 周），如 `"* * * * * *"`，返回 `{ stop }` | `engine/shu/mod.zig` + `modules/shu/crond` | 支持 *、N、*/N、N-M |
 | Shu / 全局 | `Shu.crondClear(id)` / `crondClear(id)` | 取消指定 id；不传参则清空所有由 Shu.crond 创建的任务 | `engine/shu/mod.zig` | 无 |
@@ -328,7 +328,7 @@
 | **全局** | console、setTimeout/setInterval/clear*、**setImmediate/clearImmediate**、**queueMicrotask**、fetch、process（cwd/argv/env/__dirname/__filename）、process.send/receiveSync（fork/thread 内） | 已实现并接入 |
 | **Shu.fs** | read/write、readdir、mkdir、exists、stat、unlink、rmdir、rename、**copy、append、symlink、readlink、mkdirRecursive、rmdirRecursive**（均含 Sync + 异步） | 文件与目录能力已较完整 |
 | **Shu.path** | join、resolve、dirname、basename、extname、normalize、isAbsolute、relative、filePathToUrl、urlToFilePath、sep、delimiter | 路径工具已覆盖常用 |
-| **Shu.system** | exec/execSync、run/runSync、spawn/spawnSync、fork（多进程+IPC） | 需 `--allow-exec` |
+| **Shu.system** | exec/execSync、run/runSync、spawn/spawnSync、fork（多进程+IPC） | 需 `--allow-run` |
 | **Shu.thread** | spawn、send、receiveSync、join（多线程） | 工作线程内 process.send/receiveSync |
 | **Shu** | Shu.crond、crondClear | 计划任务 |
 | **引擎子模块** | fork_child、thread_worker、timer_state、cron、globals | 支撑 fork/thread/crond |

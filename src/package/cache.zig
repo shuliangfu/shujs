@@ -1,21 +1,35 @@
 // 依赖缓存：npm/JSR 等 tarball 按 (registry, name, version) 存本地；HTTPS URL 单文件按 URL 哈希缓存
 // 参考：docs/PACKAGE_DESIGN.md §7
 // 约定：调用方负责 free 返回的路径字符串（getCacheRoot、getCachedTarball、getCachedUrlPath、urlCachePath 的返回值）
-// TODO: migrate to io_core (rule §3.0); current file I/O via std.fs (openFileAbsolute, makePath, copyFileAbsolute, etc.)
+// 文件/目录与路径经 io_core（§3.0）
 
 const std = @import("std");
+const io_core = @import("io_core");
 
 /// 默认缓存子目录名（位于 getCacheRoot() 下）
 const CONTENT_DIR = "content";
 /// HTTPS URL 缓存子目录名（位于 getCacheRoot() 下），仅支持 https://，不支持 http://
 const URL_CACHE_DIR = "url";
+/// Registry 元数据缓存子目录名（位于 getCacheRoot() 下），按 registry_host/包名.json 存 GET /<name> 的 JSON，避免重复请求
+const METADATA_DIR = "metadata";
 
-/// 返回依赖缓存根目录；优先读环境变量 SHU_CACHE 或 SHU_CACHE_DIR，否则用默认 ~/.shu/cache（Windows：%LOCALAPPDATA%\\shu\\cache）。调用方负责 free。
+/// 返回 shu 配置/缓存根目录（~/.shu 或 %LOCALAPPDATA%\\shu）；用于存放 registry 等配置。优先 SHU_HOME，否则 HOME/USERPROFILE + /.shu。调用方 free。
+pub fn getShuHome(allocator: std.mem.Allocator) ![]const u8 {
+    if (std.posix.getenv("SHU_HOME")) |v| return allocator.dupe(u8, v);
+    const home = std.posix.getenv("HOME") orelse std.posix.getenv("USERPROFILE") orelse return error.NoHomeDir;
+    var list = std.ArrayList(u8).initCapacity(allocator, home.len + 16) catch return error.OutOfMemory;
+    defer list.deinit(allocator);
+    list.writer(allocator).print("{s}/.shu", .{home}) catch return error.OutOfMemory;
+    return list.toOwnedSlice(allocator);
+}
+
+/// 返回依赖缓存根目录；优先读环境变量 SHU_CACHE 或 SHU_CACHE_DIR，否则用 getShuHome()/cache。调用方负责 free。§7：用 writer 替代 allocPrint 减少热路径临时分配。
 pub fn getCacheRoot(allocator: std.mem.Allocator) ![]const u8 {
     if (std.posix.getenv("SHU_CACHE")) |v| return allocator.dupe(u8, v);
     if (std.posix.getenv("SHU_CACHE_DIR")) |v| return allocator.dupe(u8, v);
-    const home = std.posix.getenv("HOME") orelse std.posix.getenv("USERPROFILE") orelse return error.NoHomeDir;
-    return std.fmt.allocPrint(allocator, "{s}/.shu/cache", .{home});
+    const shu_home = try getShuHome(allocator);
+    defer allocator.free(shu_home);
+    return io_core.pathJoin(allocator, &.{ shu_home, "cache" });
 }
 
 /// 将包名中的 / 和 @ 等替换为安全文件名字符，用于缓存路径
@@ -31,19 +45,79 @@ fn sanitizeName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
     return list.toOwnedSlice(allocator);
 }
 
-/// 生成缓存键：registry_host 与 name、version 组成唯一键；name 会做安全化。调用方负责 free。
+/// 生成缓存键：registry_host 与 name、version 组成唯一键；name 会做安全化。调用方负责 free。§7：用 writer 替代 allocPrint 减少热路径临时分配。
 pub fn cacheKey(allocator: std.mem.Allocator, registry_host: []const u8, name: []const u8, version: []const u8) ![]const u8 {
     const safe_name = try sanitizeName(allocator, name);
     defer allocator.free(safe_name);
-    return std.fmt.allocPrint(allocator, "npm/{s}/{s}/{s}", .{ registry_host, safe_name, version });
+    const cap = "npm/".len + registry_host.len + 1 + safe_name.len + 1 + version.len;
+    var list = std.ArrayList(u8).initCapacity(allocator, cap) catch return error.OutOfMemory;
+    defer list.deinit(allocator);
+    list.writer(allocator).print("npm/{s}/{s}/{s}", .{ registry_host, safe_name, version }) catch return error.OutOfMemory;
+    return list.toOwnedSlice(allocator);
+}
+
+/// 返回 registry 元数据缓存文件路径：cache_root/metadata/<registry_host>/<safe_name>.json。调用方 free。
+fn metadataCachePath(allocator: std.mem.Allocator, cache_root: []const u8, registry_host: []const u8, name: []const u8) ![]const u8 {
+    const safe_name = try sanitizeName(allocator, name);
+    defer allocator.free(safe_name);
+    const json_name = try std.mem.concat(allocator, u8, &.{ safe_name, ".json" });
+    defer allocator.free(json_name);
+    const dir = try io_core.pathJoin(allocator, &.{ cache_root, METADATA_DIR, registry_host });
+    defer allocator.free(dir);
+    return io_core.pathJoin(allocator, &.{ dir, json_name });
+}
+
+/// 若该包在元数据缓存中已有 GET /<name> 的 JSON，则读取并返回；否则返回 null。返回的切片由调用方 free。
+pub fn getCachedMetadata(allocator: std.mem.Allocator, cache_root: []const u8, registry_host: []const u8, name: []const u8) ?[]const u8 {
+    const path = metadataCachePath(allocator, cache_root, registry_host, name) catch return null;
+    defer allocator.free(path);
+    var f = io_core.openFileAbsolute(path, .{}) catch return null;
+    defer f.close();
+    var list = std.ArrayList(u8).initCapacity(allocator, 4096) catch return null;
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = f.read(buf[0..]) catch {
+            list.deinit(allocator);
+            return null;
+        };
+        if (n == 0) break;
+        list.appendSlice(allocator, buf[0..n]) catch {
+            list.deinit(allocator);
+            return null;
+        };
+    }
+    return list.toOwnedSlice(allocator) catch return null;
+}
+
+/// 将 GET /<name> 的 JSON 写入元数据缓存；会创建 registry_host 子目录。用于安装/解析后避免重复请求。
+pub fn putCachedMetadata(allocator: std.mem.Allocator, cache_root: []const u8, registry_host: []const u8, name: []const u8, body: []const u8) !void {
+    const safe_name = try sanitizeName(allocator, name);
+    defer allocator.free(safe_name);
+    const dir = try io_core.pathJoin(allocator, &.{ cache_root, METADATA_DIR, registry_host });
+    defer allocator.free(dir);
+    io_core.makePathAbsolute(cache_root) catch {};
+    var cache_dir = try io_core.openDirAbsolute(cache_root, .{});
+    defer cache_dir.close();
+    const meta_dir = try io_core.pathJoin(allocator, &.{ METADATA_DIR, registry_host });
+    defer allocator.free(meta_dir);
+    const dir_abs = try io_core.pathJoin(allocator, &.{ cache_root, meta_dir });
+    defer allocator.free(dir_abs);
+    io_core.makePathAbsolute(dir_abs) catch {};
+    const filename = try std.mem.concat(allocator, u8, &.{ safe_name, ".json" });
+    defer allocator.free(filename);
+    const file_abs = try io_core.pathJoin(allocator, &.{ dir_abs, filename });
+    defer allocator.free(file_abs);
+    var f = try io_core.createFileAbsolute(file_abs, .{});
+    defer f.close();
+    try f.writeAll(body);
 }
 
 /// 若缓存中已有该 key 的 tarball，返回其绝对路径；否则返回 null。返回的路径由调用方 free。
 pub fn getCachedTarball(allocator: std.mem.Allocator, cache_root: []const u8, key: []const u8) ?[]const u8 {
     const filename = std.mem.concat(allocator, u8, &.{ key, ".tgz" }) catch return null;
     defer allocator.free(filename);
-    const full = std.fs.path.join(allocator, &.{ cache_root, CONTENT_DIR, filename }) catch return null;
-    var f = std.fs.openFileAbsolute(full, .{}) catch {
+    const full = io_core.pathJoin(allocator, &.{ cache_root, CONTENT_DIR, filename }) catch return null;
+    var f = io_core.openFileAbsolute(full, .{}) catch {
         allocator.free(full);
         return null;
     };
@@ -53,25 +127,27 @@ pub fn getCachedTarball(allocator: std.mem.Allocator, cache_root: []const u8, ke
 
 /// 将 tarball_path 指向的文件复制到缓存目录下 key.tgz；必要时递归创建父目录。key 中可含子路径（如 npm/registry.npmjs.org/pkg/1.0.0），会创建对应子目录。
 pub fn putCachedTarball(allocator: std.mem.Allocator, cache_root: []const u8, key: []const u8, tarball_path: []const u8) !void {
-    var cache_dir = std.fs.openDirAbsolute(cache_root, .{}) catch blk: {
-        try std.fs.cwd().makePath(cache_root);
-        break :blk try std.fs.openDirAbsolute(cache_root, .{});
-    };
+    io_core.makePathAbsolute(cache_root) catch {};
+    var cache_dir = try io_core.openDirAbsolute(cache_root, .{});
     defer cache_dir.close();
-    if (std.fs.path.dirname(key)) |dir| {
-        const content_and_dir = try std.fs.path.join(allocator, &.{ CONTENT_DIR, dir });
+    if (io_core.pathDirname(key)) |dir| {
+        const content_and_dir = try io_core.pathJoin(allocator, &.{ CONTENT_DIR, dir });
         defer allocator.free(content_and_dir);
-        cache_dir.makePath(content_and_dir) catch {}; // 已存在则忽略
+        const dest_dir_abs = try io_core.pathJoin(allocator, &.{ cache_root, content_and_dir });
+        defer allocator.free(dest_dir_abs);
+        io_core.makePathAbsolute(dest_dir_abs) catch {}; // 已存在则忽略
     } else {
-        cache_dir.makePath(CONTENT_DIR) catch {};
+        const content_dir_abs = try io_core.pathJoin(allocator, &.{ cache_root, CONTENT_DIR });
+        defer allocator.free(content_dir_abs);
+        io_core.makePathAbsolute(content_dir_abs) catch {};
     }
     const filename = try std.mem.concat(allocator, u8, &.{ key, ".tgz" });
     defer allocator.free(filename);
-    const content_filename = try std.fs.path.join(allocator, &.{ CONTENT_DIR, filename });
+    const content_filename = try io_core.pathJoin(allocator, &.{ CONTENT_DIR, filename });
     defer allocator.free(content_filename);
-    const dest_abs = try std.fs.path.join(allocator, &.{ cache_root, content_filename });
+    const dest_abs = try io_core.pathJoin(allocator, &.{ cache_root, content_filename });
     defer allocator.free(dest_abs);
-    try std.fs.copyFileAbsolute(tarball_path, dest_abs, .{});
+    try io_core.copyFileAbsolute(tarball_path, dest_abs, .{});
 }
 
 /// 从 URL 中截取路径部分（首个 / 至 ? 或 # 或结尾），再取扩展名（如 .ts、.js）
@@ -107,13 +183,13 @@ pub fn urlCachePath(allocator: std.mem.Allocator, cache_root: []const u8, url: [
     if (!std.mem.startsWith(u8, url, "https://")) return error.InvalidUrl;
     const name = try urlCacheFilename(allocator, url);
     defer allocator.free(name);
-    return std.fs.path.join(allocator, &.{ cache_root, URL_CACHE_DIR, name });
+    return io_core.pathJoin(allocator, &.{ cache_root, URL_CACHE_DIR, name });
 }
 
 /// 若该 https:// URL 已缓存则返回其绝对路径，否则返回 null；http:// 返回 null。调用方 free 返回的路径。
 pub fn getCachedUrlPath(allocator: std.mem.Allocator, cache_root: []const u8, url: []const u8) ?[]const u8 {
     const path = urlCachePath(allocator, cache_root, url) catch return null;
-    var f = std.fs.openFileAbsolute(path, .{}) catch {
+    var f = io_core.openFileAbsolute(path, .{}) catch {
         allocator.free(path);
         return null;
     };

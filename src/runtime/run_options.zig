@@ -5,14 +5,18 @@
 /// 保留字段：locale 默认值（当前输出均为英文，不再使用 i18n）
 pub const default_locale: []const u8 = "en-US";
 
-/// 与 CLI 解析后的权限对齐；各字段对应 --allow-net / --allow-read 等
+/// 与 CLI 解析后的权限对齐；与 Deno 一致：--allow-net/read/env/write/run/hrtime/ffi
 pub const Permissions = struct {
     allow_net: bool = false,
     allow_read: bool = false,
     allow_env: bool = false,
     allow_write: bool = false,
-    /// 是否允许执行系统命令（Shu.system.exec / run / spawn 等），对应 --allow-exec
-    allow_exec: bool = false,
+    /// 是否允许执行子进程（Shu.system.exec / run / spawn 等），对应 --allow-run
+    allow_run: bool = false,
+    /// 是否允许高精度时间（如 performance.now()），对应 --allow-hrtime；预留，当前未强制校验
+    allow_hrtime: bool = false,
+    /// 是否允许 FFI 动态库加载，对应 --allow-ffi；预留，当前未实现
+    allow_ffi: bool = false,
 };
 
 /// 一次 shu run 的上下文（由 cli/run 构建并传给 VM）

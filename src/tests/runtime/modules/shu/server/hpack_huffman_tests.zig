@@ -60,3 +60,22 @@ test "decodeHuffman: InvalidHuffman 非法字节" {
     const r = hpack_huffman.decodeHuffman(allocator, &bad);
     try std.testing.expectError(error.InvalidHuffman, r);
 }
+
+// ---------- 边界：encode 精确 buffer 大小 ----------
+test "encodeHuffmanToBuffer: buffer 刚好等于编码长度" {
+    var large: [64]u8 = undefined;
+    const n = try hpack_huffman.encodeHuffmanToBuffer(&large, "a");
+    var exact: [64]u8 = undefined;
+    const m = try hpack_huffman.encodeHuffmanToBuffer(exact[0..n], "a");
+    try std.testing.expect(m == n);
+}
+
+// ---------- 边界：decode 截断编码 ----------
+test "decodeHuffman: 截断编码返回 InvalidHuffman" {
+    const allocator = std.testing.allocator;
+    var enc: [64]u8 = undefined;
+    const len = try hpack_huffman.encodeHuffmanToBuffer(&enc, "hello");
+    const truncated = enc[0 .. len - 1];
+    const r = hpack_huffman.decodeHuffman(allocator, truncated);
+    try std.testing.expectError(error.InvalidHuffman, r);
+}

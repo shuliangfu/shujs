@@ -131,8 +131,9 @@ pub fn build(b: *std.Build) void {
         .name = "shu",
         .root_module = root_module,
     });
-    // 发布时去掉调试符号以减小体积（ReleaseSmall 时效果明显）
-    exe.root_module.strip = true;
+    
+    // 发布时去掉调试符号以减小体积（ReleaseSmall 时效果明显）；Debug 时保留以便堆栈
+    exe.root_module.strip = (optimize != .Debug);
 
     // TLS：-Dtls 时加入 lib/tls/tls.c 并链接 OpenSSL；tls.c 需能找到 tls.h
     if (have_tls) {
@@ -214,6 +215,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     test_module.addImport("hpack_huffman", hpack_huffman_module);
+    test_module.addImport("io_core", io_core_module);
     const test_exe = b.addTest(.{
         .root_module = test_module,
     });

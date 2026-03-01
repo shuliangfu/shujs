@@ -3,13 +3,15 @@
 
 const std = @import("std");
 
-/// 当前进程的权限掩码（与 cli.args.ParsedArgs 对齐）
+/// 当前进程的权限掩码（与 cli.args.ParsedArgs、run_options.Permissions 对齐，Deno 一致）
 pub const Permissions = struct {
     allow_net: bool = false,
     allow_read: bool = false,
     allow_env: bool = false,
     allow_write: bool = false,
-    allow_exec: bool = false,
+    allow_run: bool = false,
+    allow_hrtime: bool = false,
+    allow_ffi: bool = false,
 
     /// 检查是否允许网络访问
     pub fn canNet(self: Permissions) bool {
@@ -27,8 +29,16 @@ pub const Permissions = struct {
     pub fn canWrite(self: Permissions) bool {
         return self.allow_write;
     }
-    /// 检查是否允许执行系统命令（Shu.system.exec / run / spawn 等）
-    pub fn canExec(self: Permissions) bool {
-        return self.allow_exec;
+    /// 检查是否允许执行子进程（Shu.system.exec / run / spawn 等），对应 --allow-run
+    pub fn canRun(self: Permissions) bool {
+        return self.allow_run;
+    }
+    /// 检查是否允许高精度时间，对应 --allow-hrtime
+    pub fn canHrtime(self: Permissions) bool {
+        return self.allow_hrtime;
+    }
+    /// 检查是否允许 FFI，对应 --allow-ffi
+    pub fn canFfi(self: Permissions) bool {
+        return self.allow_ffi;
     }
 };

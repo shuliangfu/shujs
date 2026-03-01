@@ -1,6 +1,18 @@
-// shu run 子命令：执行单文件或 package.json scripts
-// 参考：SHU_RUNTIME_ANALYSIS.md 6.1
-// Zig 0.15.2：std.fs 与 I/O 使用当前稳定 API
+//! shu run 子命令（cli/run.zig）
+//!
+//! 职责
+//!   - 执行单入口文件（.js / .ts / .tsx）或 package.json scripts；.ts/.tsx 先做类型擦除，.tsx 再经 JSX 转译。
+//!   - 若当前目录存在 package.json、package.jsonc、deno.json 或 deno.jsonc 任一，会先自动执行依赖安装（与 Deno 一致）；皆无则跳过。
+//!   - 构建 RunOptions（cwd、entry_path、argv、permissions 等）并调用 VM 执行源码。
+//!
+//! 主要 API
+//!   - run(allocator, parsed, positional, argv)：入口；positional[0] 为 entry 或 script 名；argv 为完整命令行用于 process.argv。
+//!
+//! 约定
+//!   - 无 entry 且非 help 时返回 error.MissingEntry 并打印用法；面向用户输出为英文。
+//!   - 文件与路径 I/O 使用当前稳定 API；install 等经 package 与 io_core。
+//!
+//! 参考：SHU_RUNTIME_ANALYSIS.md 6.1
 
 const std = @import("std");
 const args_mod = @import("args.zig");
@@ -27,7 +39,7 @@ pub fn run(allocator: std.mem.Allocator, parsed: args_mod.ParsedArgs, positional
     defer allocator.free(cwd_str);
     // 存在 package.json/jsonc 或 deno.json/jsonc 时自动安装依赖（Deno 风格）；皆无则跳过（install 需 package 才真正安装，仅 deno 时会 NoManifest）
     if (hasAnyManifest(cwd_str)) {
-        pkg_install.install(allocator, cwd_str) catch |e| {
+        pkg_install.install(allocator, cwd_str, null, null) catch |e| {
             if (e != error.NoManifest) return e;
         };
     }
@@ -78,7 +90,9 @@ pub fn run(allocator: std.mem.Allocator, parsed: args_mod.ParsedArgs, positional
             .allow_read = parsed.allow_read,
             .allow_env = parsed.allow_env,
             .allow_write = parsed.allow_write,
-            .allow_exec = parsed.allow_exec,
+            .allow_run = parsed.allow_run,
+            .allow_hrtime = parsed.allow_hrtime,
+            .allow_ffi = parsed.allow_ffi,
         },
         .locale = run_options.default_locale,
         .is_forked = is_forked,
@@ -111,8 +125,8 @@ fn hasExtension(path: []const u8, ext: []const u8) bool {
 fn printRunUsage() !void {
     try printToStdout(
         \\shu run <entry> [options...]
-        \\Run a single .js/.ts/.tsx file (types stripped; .tsx also JSX-transformed); or package.json script (later).
-        \\Options: --allow-net, --allow-read, --allow-env, --allow-write, --allow-exec
+        \\Run a single .js / .ts / .tsx file (types stripped; .tsx also JSX-transformed); or package.json script (later).
+        \\Options: --allow-all / -A, --allow-net, --allow-read, --allow-env, --allow-write, --allow-run, --allow-hrtime, --allow-ffi
         \\
     , .{});
 }

@@ -53,6 +53,11 @@
 //! - readSync(path, { encoding: null }) 返回 Buffer 时：小文件 Zig 分配 + JSC NoCopy；大文件（≥FS_MAP_THRESHOLD）走 io_core.mapFileReadOnly，零拷贝
 //! - copySync 大文件：源 mmap + 整块写，减少 OOM 与拷贝
 //! - 所有需要分配内存的路径均使用调用方传入的 allocator（globals.current_allocator），谁分配谁释放
+//!
+//! ## §3.0 性能规则：I/O 经 io_core
+//! - 文件/目录操作：openFileAbsolute、openDirAbsolute、realpath、makeDirAbsolute、deleteFileAbsolute、deleteDirAbsolute、renameAbsolute、accessAbsolute、createFileAbsolute 均经 io_core（file.zig 薄封装）。
+//! - 大文件/异步：readSync(encoding:null) 大文件 → io_core.mapFileReadOnly；copySync 大文件 → mapFileReadOnly + 整块写；异步 read/write → io_core.AsyncFileIO。
+//! - 符号链接与路径解析：readLinkAbsolute、symLinkAbsolute、pathDirname/pathBasename/pathJoin/pathResolve 等均经 io_core（file.zig 薄封装）。
 
 const std = @import("std");
 const jsc = @import("jsc");
@@ -97,7 +102,7 @@ fn mappedFileDeallocator(bytes: *anyopaque, deallocator_context: ?*anyopaque) ca
 const PendingEntry = struct {
     resolve: jsc.JSValueRef,
     reject: jsc.JSValueRef,
-    file: std.fs.File,
+    file: io_core.File,
     allocator: std.mem.Allocator,
     kind: enum { read, write },
     /// read 时：读入数据的 buffer，drain 时交 JSC 或 free
@@ -282,8 +287,8 @@ fn runDeferredFsOp(ctx: jsc.JSContextRef, op: *const DeferredFsOp) void {
                 do_reject(ctx, reject_fn, allocator, "Shu.fs.realpath requires --allow-read");
                 return;
             }
-            var buf: [std.fs.max_path_bytes]u8 = undefined;
-            const canonical = std.fs.realpath(op.path, &buf) catch {
+            var buf: [io_core.max_path_bytes]u8 = undefined;
+            const canonical = io_core.realpath(op.path, &buf) catch {
                 do_reject(ctx, reject_fn, allocator, "realpath failed");
                 return;
             };
@@ -304,9 +309,9 @@ fn runDeferredFsOp(ctx: jsc.JSContextRef, op: *const DeferredFsOp) void {
                 do_reject(ctx, reject_fn, allocator, "Shu.fs.lstat requires --allow-read");
                 return;
             }
-            const dir_path = std.fs.path.dirname(op.path) orelse ".";
-            const base = std.fs.path.basename(op.path);
-            var dir = std.fs.openDirAbsolute(dir_path, .{}) catch {
+            const dir_path = io_core.pathDirname(op.path) orelse ".";
+            const base = io_core.pathBasename(op.path);
+            var dir = io_core.openDirAbsolute(dir_path, .{}) catch {
                 do_reject(ctx, reject_fn, allocator, "lstat failed");
                 return;
             };
@@ -331,7 +336,7 @@ fn runDeferredFsOp(ctx: jsc.JSContextRef, op: *const DeferredFsOp) void {
                 do_reject(ctx, reject_fn, allocator, "Shu.fs.truncate requires --allow-write");
                 return;
             }
-            const file = std.fs.openFileAbsolute(op.path, .{ .mode = .read_write }) catch {
+            const file = io_core.openFileAbsolute(op.path, .{ .mode = .read_write }) catch {
                 do_reject(ctx, reject_fn, allocator, "truncate failed");
                 return;
             };
@@ -349,10 +354,10 @@ fn runDeferredFsOp(ctx: jsc.JSContextRef, op: *const DeferredFsOp) void {
                 _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 1, &false_arg, null);
                 return;
             }
-            var flags: std.fs.File.OpenFlags = .{};
+            var flags: io_core.FileOpenFlags = .{};
             if (op.mode & 1 != 0) flags.mode = .read_only;
             if (op.mode & 2 != 0) flags.mode = if (op.mode & 1 != 0) .read_write else .write_only;
-            std.fs.accessAbsolute(op.path, flags) catch {
+            io_core.accessAbsolute(op.path, flags) catch {
                 var false_arg: [1]jsc.JSValueRef = .{jsc.JSValueMakeBoolean(ctx, false)};
                 _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 1, &false_arg, null);
                 return;
@@ -366,7 +371,7 @@ fn runDeferredFsOp(ctx: jsc.JSContextRef, op: *const DeferredFsOp) void {
                 _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 1, &false_arg, null);
                 return;
             }
-            var dir = std.fs.openDirAbsolute(op.path, .{ .iterate = true }) catch {
+            var dir = io_core.openDirAbsolute(op.path, .{ .iterate = true }) catch {
                 var false_arg: [1]jsc.JSValueRef = .{jsc.JSValueMakeBoolean(ctx, false)};
                 _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 1, &false_arg, null);
                 return;
@@ -390,8 +395,8 @@ fn runDeferredFsOp(ctx: jsc.JSContextRef, op: *const DeferredFsOp) void {
                 do_reject(ctx, reject_fn, allocator, "Shu.fs.size requires --allow-read");
                 return;
             }
-            const file = std.fs.openFileAbsolute(op.path, .{}) catch |e| {
-                if (e == std.fs.File.OpenError.IsDir) {
+            const file = io_core.openFileAbsolute(op.path, .{}) catch |e| {
+                if (e == io_core.FileOpenError.IsDir) {
                     var zero_arg: [1]jsc.JSValueRef = .{jsc.JSValueMakeNumber(ctx, 0)};
                     _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 1, &zero_arg, null);
                     return;
@@ -413,7 +418,7 @@ fn runDeferredFsOp(ctx: jsc.JSContextRef, op: *const DeferredFsOp) void {
                 _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 1, &false_arg, null);
                 return;
             }
-            const file = std.fs.openFileAbsolute(op.path, .{}) catch {
+            const file = io_core.openFileAbsolute(op.path, .{}) catch {
                 var false_arg: [1]jsc.JSValueRef = .{jsc.JSValueMakeBoolean(ctx, false)};
                 _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 1, &false_arg, null);
                 return;
@@ -433,7 +438,7 @@ fn runDeferredFsOp(ctx: jsc.JSContextRef, op: *const DeferredFsOp) void {
                 _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 1, &false_arg, null);
                 return;
             }
-            var dir = std.fs.openDirAbsolute(op.path, .{}) catch {
+            var dir = io_core.openDirAbsolute(op.path, .{}) catch {
                 var false_arg: [1]jsc.JSValueRef = .{jsc.JSValueMakeBoolean(ctx, false)};
                 _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 1, &false_arg, null);
                 return;
@@ -452,7 +457,7 @@ fn runDeferredFsOp(ctx: jsc.JSContextRef, op: *const DeferredFsOp) void {
                 do_reject(ctx, reject_fn, allocator, "Shu.fs.readdirWithStats requires --allow-read");
                 return;
             }
-            var dir = std.fs.openDirAbsolute(op.path, .{ .iterate = true }) catch {
+            var dir = io_core.openDirAbsolute(op.path, .{ .iterate = true }) catch {
                 do_reject(ctx, reject_fn, allocator, "readdir failed");
                 return;
             };
@@ -506,11 +511,11 @@ fn runDeferredFsOp(ctx: jsc.JSContextRef, op: *const DeferredFsOp) void {
                 do_reject(ctx, reject_fn, allocator, "Shu.fs.ensureFile requires --allow-read and --allow-write");
                 return;
             }
-            const file = std.fs.openFileAbsolute(op.path, .{}) catch |e| {
-                if (e == std.fs.File.OpenError.FileNotFound) {
-                    const parent = std.fs.path.dirname(op.path) orelse return;
+            const file = io_core.openFileAbsolute(op.path, .{}) catch |e| {
+                if (e == io_core.FileOpenError.FileNotFound) {
+                    const parent = io_core.pathDirname(op.path) orelse return;
                     if (parent.len > 0 and parent.len < op.path.len) makeDirRecursiveAbsolute(allocator, parent);
-                    var f = std.fs.createFileAbsolute(op.path, .{}) catch {
+                    var f = io_core.createFileAbsolute(op.path, .{}) catch {
                         do_reject(ctx, reject_fn, allocator, "ensureFile create failed");
                         return;
                     };
@@ -519,7 +524,7 @@ fn runDeferredFsOp(ctx: jsc.JSContextRef, op: *const DeferredFsOp) void {
                     _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 0, &empty, null);
                     return;
                 }
-                if (e == std.fs.File.OpenError.IsDir) {
+                if (e == io_core.FileOpenError.IsDir) {
                     do_reject(ctx, reject_fn, allocator, "Shu.fs.ensureFile: path is a directory");
                     return;
                 }
@@ -555,8 +560,8 @@ fn runDeferredFsOpReadFile(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resol
         do_reject(ctx, reject_fn, allocator, "Shu.fs.read requires --allow-read");
         return;
     }
-    const file = std.fs.openFileAbsolute(op.path, .{}) catch |e| {
-        if (e == std.fs.File.OpenError.FileNotFound) {
+    const file = io_core.openFileAbsolute(op.path, .{}) catch |e| {
+        if (e == io_core.FileOpenError.FileNotFound) {
             do_reject(ctx, reject_fn, allocator, "File not found");
             return;
         }
@@ -576,7 +581,7 @@ fn runDeferredFsOpReadFile(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resol
                 return;
             };
             defer allocator.free(content);
-            var f = std.fs.openFileAbsolute(op.path, .{}) catch {
+            var f = io_core.openFileAbsolute(op.path, .{}) catch {
                 do_reject(ctx, reject_fn, allocator, "read failed");
                 return;
             };
@@ -630,7 +635,7 @@ fn runDeferredFsOpReadFile(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resol
         return;
     };
     defer allocator.free(content);
-    var f = std.fs.openFileAbsolute(op.path, .{}) catch {
+    var f = io_core.openFileAbsolute(op.path, .{}) catch {
         do_reject(ctx, reject_fn, allocator, "read failed");
         return;
     };
@@ -672,7 +677,7 @@ fn runDeferredFsOpSymlink(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolv
         do_reject(ctx, reject_fn, allocator, "Shu.fs.symlink requires --allow-write");
         return;
     }
-    std.fs.symLinkAbsolute(op.path, path2, .{}) catch {
+    io_core.symLinkAbsolute(op.path, path2, .{}) catch {
         do_reject(ctx, reject_fn, allocator, "symlink failed");
         return;
     };
@@ -687,9 +692,9 @@ fn runDeferredFsOpStat(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_f
         do_reject(ctx, reject_fn, allocator, "Shu.fs.stat requires --allow-read");
         return;
     }
-    const file = std.fs.openFileAbsolute(op.path, .{}) catch |e| {
-        if (e == std.fs.File.OpenError.IsDir) {
-            var dir = std.fs.openDirAbsolute(op.path, .{}) catch return;
+    const file = io_core.openFileAbsolute(op.path, .{}) catch |e| {
+        if (e == io_core.FileOpenError.IsDir) {
+            var dir = io_core.openDirAbsolute(op.path, .{}) catch return;
             defer dir.close();
             const s = dir.stat() catch return;
             const mtime_ns: i64 = @intCast(@min(s.mtime, std.math.maxInt(i64)));
@@ -719,7 +724,7 @@ fn runDeferredFsOpReaddir(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolv
         do_reject(ctx, reject_fn, allocator, "Shu.fs.readdir requires --allow-read");
         return;
     }
-    var dir = std.fs.openDirAbsolute(op.path, .{ .iterate = true }) catch {
+    var dir = io_core.openDirAbsolute(op.path, .{ .iterate = true }) catch {
         do_reject(ctx, reject_fn, allocator, "readdir failed");
         return;
     };
@@ -751,7 +756,7 @@ fn runDeferredFsOpMkdir(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_
         do_reject(ctx, reject_fn, allocator, "Shu.fs.mkdir requires --allow-write");
         return;
     }
-    std.fs.makeDirAbsolute(op.path) catch {
+    io_core.makeDirAbsolute(op.path) catch {
         do_reject(ctx, reject_fn, allocator, "mkdir failed");
         return;
     };
@@ -767,7 +772,7 @@ fn runDeferredFsOpExists(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve
         _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 1, &false_arg, null);
         return;
     }
-    std.fs.accessAbsolute(op.path, .{}) catch {
+    io_core.accessAbsolute(op.path, .{}) catch {
         var false_arg: [1]jsc.JSValueRef = .{jsc.JSValueMakeBoolean(ctx, false)};
         _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 1, &false_arg, null);
         return;
@@ -783,7 +788,7 @@ fn runDeferredFsOpUnlink(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve
         do_reject(ctx, reject_fn, allocator, "Shu.fs.unlink requires --allow-write");
         return;
     }
-    std.fs.deleteFileAbsolute(op.path) catch {
+    io_core.deleteFileAbsolute(op.path) catch {
         do_reject(ctx, reject_fn, allocator, "unlink failed");
         return;
     };
@@ -798,7 +803,7 @@ fn runDeferredFsOpRmdir(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_
         do_reject(ctx, reject_fn, allocator, "Shu.fs.rmdir requires --allow-write");
         return;
     }
-    std.fs.deleteDirAbsolute(op.path) catch {
+    io_core.deleteDirAbsolute(op.path) catch {
         do_reject(ctx, reject_fn, allocator, "rmdir failed");
         return;
     };
@@ -814,7 +819,7 @@ fn runDeferredFsOpRename(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve
         do_reject(ctx, reject_fn, allocator, "Shu.fs.rename requires --allow-read and --allow-write");
         return;
     }
-    std.fs.renameAbsolute(op.path, path2) catch {
+    io_core.renameAbsolute(op.path, path2) catch {
         do_reject(ctx, reject_fn, allocator, "rename failed");
         return;
     };
@@ -830,8 +835,8 @@ fn runDeferredFsOpCopy(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_f
         do_reject(ctx, reject_fn, allocator, "Shu.fs.copy requires --allow-read and --allow-write");
         return;
     }
-    const src_file = std.fs.openFileAbsolute(op.path, .{}) catch |e| {
-        if (e == std.fs.File.OpenError.FileNotFound) {
+    const src_file = io_core.openFileAbsolute(op.path, .{}) catch |e| {
+        if (e == io_core.FileOpenError.FileNotFound) {
             do_reject(ctx, reject_fn, allocator, "File not found");
             return;
         }
@@ -843,7 +848,7 @@ fn runDeferredFsOpCopy(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_f
         do_reject(ctx, reject_fn, allocator, "copy stat failed");
         return;
     };
-    const dest_file = std.fs.createFileAbsolute(dest, .{}) catch {
+    const dest_file = io_core.createFileAbsolute(dest, .{}) catch {
         do_reject(ctx, reject_fn, allocator, "copy create dest failed");
         return;
     };
@@ -881,7 +886,7 @@ fn runDeferredFsOpAppend(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve
         do_reject(ctx, reject_fn, allocator, "Shu.fs.append requires --allow-write");
         return;
     }
-    const file = std.fs.openFileAbsolute(op.path, .{ .mode = .read_write }) catch {
+    const file = io_core.openFileAbsolute(op.path, .{ .mode = .read_write }) catch {
         do_reject(ctx, reject_fn, allocator, "append open failed");
         return;
     };
@@ -906,7 +911,7 @@ fn runDeferredFsOpWrite(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_
         do_reject(ctx, reject_fn, allocator, "Shu.fs.write requires --allow-write");
         return;
     }
-    const file = std.fs.createFileAbsolute(op.path, .{}) catch {
+    const file = io_core.createFileAbsolute(op.path, .{}) catch {
         do_reject(ctx, reject_fn, allocator, "write create failed");
         return;
     };
@@ -926,8 +931,8 @@ fn runDeferredFsOpReadlink(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resol
         do_reject(ctx, reject_fn, allocator, "Shu.fs.readlink requires --allow-read");
         return;
     }
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const target = std.fs.readLinkAbsolute(op.path, &buf) catch {
+    var buf: [io_core.max_path_bytes]u8 = undefined;
+    const target = io_core.readLinkAbsolute(op.path, &buf) catch {
         do_reject(ctx, reject_fn, allocator, "readlink failed");
         return;
     };
@@ -958,20 +963,20 @@ fn runDeferredFsOpMkdirRecursive(ctx: jsc.JSContextRef, op: *const DeferredFsOp,
 
 /// 递归删除目录（仅 Zig 内部使用）；失败时返回 error，由调用方 reject
 fn deleteDirRecursiveAbsolute(allocator: std.mem.Allocator, path: []const u8) !void {
-    var dir = std.fs.openDirAbsolute(path, .{ .iterate = true }) catch return error.OpenFailed;
+    var dir = io_core.openDirAbsolute(path, .{ .iterate = true }) catch return error.OpenFailed;
     defer dir.close();
     var iter = dir.iterate();
     while (iter.next() catch return error.IterateFailed) |entry| {
-        const full = std.fs.path.join(allocator, &.{ path, entry.name }) catch return error.OutOfMemory;
+        const full = io_core.pathJoin(allocator, &.{ path, entry.name }) catch return error.OutOfMemory;
         defer allocator.free(full);
-        var d = std.fs.openDirAbsolute(full, .{ .iterate = true }) catch {
-            std.fs.deleteFileAbsolute(full) catch {};
+        var d = io_core.openDirAbsolute(full, .{ .iterate = true }) catch {
+            io_core.deleteFileAbsolute(full) catch {};
             continue;
         };
         d.close();
         try deleteDirRecursiveAbsolute(allocator, full);
     }
-    std.fs.deleteDirAbsolute(path) catch return error.DeleteFailed;
+    io_core.deleteDirAbsolute(path) catch return error.DeleteFailed;
 }
 
 fn runDeferredFsOpRmdirRecursive(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_fn: jsc.JSObjectRef, reject_fn: jsc.JSObjectRef, do_reject: *const fn (jsc.JSContextRef, jsc.JSObjectRef, std.mem.Allocator, []const u8) void) void {
@@ -1075,8 +1080,8 @@ fn doSubmitRead(
     reject_fn: jsc.JSValueRef,
 ) void {
     const allocator = globals.current_allocator orelse return;
-    var file = std.fs.openFileAbsolute(resolved, .{}) catch |e| {
-        if (e == std.fs.File.OpenError.FileNotFound) {
+    var file = io_core.openFileAbsolute(resolved, .{}) catch |e| {
+        if (e == io_core.FileOpenError.FileNotFound) {
             const msg = std.fmt.allocPrint(allocator, "File not found: {s}", .{resolved}) catch resolved;
             errors.reportToStderr(.{ .code = .file_not_found, .message = msg }) catch {};
             if (msg.ptr != resolved.ptr) allocator.free(msg);
@@ -1158,7 +1163,7 @@ fn doSubmitWrite(
     reject_fn: jsc.JSValueRef,
 ) void {
     const allocator = globals.current_allocator orelse return;
-    var file = std.fs.createFileAbsolute(resolved, .{}) catch {
+    var file = io_core.createFileAbsolute(resolved, .{}) catch {
         allocator.free(content);
         return;
     };
@@ -1453,7 +1458,7 @@ fn getResolvedPath(allocator: std.mem.Allocator, cwd: []const u8, ctx: jsc.JSCon
         return null;
     }
     const path = path_buf[0 .. n - 1];
-    const resolved = std.fs.path.resolve(allocator, &.{ cwd, path }) catch {
+    const resolved = io_core.pathResolve(allocator, &.{ cwd, path }) catch {
         allocator.free(path_buf);
         return null;
     };
@@ -1559,8 +1564,8 @@ fn readFileSyncCallback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.read requires --allow-read" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    const file = std.fs.openFileAbsolute(resolved, .{}) catch |e| {
-        if (e == std.fs.File.OpenError.FileNotFound) {
+    const file = io_core.openFileAbsolute(resolved, .{}) catch |e| {
+        if (e == io_core.FileOpenError.FileNotFound) {
             const msg = std.fmt.allocPrint(allocator, "File not found: {s}", .{resolved}) catch resolved;
             errors.reportToStderr(.{ .code = .file_not_found, .message = msg }) catch {};
             if (msg.ptr != resolved.ptr) allocator.free(msg);
@@ -1584,7 +1589,7 @@ fn readFileSyncCallback(
         if (max_sz <= 1 or max_sz > 32) break :blk false;
         var buf: [32]u8 = undefined;
         const n = jsc.JSStringGetUTF8CString(enc_str, &buf, max_sz);
-        const enc = buf[0 .. if (n > 0) n - 1 else 0];
+        const enc = buf[0..if (n > 0) n - 1 else 0];
         if (std.mem.eql(u8, enc, "buffer") or std.mem.eql(u8, enc, "binary") or enc.len == 0) break :blk true;
         break :blk false;
     };
@@ -1592,7 +1597,7 @@ fn readFileSyncCallback(
     if (return_buffer and stat.size >= FS_MAP_THRESHOLD and stat.kind == .file) {
         file.close();
         var mapped = io_core.mapFileReadOnly(resolved) catch {
-            var fallback_file = std.fs.openFileAbsolute(resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
+            var fallback_file = io_core.openFileAbsolute(resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
             defer fallback_file.close();
             const content = fallback_file.readToEndAlloc(allocator, std.math.maxInt(usize)) catch return jsc.JSValueMakeUndefined(ctx);
             var dc = allocator.create(FileBufferDeallocContext) catch {
@@ -1691,7 +1696,7 @@ fn writeFileSyncCallback(
     defer allocator.free(content_buf);
     const n = jsc.JSStringGetUTF8CString(content_js, content_buf.ptr, max_sz);
     const content = content_buf[0..if (n > 0) n - 1 else 0];
-    const file = std.fs.createFileAbsolute(resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
+    const file = io_core.createFileAbsolute(resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
     defer file.close();
     file.writeAll(content) catch return jsc.JSValueMakeUndefined(ctx);
     return jsc.JSValueMakeUndefined(ctx);
@@ -1713,7 +1718,7 @@ fn readdirSyncCallback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.readdir requires --allow-read" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    var dir = std.fs.openDirAbsolute(resolved, .{ .iterate = true }) catch return jsc.JSValueMakeUndefined(ctx);
+    var dir = io_core.openDirAbsolute(resolved, .{ .iterate = true }) catch return jsc.JSValueMakeUndefined(ctx);
     defer dir.close();
     var buf: [512]jsc.JSValueRef = undefined;
     var count: usize = 0;
@@ -1747,7 +1752,7 @@ fn mkdirSyncCallback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.mkdir requires --allow-write" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    std.fs.makeDirAbsolute(resolved) catch return jsc.JSValueMakeUndefined(ctx);
+    io_core.makeDirAbsolute(resolved) catch return jsc.JSValueMakeUndefined(ctx);
     return jsc.JSValueMakeUndefined(ctx);
 }
 
@@ -1766,7 +1771,7 @@ fn existsSyncCallback(
     if (!opts.permissions.allow_read) {
         return jsc.JSValueMakeBoolean(ctx, false);
     }
-    std.fs.accessAbsolute(resolved, .{}) catch return jsc.JSValueMakeBoolean(ctx, false);
+    io_core.accessAbsolute(resolved, .{}) catch return jsc.JSValueMakeBoolean(ctx, false);
     return jsc.JSValueMakeBoolean(ctx, true);
 }
 
@@ -1786,9 +1791,9 @@ fn statSyncCallback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.stat requires --allow-read" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    const file = std.fs.openFileAbsolute(resolved, .{}) catch |e| {
-        if (e == std.fs.File.OpenError.IsDir) {
-            var dir = std.fs.openDirAbsolute(resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
+    const file = io_core.openFileAbsolute(resolved, .{}) catch |e| {
+        if (e == io_core.FileOpenError.IsDir) {
+            var dir = io_core.openDirAbsolute(resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
             defer dir.close();
             const s = dir.stat() catch return jsc.JSValueMakeUndefined(ctx);
             const mtime_ns: i64 = @intCast(@min(s.mtime, std.math.maxInt(i64)));
@@ -1819,8 +1824,8 @@ fn realpathSyncCallback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.realpath requires --allow-read" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const canonical = std.fs.realpath(resolved, &buf) catch return jsc.JSValueMakeUndefined(ctx);
+    var buf: [io_core.max_path_bytes]u8 = undefined;
+    const canonical = io_core.realpath(resolved, &buf) catch return jsc.JSValueMakeUndefined(ctx);
     const dup = allocator.dupe(u8, canonical) catch return jsc.JSValueMakeUndefined(ctx);
     defer allocator.free(dup);
     const z = allocator.dupeZ(u8, dup) catch return jsc.JSValueMakeUndefined(ctx);
@@ -1847,9 +1852,9 @@ fn lstatSyncCallback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.lstat requires --allow-read" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    const dir_path = std.fs.path.dirname(resolved) orelse ".";
-    const base = std.fs.path.basename(resolved);
-    var dir = std.fs.openDirAbsolute(dir_path, .{}) catch return jsc.JSValueMakeUndefined(ctx);
+    const dir_path = io_core.pathDirname(resolved) orelse ".";
+    const base = io_core.pathBasename(resolved);
+    var dir = io_core.openDirAbsolute(dir_path, .{}) catch return jsc.JSValueMakeUndefined(ctx);
     defer dir.close();
     const s = if (base.len == 0)
         dir.stat() catch return jsc.JSValueMakeUndefined(ctx)
@@ -1884,7 +1889,7 @@ fn truncateSyncCallback(
         const n = jsc.JSValueToNumber(ctx, arguments[1], null);
         if (n == n and n >= 0) len = @min(@as(u64, @intFromFloat(n)), std.math.maxInt(u64));
     }
-    const file = std.fs.openFileAbsolute(resolved, .{ .mode = .read_write }) catch return jsc.JSValueMakeUndefined(ctx);
+    const file = io_core.openFileAbsolute(resolved, .{ .mode = .read_write }) catch return jsc.JSValueMakeUndefined(ctx);
     defer file.close();
     std.posix.ftruncate(file.handle, len) catch return jsc.JSValueMakeUndefined(ctx);
     return jsc.JSValueMakeUndefined(ctx);
@@ -1906,7 +1911,7 @@ fn accessSyncCallback(
     if (!opts.permissions.allow_read) {
         return jsc.JSValueMakeBoolean(ctx, false);
     }
-    var flags: std.fs.File.OpenFlags = .{};
+    var flags: io_core.FileOpenFlags = .{};
     if (argumentCount >= 2) {
         const m = jsc.JSValueToNumber(ctx, arguments[1], null);
         if (m == m) {
@@ -1918,7 +1923,7 @@ fn accessSyncCallback(
             // mode & 4 (X_OK) 无对应 Zig OpenMode，保留默认 .read_only 做存在性检查
         }
     }
-    std.fs.accessAbsolute(resolved, flags) catch return jsc.JSValueMakeBoolean(ctx, false);
+    io_core.accessAbsolute(resolved, flags) catch return jsc.JSValueMakeBoolean(ctx, false);
     return jsc.JSValueMakeBoolean(ctx, true);
 }
 
@@ -1938,7 +1943,7 @@ fn isEmptyDirSyncCallback(
     if (!opts.permissions.allow_read) {
         return jsc.JSValueMakeBoolean(ctx, false);
     }
-    var dir = std.fs.openDirAbsolute(resolved, .{ .iterate = true }) catch return jsc.JSValueMakeBoolean(ctx, false);
+    var dir = io_core.openDirAbsolute(resolved, .{ .iterate = true }) catch return jsc.JSValueMakeBoolean(ctx, false);
     defer dir.close();
     var iter = dir.iterate();
     var has_any = false;
@@ -1966,8 +1971,8 @@ fn sizeSyncCallback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.size requires --allow-read" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    const file = std.fs.openFileAbsolute(resolved, .{}) catch |e| {
-        if (e == std.fs.File.OpenError.IsDir) {
+    const file = io_core.openFileAbsolute(resolved, .{}) catch |e| {
+        if (e == io_core.FileOpenError.IsDir) {
             return jsc.JSValueMakeNumber(ctx, 0);
         }
         return jsc.JSValueMakeUndefined(ctx);
@@ -1991,7 +1996,7 @@ fn isFileSyncCallback(
     const resolved = getResolvedPath(allocator, opts.cwd, ctx, arguments, argumentCount, 0) orelse return jsc.JSValueMakeBoolean(ctx, false);
     defer allocator.free(resolved);
     if (!opts.permissions.allow_read) return jsc.JSValueMakeBoolean(ctx, false);
-    const file = std.fs.openFileAbsolute(resolved, .{}) catch return jsc.JSValueMakeBoolean(ctx, false);
+    const file = io_core.openFileAbsolute(resolved, .{}) catch return jsc.JSValueMakeBoolean(ctx, false);
     defer file.close();
     const s = file.stat() catch return jsc.JSValueMakeBoolean(ctx, false);
     return jsc.JSValueMakeBoolean(ctx, s.kind == .file);
@@ -2011,7 +2016,7 @@ fn isDirectorySyncCallback(
     const resolved = getResolvedPath(allocator, opts.cwd, ctx, arguments, argumentCount, 0) orelse return jsc.JSValueMakeBoolean(ctx, false);
     defer allocator.free(resolved);
     if (!opts.permissions.allow_read) return jsc.JSValueMakeBoolean(ctx, false);
-    var dir = std.fs.openDirAbsolute(resolved, .{}) catch return jsc.JSValueMakeBoolean(ctx, false);
+    var dir = io_core.openDirAbsolute(resolved, .{}) catch return jsc.JSValueMakeBoolean(ctx, false);
     defer dir.close();
     _ = dir.stat() catch return jsc.JSValueMakeBoolean(ctx, false);
     return jsc.JSValueMakeBoolean(ctx, true);
@@ -2034,7 +2039,7 @@ fn readdirWithStatsSyncCallback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.readdirWithStats requires --allow-read" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    var dir = std.fs.openDirAbsolute(resolved, .{ .iterate = true }) catch return jsc.JSValueMakeUndefined(ctx);
+    var dir = io_core.openDirAbsolute(resolved, .{ .iterate = true }) catch return jsc.JSValueMakeUndefined(ctx);
     defer dir.close();
     var buf: [512]jsc.JSValueRef = undefined;
     var count: usize = 0;
@@ -2094,17 +2099,17 @@ fn ensureFileSyncCallback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.ensureFile requires --allow-read and --allow-write" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    const file = std.fs.openFileAbsolute(resolved, .{}) catch |e| {
-        if (e == std.fs.File.OpenError.FileNotFound) {
-            const parent = std.fs.path.dirname(resolved) orelse return jsc.JSValueMakeUndefined(ctx);
+    const file = io_core.openFileAbsolute(resolved, .{}) catch |e| {
+        if (e == io_core.FileOpenError.FileNotFound) {
+            const parent = io_core.pathDirname(resolved) orelse return jsc.JSValueMakeUndefined(ctx);
             if (parent.len > 0 and parent.len < resolved.len) {
                 makeDirRecursiveAbsolute(allocator, parent);
             }
-            var f = std.fs.createFileAbsolute(resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
+            var f = io_core.createFileAbsolute(resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
             f.close();
             return jsc.JSValueMakeUndefined(ctx);
         }
-        if (e == std.fs.File.OpenError.IsDir) {
+        if (e == io_core.FileOpenError.IsDir) {
             errors.reportToStderr(.{ .code = .file_not_found, .message = "Shu.fs.ensureFile: path is a directory" }) catch {};
         }
         return jsc.JSValueMakeUndefined(ctx);
@@ -2129,7 +2134,7 @@ fn unlinkSyncCallback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.unlink requires --allow-write" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    std.fs.deleteFileAbsolute(resolved) catch return jsc.JSValueMakeUndefined(ctx);
+    io_core.deleteFileAbsolute(resolved) catch return jsc.JSValueMakeUndefined(ctx);
     return jsc.JSValueMakeUndefined(ctx);
 }
 
@@ -2149,7 +2154,7 @@ fn rmdirSyncCallback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.rmdir requires --allow-write" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    std.fs.deleteDirAbsolute(resolved) catch return jsc.JSValueMakeUndefined(ctx);
+    io_core.deleteDirAbsolute(resolved) catch return jsc.JSValueMakeUndefined(ctx);
     return jsc.JSValueMakeUndefined(ctx);
 }
 
@@ -2172,7 +2177,7 @@ fn renameSyncCallback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.rename requires --allow-read and --allow-write" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    std.fs.renameAbsolute(old_resolved, new_resolved) catch return jsc.JSValueMakeUndefined(ctx);
+    io_core.renameAbsolute(old_resolved, new_resolved) catch return jsc.JSValueMakeUndefined(ctx);
     return jsc.JSValueMakeUndefined(ctx);
 }
 
@@ -2196,8 +2201,8 @@ fn copySyncCallback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.copy requires --allow-read and --allow-write" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    const src_file = std.fs.openFileAbsolute(src_resolved, .{}) catch |e| {
-        if (e == std.fs.File.OpenError.FileNotFound) {
+    const src_file = io_core.openFileAbsolute(src_resolved, .{}) catch |e| {
+        if (e == io_core.FileOpenError.FileNotFound) {
             const msg = std.fmt.allocPrint(allocator, "File not found: {s}", .{src_resolved}) catch src_resolved;
             errors.reportToStderr(.{ .code = .file_not_found, .message = msg }) catch {};
             if (msg.ptr != src_resolved.ptr) allocator.free(msg);
@@ -2211,24 +2216,24 @@ fn copySyncCallback(
     if (src_stat.size >= FS_MAP_THRESHOLD and src_stat.kind == .file) {
         src_file.close();
         var mapped = io_core.mapFileReadOnly(src_resolved) catch {
-            var fallback_src = std.fs.openFileAbsolute(src_resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
+            var fallback_src = io_core.openFileAbsolute(src_resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
             defer fallback_src.close();
             const content = fallback_src.readToEndAlloc(allocator, std.math.maxInt(usize)) catch return jsc.JSValueMakeUndefined(ctx);
             defer allocator.free(content);
-            const dest_file = std.fs.createFileAbsolute(dest_resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
+            const dest_file = io_core.createFileAbsolute(dest_resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
             defer dest_file.close();
             dest_file.writeAll(content) catch return jsc.JSValueMakeUndefined(ctx);
             return jsc.JSValueMakeUndefined(ctx);
         };
         defer mapped.deinit();
-        const dest_file = std.fs.createFileAbsolute(dest_resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
+        const dest_file = io_core.createFileAbsolute(dest_resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
         defer dest_file.close();
         dest_file.writeAll(mapped.slice()) catch return jsc.JSValueMakeUndefined(ctx);
         return jsc.JSValueMakeUndefined(ctx);
     }
     src_file.close();
-    // §3.1/§5 小文件用 std.fs.copyFileAbsolute，由内核 copy_file_range/sendfile 等实现，避免 readToEndAlloc+writeAll 用户态拷贝
-    std.fs.copyFileAbsolute(src_resolved, dest_resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
+    // §3.1/§5 小文件用 io_core.copyFileAbsolute，由内核 copy_file_range/sendfile 等实现，避免 readToEndAlloc+writeAll 用户态拷贝
+    io_core.copyFileAbsolute(src_resolved, dest_resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
     return jsc.JSValueMakeUndefined(ctx);
 }
 
@@ -2258,9 +2263,9 @@ fn appendSyncCallback(
     defer allocator.free(content_buf);
     const n = jsc.JSStringGetUTF8CString(content_js, content_buf.ptr, max_sz);
     const content = content_buf[0..if (n > 0) n - 1 else 0];
-    var file = std.fs.openFileAbsolute(resolved, .{ .mode = .write_only }) catch |e| {
-        if (e == std.fs.File.OpenError.FileNotFound) {
-            var new_file = std.fs.createFileAbsolute(resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
+    var file = io_core.openFileAbsolute(resolved, .{ .mode = .write_only }) catch |e| {
+        if (e == io_core.FileOpenError.FileNotFound) {
+            var new_file = io_core.createFileAbsolute(resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
             defer new_file.close();
             new_file.writeAll(content) catch return jsc.JSValueMakeUndefined(ctx);
             return jsc.JSValueMakeUndefined(ctx);
@@ -2276,14 +2281,14 @@ fn appendSyncCallback(
 
 /// 递归创建目录（mkdir -p）：先创建父目录再创建当前路径
 fn makeDirRecursiveAbsolute(allocator: std.mem.Allocator, absolute_path: []const u8) void {
-    std.fs.makeDirAbsolute(absolute_path) catch |e| {
+    io_core.makeDirAbsolute(absolute_path) catch |e| {
         switch (e) {
             error.PathAlreadyExists => return,
             else => {
-                const parent = std.fs.path.dirname(absolute_path) orelse return;
+                const parent = io_core.pathDirname(absolute_path) orelse return;
                 if (parent.len == 0 or parent.len >= absolute_path.len) return;
                 makeDirRecursiveAbsolute(allocator, parent);
-                std.fs.makeDirAbsolute(absolute_path) catch return;
+                io_core.makeDirAbsolute(absolute_path) catch return;
             },
         }
     };
@@ -2309,7 +2314,7 @@ fn symlinkSyncCallback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.symlink requires --allow-write" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    std.fs.symLinkAbsolute(target_resolved, link_resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
+    io_core.symLinkAbsolute(target_resolved, link_resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
     return jsc.JSValueMakeUndefined(ctx);
 }
 
@@ -2330,8 +2335,8 @@ fn readlinkSyncCallback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.readlink requires --allow-read" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const target = std.fs.readLinkAbsolute(resolved, &buf) catch return jsc.JSValueMakeUndefined(ctx);
+    var buf: [io_core.max_path_bytes]u8 = undefined;
+    const target = io_core.readLinkAbsolute(resolved, &buf) catch return jsc.JSValueMakeUndefined(ctx);
     const target_dup = allocator.dupe(u8, target) catch return jsc.JSValueMakeUndefined(ctx);
     defer allocator.free(target_dup);
     const target_z = allocator.dupeZ(u8, target_dup) catch return jsc.JSValueMakeUndefined(ctx);
@@ -2379,7 +2384,7 @@ fn rmdirRecursiveSyncCallback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.rmdir requires --allow-write" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    std.fs.deleteTreeAbsolute(resolved) catch return jsc.JSValueMakeUndefined(ctx);
+    io_core.deleteTreeAbsolute(resolved) catch return jsc.JSValueMakeUndefined(ctx);
     return jsc.JSValueMakeUndefined(ctx);
 }
 

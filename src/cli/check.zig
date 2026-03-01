@@ -10,7 +10,7 @@ pub fn check(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional: 
     _ = allocator;
     _ = parsed;
     _ = positional;
-    try printToStdout("shu check: 尚未实现（Phase 0 占位）\n", .{});
+    try printToStdout("shu check: not implemented (Phase 0 placeholder)\n", .{});
 }
 
 fn printToStdout(comptime fmt: []const u8, fargs: anytype) !void {

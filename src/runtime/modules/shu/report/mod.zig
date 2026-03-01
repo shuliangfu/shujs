@@ -25,12 +25,14 @@ fn buildReportString(allocator: std.mem.Allocator) []const u8 {
     w.print("Time: {d}\n", .{std.time.timestamp()}) catch return "";
     if (globals.current_run_options) |opts| {
         w.print("Entry: {s}\nCwd: {s}\n", .{ opts.entry_path, opts.cwd }) catch return "";
-        w.print("Permissions: read={} write={} net={} env={} exec={}\n", .{
+        w.print("Permissions: read={} write={} net={} env={} run={} hrtime={} ffi={}\n", .{
             opts.permissions.allow_read,
             opts.permissions.allow_write,
             opts.permissions.allow_net,
             opts.permissions.allow_env,
-            opts.permissions.allow_exec,
+            opts.permissions.allow_run,
+            opts.permissions.allow_hrtime,
+            opts.permissions.allow_ffi,
         }) catch return "";
     } else {
         w.print("(no run context)\n", .{}) catch return "";

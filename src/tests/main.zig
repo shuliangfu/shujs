@@ -10,6 +10,7 @@ const path_tests = @import("runtime/modules/shu/path.zig");
 const fs_tests = @import("runtime/modules/shu/fs.zig");
 const hpack_huffman_tests = @import("runtime/modules/shu/server/hpack_huffman_tests.zig");
 const server_integration_tests = @import("runtime/modules/shu/server/server_integration.zig");
+const package_tests = @import("package.zig");
 
 test "test harness: suites loaded" {
     _ = strip_types_tests;
@@ -20,4 +21,5 @@ test "test harness: suites loaded" {
     _ = fs_tests;
     _ = hpack_huffman_tests;
     _ = server_integration_tests;
+    _ = package_tests;
 }

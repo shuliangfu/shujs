@@ -46,3 +46,6 @@ coverage/
 # 日志
 *.log
 logs/
+
+# 分析
+analysis
