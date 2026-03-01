@@ -207,34 +207,21 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run shu CLI");
     run_step.dependOn(&run_cmd.step);
 
-    // 单元测试：strip_types（词法/类型擦除）
+    // 单元测试：入口为 src/test_runner.zig，模块根为 src/；拉入 server/http2.zig 时需能解析 hpack_huffman
     const test_module = b.createModule(.{
-        .root_source_file = b.path("src/transpiler/strip_types.zig"),
+        .root_source_file = b.path("src/test_runner.zig"),
         .target = target,
         .optimize = optimize,
     });
+    test_module.addImport("hpack_huffman", hpack_huffman_module);
     const test_exe = b.addTest(.{
         .root_module = test_module,
     });
     const run_tests = b.addRunArtifact(test_exe);
-    const test_step = b.step("test", "Run unit tests (strip_types + server)");
+    const test_step = b.step("test", "Run all tests (目标：全面覆盖)");
     test_step.dependOn(&run_tests.step);
-
-    // Server 模块单元测试：websocket.zig、http2.zig 的 test 块（不依赖 JSC）
-    const server_test_module = b.createModule(.{
-        .root_source_file = b.path("src/runtime/modules/shu/server/test_runner.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    server_test_module.addImport("hpack_huffman", hpack_huffman_module);
-    server_test_module.addImport("io_core", io_core_module);
-    const server_test_exe = b.addTest(.{
-        .root_module = server_test_module,
-    });
-    const server_run_tests = b.addRunArtifact(server_test_exe);
-    const test_server_step = b.step("test-server", "Run server (websocket, http2) unit tests only");
-    test_server_step.dependOn(&server_run_tests.step);
-    test_step.dependOn(&server_run_tests.step);
+    // path/fs 等测试需运行 zig-out/bin/shu，故 test 前先执行 install
+    run_tests.step.dependOn(b.getInstallStep());
 
     // 从 BUILTINS.md 自动生成 JS API 参考文档（输出到 docs/JS_API_REFERENCE.md）
     const gen_docs = b.addSystemCommand(&.{

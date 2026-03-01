@@ -10,6 +10,7 @@ const common = @import("../../../common.zig");
 const run_options = @import("../../../run_options.zig");
 const thread_worker = @import("worker.zig");
 const strip_types = @import("../../../../transpiler/strip_types.zig");
+const jsx = @import("../../../../transpiler/jsx.zig");
 const run_mod = @import("../system/run.zig");
 const vm = @import("../../../vm.zig");
 
@@ -64,15 +65,22 @@ fn threadWorkerEntry(args: *WorkerArgs) void {
     defer args.allocator.free(raw);
 
     var stripped_to_free: ?[]const u8 = null;
+    var jsx_to_free: ?[]const u8 = null;
     const source: []const u8 = blk: {
         if (hasExtension(args.entry_path, ".ts") or hasExtension(args.entry_path, ".tsx") or hasExtension(args.entry_path, ".mts")) {
             const stripped = strip_types.strip(args.allocator, raw) catch return;
             stripped_to_free = stripped;
+            if (hasExtension(args.entry_path, ".tsx")) {
+                const jsx_src = jsx.transformDefault(args.allocator, stripped) catch return;
+                jsx_to_free = jsx_src;
+                break :blk jsx_src;
+            }
             break :blk stripped;
         }
         break :blk raw;
     };
     defer if (stripped_to_free) |s| args.allocator.free(s);
+    defer if (jsx_to_free) |j| args.allocator.free(j);
 
     var argv_buf = [_][]const u8{ "shu", args.entry_path };
     const options = run_options.RunOptions{

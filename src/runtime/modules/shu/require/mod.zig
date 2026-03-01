@@ -9,6 +9,7 @@ const globals = @import("../../../globals.zig");
 const errors = @import("../../../../errors.zig");
 const node_builtin = @import("../../node/builtin.zig");
 const shu_builtin = @import("../builtin.zig");
+const pkg_resolver = @import("../../../../package/resolver.zig");
 
 /// 单次 run 的模块缓存：resolved_path -> 已保护的 exports 值（避免 GC）；allocator 由 initCache(allocator) 调用方传入，put/clear 等由各回调的 globals.current_allocator 或参数提供（§1.1 不持全局 allocator）
 var g_cache: ?*std.StringHashMap(CacheEntry) = null;
@@ -228,7 +229,7 @@ pub fn resolveSpecifierForPackageJson(allocator: std.mem.Allocator, base_path: [
     return null;
 }
 
-/// 解析 require(id)：仅支持相对路径 ./ 或 ../；id 可带 ?query；node:/shu: 在 requireCallback 中直接走内置，不进入 resolveId
+/// 解析 require(id)：相对路径 ./ ../、裸说明符（node_modules + main/exports）、jsr:；id 可带 ?query；node:/shu: 在 requireCallback 中直接走内置，不进入 resolveId
 fn resolveId(allocator: std.mem.Allocator, parent_dir: []const u8, id: []const u8) !ResolveResult {
     if (std.mem.startsWith(u8, id, "node:")) {
         errors.reportToStderr(.{ .code = .type_error, .message = "require(node:...) only supports registered node: builtins" }) catch {};
@@ -238,18 +239,25 @@ fn resolveId(allocator: std.mem.Allocator, parent_dir: []const u8, id: []const u
         errors.reportToStderr(.{ .code = .type_error, .message = "require(shu:...) only supports registered shu: builtins (fs, path, zlib, crypto, assert, events, util, querystring, url, string_decoder)" }) catch {};
         return error.NotImplemented;
     }
-    if (!std.mem.startsWith(u8, id, ".")) {
-        errors.reportToStderr(.{ .code = .type_error, .message = "require() only supports relative paths (./ or ../) for now" }) catch {};
-        return error.NotImplemented;
+    if (std.mem.startsWith(u8, id, ".")) {
+        const split = splitIdQuery(id);
+        const file_path = try std.fs.path.resolve(allocator, &.{ parent_dir, split.path_part });
+        errdefer allocator.free(file_path);
+        if (split.query.len == 0) {
+            return .{ .file_path = file_path, .cache_key = file_path };
+        }
+        const cache_key = try std.mem.concat(allocator, u8, &.{ file_path, split.query });
+        return .{ .file_path = file_path, .cache_key = cache_key };
     }
-    const split = splitIdQuery(id);
-    const file_path = try std.fs.path.resolve(allocator, &.{ parent_dir, split.path_part });
-    errdefer allocator.free(file_path);
-    if (split.query.len == 0) {
-        return .{ .file_path = file_path, .cache_key = file_path };
-    }
-    const cache_key = try std.mem.concat(allocator, u8, &.{ file_path, split.query });
-    return .{ .file_path = file_path, .cache_key = cache_key };
+    const pkg_result = pkg_resolver.resolve(allocator, parent_dir, id, .require) catch |e| {
+        if (e == error.ModuleNotFound) {
+            var msg_buf: [512]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&msg_buf, "Cannot find module: {s}", .{id}) catch "Cannot find module";
+            errors.reportToStderr(.{ .code = .file_not_found, .message = msg }) catch {};
+        }
+        return e;
+    };
+    return .{ .file_path = pkg_result.file_path, .cache_key = pkg_result.cache_key };
 }
 
 fn readFileContent(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {

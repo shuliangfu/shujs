@@ -63,7 +63,7 @@
 | Shu.fs | `Shu.fs.readlink(path)` / `Shu.fs.readlinkSync(path)` | 异步 Promise\<string\> / 同步返回链接目标路径 | `shu/fs.zig` | `--allow-read` |
 | Shu.fs | `Shu.fs.mkdirRecursive(path)` / `Shu.fs.mkdirRecursiveSync(path)` | 异步 Promise\<void\> / 同步递归创建目录（mkdir -p 风格） | `shu/fs.zig` | `--allow-write` |
 | Shu.fs | `Shu.fs.rmdirRecursive(path)` / `Shu.fs.rmdirRecursiveSync(path)` | 异步 Promise\<void\> / 同步递归删除目录及内容（rm -rf 风格） | `shu/fs.zig` | `--allow-write` |
-| Shu.path | `Shu.path.join(...parts)`、`Shu.path.resolve(...parts)`、`dirname`、`basename`、`extname`、`normalize`、`isAbsolute`、`relative`、`filePathToUrl`、`urlToFilePath`、`sep`、`delimiter` | 路径工具 | `shu/path.zig` | 无 |
+| Shu.path | `join`、`resolve`、`dirname`、`basename`、`extname`、`normalize`、`isAbsolute`、`relative`、`parse`、`format`、`root`、`name`、`toNamespacedPath`、`filePathToUrl`、`urlToFilePath`、`sep`、`delimiter`、`posix`、`win32` | 路径工具 | `shu/path.zig` | 无 |
 | Shu.system | `Shu.system.exec(cmd)` / `execSync(cmd)` | 通过 shell 执行命令，返回 `{ stdout, stderr, code }` | `shu/system/exec.zig` | `--allow-exec` |
 | Shu.system | `Shu.system.run(options)` / `runSync(options)` | 不经过 shell 执行（options.cmd 数组、cwd），返回 `{ status, stdout, stderr }` | `shu/system/run.zig` | `--allow-exec` |
 | Shu.system | `Shu.system.spawn(options)` / `spawnSync(options)` | 同 run，当前实现与 run 一致 | `shu/system/spawn.zig` | `--allow-exec` |
@@ -138,7 +138,7 @@
 
 | Node 模块 | Node 常用 API | Shu 对应实现 | 说明 |
 |-----------|----------------|--------------|------|
-| **node:path** | path.join、path.resolve、path.dirname、path.basename、path.extname、path.normalize、path.isAbsolute、path.relative、path.sep、path.delimiter | **Shu.path** 同名或等价（join、resolve、dirname、basename、extname、normalize、isAbsolute、relative、sep、delimiter）；另有 filePathToUrl、urlToFilePath | 一一对应，**已同步** |
+| **node:path** | path.join、path.resolve、path.dirname、path.basename、path.extname、path.normalize、path.isAbsolute、path.relative、path.parse、path.format、path.toNamespacedPath、path.posix、path.win32、path.sep、path.delimiter | **Shu.path** 同名或等价；另有 root、name（Shu 特色）、filePathToUrl、urlToFilePath | 一一对应，**已同步** |
 | **node:fs** | readFileSync、writeFileSync、readdirSync、mkdirSync、existsSync、statSync、unlinkSync、rmdirSync、renameSync、copyFileSync、appendFileSync、symlinkSync、readlinkSync | **Shu.fs**→readFileSync 等（脚本薄封装） | **已同步** |
 | **node:http** | createServer、request 等 | **Shu.server** 已提供 HTTP 服务端；可薄包装为 Node 的 createServer/IncomingMessage/ServerResponse 风格 | 未同步，需适配请求/响应对象形态 |
 

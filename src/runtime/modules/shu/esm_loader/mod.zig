@@ -8,6 +8,7 @@ const globals = @import("../../../globals.zig");
 const errors = @import("../../../../errors.zig");
 const node_builtin = @import("../../node/builtin.zig");
 const shu_builtin = @import("../builtin.zig");
+const pkg_resolver = @import("../../../../package/resolver.zig");
 
 /// 单条 import 的绑定类型
 const ImportKind = enum { default_import, named_imports, namespace };
@@ -213,24 +214,31 @@ fn splitSpecifierQuery(specifier: []const u8) struct { path_part: []const u8, qu
 /// 解析结果：file_path 用于读文件与 __filename；cache_key 用于模块图去重（有 ?query 时为 path+query）
 const ResolveResult = struct { file_path: []const u8, cache_key: []const u8 };
 
-/// 解析说明符为绝对路径：仅支持 ./ ../；可带 ?query，仅路径参与解析，返回 file_path + cache_key
+/// 解析说明符为绝对路径：相对路径 ./ ../、裸说明符（node_modules + main/exports）、jsr:；可带 ?query，返回 file_path + cache_key
 fn resolveSpecifier(allocator: std.mem.Allocator, parent_dir: []const u8, specifier: []const u8) !ResolveResult {
     if (std.mem.startsWith(u8, specifier, "node:")) {
         errors.reportToStderr(.{ .code = .type_error, .message = "ESM import(node:...) is not implemented yet" }) catch {};
         return error.NotImplemented;
     }
-    if (!std.mem.startsWith(u8, specifier, ".")) {
-        errors.reportToStderr(.{ .code = .type_error, .message = "ESM import only supports relative paths (./ or ../) for now" }) catch {};
-        return error.NotImplemented;
+    if (std.mem.startsWith(u8, specifier, ".")) {
+        const split = splitSpecifierQuery(specifier);
+        const file_path = try std.fs.path.resolve(allocator, &.{ parent_dir, split.path_part });
+        errdefer allocator.free(file_path);
+        if (split.query.len == 0) {
+            return .{ .file_path = file_path, .cache_key = file_path };
+        }
+        const cache_key = try std.mem.concat(allocator, u8, &.{ file_path, split.query });
+        return .{ .file_path = file_path, .cache_key = cache_key };
     }
-    const split = splitSpecifierQuery(specifier);
-    const file_path = try std.fs.path.resolve(allocator, &.{ parent_dir, split.path_part });
-    errdefer allocator.free(file_path);
-    if (split.query.len == 0) {
-        return .{ .file_path = file_path, .cache_key = file_path };
-    }
-    const cache_key = try std.mem.concat(allocator, u8, &.{ file_path, split.query });
-    return .{ .file_path = file_path, .cache_key = cache_key };
+    const pkg_result = pkg_resolver.resolve(allocator, parent_dir, specifier, .import) catch |e| {
+        if (e == error.ModuleNotFound) {
+            var msg_buf: [512]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&msg_buf, "Cannot find module: {s}", .{specifier}) catch "Cannot find module";
+            errors.reportToStderr(.{ .code = .file_not_found, .message = msg }) catch {};
+        }
+        return e;
+    };
+    return .{ .file_path = pkg_result.file_path, .cache_key = pkg_result.cache_key };
 }
 
 /// 读取文件内容

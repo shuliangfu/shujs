@@ -6,11 +6,14 @@ const std = @import("std");
 const args_mod = @import("args.zig");
 const errors = @import("../errors.zig");
 const strip_types = @import("../transpiler/strip_types.zig");
+const jsx = @import("../transpiler/jsx.zig");
 const run_options = @import("../runtime/run_options.zig");
 const vm = @import("../runtime/vm.zig");
+const pkg_install = @import("../package/install.zig");
 
 /// 执行 shu run [entry] 或 shu run <script>
-/// entry 可为单文件路径；.ts/.tsx 会先做类型擦除再执行。
+/// entry 可为单文件路径；.ts/.tsx 会先做类型擦除；.tsx 再经 JSX 转译（默认 @dreamer/view 格式）。
+/// 若当前目录存在 package.json 或 package.jsonc、deno.json 或 deno.jsonc 任一，会先自动执行依赖安装（与 Deno 一致）；皆无则跳过。
 /// argv 为完整命令行参数（含程序名与子命令），用于 process.argv。
 pub fn run(allocator: std.mem.Allocator, parsed: args_mod.ParsedArgs, positional: []const []const u8, argv: []const []const u8) !void {
     if (parsed.help or positional.len == 0) {
@@ -20,6 +23,15 @@ pub fn run(allocator: std.mem.Allocator, parsed: args_mod.ParsedArgs, positional
     }
 
     const entry = positional[0];
+    const cwd_str = try std.process.getCwdAlloc(allocator);
+    defer allocator.free(cwd_str);
+    // 存在 package.json/jsonc 或 deno.json/jsonc 时自动安装依赖（Deno 风格）；皆无则跳过（install 需 package 才真正安装，仅 deno 时会 NoManifest）
+    if (hasAnyManifest(cwd_str)) {
+        pkg_install.install(allocator, cwd_str) catch |e| {
+            if (e != error.NoManifest) return e;
+        };
+    }
+
     const cwd_dir = std.fs.cwd();
     const file = cwd_dir.openFile(entry, .{}) catch |e| {
         if (e == std.fs.File.OpenError.FileNotFound) {
@@ -36,19 +48,24 @@ pub fn run(allocator: std.mem.Allocator, parsed: args_mod.ParsedArgs, positional
     defer allocator.free(raw);
 
     var stripped_to_free: ?[]const u8 = null;
+    var jsx_to_free: ?[]const u8 = null;
     const source: []const u8 = blk: {
         if (hasExtension(entry, ".ts") or hasExtension(entry, ".tsx") or hasExtension(entry, ".mts")) {
             const stripped = strip_types.strip(allocator, raw) catch return;
             stripped_to_free = stripped;
+            if (hasExtension(entry, ".tsx")) {
+                const jsx_src = jsx.transformDefault(allocator, stripped) catch return;
+                jsx_to_free = jsx_src;
+                break :blk jsx_src;
+            }
             break :blk stripped;
         }
         break :blk raw;
     };
     defer if (stripped_to_free) |s| allocator.free(s);
+    defer if (jsx_to_free) |j| allocator.free(j);
 
     // 构建 RunOptions：cwd、入口绝对路径、argv、权限（供 process / __dirname / __filename）
-    const cwd_str = try std.process.getCwdAlloc(allocator);
-    defer allocator.free(cwd_str);
     const entry_path_abs = try std.fs.path.join(allocator, &.{ cwd_str, entry });
     defer allocator.free(entry_path_abs);
     const is_forked = std.posix.getenv("SHU_FORKED") != null;
@@ -63,13 +80,26 @@ pub fn run(allocator: std.mem.Allocator, parsed: args_mod.ParsedArgs, positional
             .allow_write = parsed.allow_write,
             .allow_exec = parsed.allow_exec,
         },
-        .locale = parsed.lang orelse run_options.default_locale,
+        .locale = run_options.default_locale,
         .is_forked = is_forked,
     };
 
     var runtime = vm.VM.init(allocator, &options) catch return;
     defer runtime.deinit();
     try runtime.run(source, entry_path_abs);
+}
+
+/// 当前目录是否存在任意 manifest：package.json 或 package.jsonc、deno.json 或 deno.jsonc 任一存在即返回 true
+fn hasAnyManifest(dir: []const u8) bool {
+    const names = [_][]const u8{ "package.json", "package.jsonc", "deno.json", "deno.jsonc" };
+    var d = std.fs.openDirAbsolute(dir, .{}) catch return false;
+    defer d.close();
+    for (names) |name| {
+        const f = d.openFile(name, .{}) catch continue;
+        f.close();
+        return true;
+    }
+    return false;
 }
 
 fn hasExtension(path: []const u8, ext: []const u8) bool {
@@ -81,7 +111,7 @@ fn hasExtension(path: []const u8, ext: []const u8) bool {
 fn printRunUsage() !void {
     try printToStdout(
         \\shu run <entry> [options...]
-        \\Run a single .js/.ts/.tsx file (types stripped for .ts); or package.json script (later).
+        \\Run a single .js/.ts/.tsx file (types stripped; .tsx also JSX-transformed); or package.json script (later).
         \\Options: --allow-net, --allow-read, --allow-env, --allow-write, --allow-exec
         \\
     , .{});

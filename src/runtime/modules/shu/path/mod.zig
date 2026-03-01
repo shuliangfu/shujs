@@ -1,5 +1,50 @@
-// Shu.path 路径相关 API：join、resolve、dirname、basename、extname、normalize、isAbsolute、relative、filePathToUrl、urlToFilePath、sep、delimiter
-// §2.2 性能规则：os 相关用 comptime 常量，避免热路径重复分支
+//! Shu.path：路径字符串解析与组装，纯逻辑无 I/O，不访问文件系统。
+//!
+//! ## 提供 API（同步，无权限要求）
+//! - **join(...parts)**：多段路径用平台分隔符拼接并规范化
+//! - **resolve(...parts)**：相对当前工作目录解析为绝对路径（从右到左）
+//! - **dirname(path)**：目录部分（不含最后一段）
+//! - **basename(path [, ext])**：最后一段；可选第二参去掉后缀
+//! - **extname(path)**：扩展名（含点，如 ".zig"）
+//! - **normalize(path)**：规范化（解析 .、.. 与多余分隔符）
+//! - **isAbsolute(path)**：是否绝对路径
+//! - **relative(from, to)**：从 from 到 to 的相对路径
+//! - **parse(path)**：返回 `{ root, dir, base, name, ext }`，与 Node path.parse 一致
+//! - **format(pathObject)**：从 `{ root, dir, base, name, ext }` 组装路径，与 Node path.format 一致
+//! - **root(path)**：仅返回根部分（如 "/"、"C:\\"），等价 parse(path).root（Shu 特色）
+//! - **name(path)**：仅返回文件名无扩展名，等价 parse(path).name（Shu 特色）
+//! - **toNamespacedPath(path)**：Windows 下转为 `\\?\` 长路径命名空间，非 Windows 返回规范化绝对路径
+//! - **filePathToUrl(path)**：路径 → file: URL 字符串（等价 Node url.pathToFileURL）
+//! - **urlToFilePath(url)**：file: URL → 路径（等价 Node url.fileURLToPath）
+//! - **sep**：路径分隔符（"/" 或 "\\"）
+//! - **delimiter**：环境变量分隔符（":" 或 ";"）
+//! - **posix** / **win32**：子对象，同名方法 + 固定 sep/delimiter（posix: "/"、":"，win32: "\\"、";"），便于跨平台脚本
+//!
+//! ## 与 Node.js (node:path) 兼容情况
+//! | Node API | Shu.path | 说明 |
+//! |----------|---------|------|
+//! | path.join, resolve, dirname, basename, extname, normalize, isAbsolute, relative | 同名 | 行为与 Node 一致，按当前 OS 分隔符 |
+//! | path.parse, path.format | 同名 | 返回/接收 { root, dir, base, name, ext } |
+//! | path.sep, path.delimiter | 同名 | 只读属性 |
+//! | path.posix, path.win32 | 同名 | 子对象，相同方法 + 固定 sep/delimiter |
+//! | path.toNamespacedPath | 同名 | Windows 长路径 `\\?\`；非 Windows 返回规范化路径 |
+//! | url.pathToFileURL / url.fileURLToPath | filePathToUrl / urlToFilePath | 功能等价，命名不同 |
+//! | path.root / path.name | 有 | Node 无此二者，为 Shu 特色便捷方法 |
+//!
+//! ## 与 Deno 兼容情况
+//! - Deno 使用 `@std/path` 或 `Deno` 命名空间：basename、dirname、extname、join、normalize、resolve、relative、isAbsolute、fromFileUrl、toFileUrl、parse、format 等。
+//! - Shu.path 的 join/resolve/dirname/basename/extname/normalize/isAbsolute/relative/parse/format 与 @std/path 对应方法语义一致。
+//! - filePathToUrl ≈ toFileUrl，urlToFilePath ≈ fromFileUrl；sep、delimiter 与 std path 一致。
+//! - root、name、toNamespacedPath 为 Shu 扩展；posix/win32 与 Node 对齐，Deno std 有 posix/win32 子模块可类比。
+//!
+//! ## 与 Bun 兼容情况
+//! - Bun 兼容 Node path 模块：`import path from "node:path"` 或 `import * as path from "path"`。
+//! - Shu.path 提供的 join、resolve、dirname、basename、extname、normalize、isAbsolute、relative、parse、format、sep、delimiter、posix、win32、toNamespacedPath 与 Node/Bun 一致或等价。
+//! - filePathToUrl/urlToFilePath 对应 Node 的 url.pathToFileURL/url.fileURLToPath；root、name 为 Shu 额外便捷 API。
+//!
+//! ## 性能与约定
+//! - §2.2 性能规则：os 相关用 comptime 常量（is_windows、path_sep、path_delimiter），避免热路径运行时分支。
+//! - 所有方法均为纯字符串解析，不触发 I/O，无需 --allow-read/--allow-write。
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -25,11 +70,59 @@ pub fn getExports(ctx: jsc.JSContextRef, _: std.mem.Allocator) jsc.JSValueRef {
     common.setMethod(ctx, path_obj, "normalize", pathNormalizeCallback);
     common.setMethod(ctx, path_obj, "isAbsolute", pathIsAbsoluteCallback);
     common.setMethod(ctx, path_obj, "relative", pathRelativeCallback);
+    common.setMethod(ctx, path_obj, "parse", pathParseCallback);
+    common.setMethod(ctx, path_obj, "format", pathFormatCallback);
+    common.setMethod(ctx, path_obj, "root", pathRootCallback);
+    common.setMethod(ctx, path_obj, "name", pathNameCallback);
+    common.setMethod(ctx, path_obj, "toNamespacedPath", pathToNamespacedPathCallback);
     common.setMethod(ctx, path_obj, "filePathToUrl", pathFilePathToUrlCallback);
     common.setMethod(ctx, path_obj, "urlToFilePath", pathUrlToFilePathCallback);
     setStringProperty(ctx, path_obj, "sep", path_sep);
     setStringProperty(ctx, path_obj, "delimiter", path_delimiter);
+    // Node 兼容：path.posix / path.win32 固定平台规则，sep 与 delimiter 固定
+    const posix_obj = jsc.JSObjectMake(ctx, null, null);
+    setPathPlatformProperty(ctx, posix_obj, "posix");
+    attachPathMethodsToObject(ctx, posix_obj, "/", ":");
+    const win32_obj = jsc.JSObjectMake(ctx, null, null);
+    setPathPlatformProperty(ctx, win32_obj, "win32");
+    attachPathMethodsToObject(ctx, win32_obj, "\\", ";");
+    const k_posix = jsc.JSStringCreateWithUTF8CString("posix");
+    defer jsc.JSStringRelease(k_posix);
+    const k_win32 = jsc.JSStringCreateWithUTF8CString("win32");
+    defer jsc.JSStringRelease(k_win32);
+    _ = jsc.JSObjectSetProperty(ctx, path_obj, k_posix, posix_obj, jsc.kJSPropertyAttributeNone, null);
+    _ = jsc.JSObjectSetProperty(ctx, path_obj, k_win32, win32_obj, jsc.kJSPropertyAttributeNone, null);
     return path_obj;
+}
+
+/// 在 obj 上设置 __pathPlatform 为 "posix" 或 "win32"，供回调通过 this 判断平台
+fn setPathPlatformProperty(ctx: jsc.JSContextRef, obj: jsc.JSObjectRef, platform: [*:0]const u8) void {
+    const k = jsc.JSStringCreateWithUTF8CString("__pathPlatform");
+    defer jsc.JSStringRelease(k);
+    const v = jsc.JSStringCreateWithUTF8CString(platform);
+    defer jsc.JSStringRelease(v);
+    _ = jsc.JSObjectSetProperty(ctx, obj, k, jsc.JSValueMakeString(ctx, v), jsc.kJSPropertyAttributeNone, null);
+}
+
+/// 向 target 挂载与 path_obj 相同的方法及 sep/delimiter，用于 posix/win32 子对象
+fn attachPathMethodsToObject(ctx: jsc.JSContextRef, target: jsc.JSObjectRef, sep: [*:0]const u8, delimiter: [*:0]const u8) void {
+    setStringProperty(ctx, target, "sep", sep);
+    setStringProperty(ctx, target, "delimiter", delimiter);
+    common.setMethod(ctx, target, "join", pathJoinCallback);
+    common.setMethod(ctx, target, "resolve", pathResolveCallback);
+    common.setMethod(ctx, target, "dirname", pathDirnameCallback);
+    common.setMethod(ctx, target, "basename", pathBasenameCallback);
+    common.setMethod(ctx, target, "extname", pathExtnameCallback);
+    common.setMethod(ctx, target, "normalize", pathNormalizeCallback);
+    common.setMethod(ctx, target, "isAbsolute", pathIsAbsoluteCallback);
+    common.setMethod(ctx, target, "relative", pathRelativeCallback);
+    common.setMethod(ctx, target, "parse", pathParseCallback);
+    common.setMethod(ctx, target, "format", pathFormatCallback);
+    common.setMethod(ctx, target, "root", pathRootCallback);
+    common.setMethod(ctx, target, "name", pathNameCallback);
+    common.setMethod(ctx, target, "toNamespacedPath", pathToNamespacedPathCallback);
+    common.setMethod(ctx, target, "filePathToUrl", pathFilePathToUrlCallback);
+    common.setMethod(ctx, target, "urlToFilePath", pathUrlToFilePathCallback);
 }
 
 /// 向 shu_obj 上注册 Shu.path 子对象（委托 getExports）
@@ -277,6 +370,268 @@ fn pathRelativeCallback(
     const rel = std.fs.path.relative(allocator, from, to) catch return jsc.JSValueMakeUndefined(ctx);
     defer allocator.free(rel);
     return stringToJS(ctx, allocator, rel);
+}
+
+// ---------- parse / format（Node path.parse / path.format 兼容）----------
+
+/// 从绝对路径中解析出 root 部分（POSIX 为 "/"，Windows 为 "C:\\" 或 "\\\\server\\share"）；非绝对路径返回空切片；path 为传入路径，返回值为 path 的切片，不分配
+fn pathRootSlice(path: []const u8) []const u8 {
+    if (path.len == 0) return path;
+    if (is_windows) {
+        // Windows: "C:\" 或 "C:" 或 "\\server\share"
+        if (path.len >= 2 and path[1] == ':') {
+            if (path.len >= 3 and (path[2] == '/' or path[2] == '\\'))
+                return path[0..3];
+            return path[0..2];
+        }
+        if (path.len >= 2 and (path[0] == '/' or path[0] == '\\') and (path[1] == '/' or path[1] == '\\')) {
+            var i: usize = 2;
+            var count: u32 = 0;
+            while (i < path.len) : (i += 1) {
+                if (path[i] == '/' or path[i] == '\\') {
+                    count += 1;
+                    if (count == 2) return path[0..i];
+                }
+            }
+            return path;
+        }
+        return path[0..0];
+    }
+    // POSIX
+    if (path[0] == '/') return path[0..1];
+    return path[0..0];
+}
+
+/// Shu.path.parse(path)：返回 { root, dir, base, name, ext }，与 Node path.parse 一致；需 -- 无，纯字符串解析
+fn pathParseCallback(
+    ctx: jsc.JSContextRef,
+    _: jsc.JSObjectRef,
+    _: jsc.JSObjectRef,
+    argumentCount: usize,
+    arguments: [*]const jsc.JSValueRef,
+    _: [*]jsc.JSValueRef,
+) callconv(.c) jsc.JSValueRef {
+    const allocator = globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
+    const path = getPathArg(allocator, ctx, arguments, argumentCount, 0) orelse return jsc.JSValueMakeUndefined(ctx);
+    defer allocator.free(path);
+    const root = pathRootSlice(path);
+    const dir = std.fs.path.dirname(path) orelse ".";
+    const base = std.fs.path.basename(path);
+    const ext = std.fs.path.extension(path);
+    const name = if (ext.len > 0 and base.len >= ext.len and std.mem.endsWith(u8, base, ext))
+        base[0 .. base.len - ext.len]
+    else
+        base;
+    const obj = jsc.JSObjectMake(ctx, null, null);
+    const k_root = jsc.JSStringCreateWithUTF8CString("root");
+    defer jsc.JSStringRelease(k_root);
+    const k_dir = jsc.JSStringCreateWithUTF8CString("dir");
+    defer jsc.JSStringRelease(k_dir);
+    const k_base = jsc.JSStringCreateWithUTF8CString("base");
+    defer jsc.JSStringRelease(k_base);
+    const k_name = jsc.JSStringCreateWithUTF8CString("name");
+    defer jsc.JSStringRelease(k_name);
+    const k_ext = jsc.JSStringCreateWithUTF8CString("ext");
+    defer jsc.JSStringRelease(k_ext);
+    const root_z = allocator.dupeZ(u8, root) catch return jsc.JSValueMakeUndefined(ctx);
+    defer allocator.free(root_z);
+    const dir_z = allocator.dupeZ(u8, dir) catch return jsc.JSValueMakeUndefined(ctx);
+    defer allocator.free(dir_z);
+    const base_z = allocator.dupeZ(u8, base) catch return jsc.JSValueMakeUndefined(ctx);
+    defer allocator.free(base_z);
+    const name_z = allocator.dupeZ(u8, name) catch return jsc.JSValueMakeUndefined(ctx);
+    defer allocator.free(name_z);
+    const ext_z = allocator.dupeZ(u8, ext) catch return jsc.JSValueMakeUndefined(ctx);
+    defer allocator.free(ext_z);
+    {
+        const root_str = jsc.JSStringCreateWithUTF8CString(root_z.ptr);
+        defer jsc.JSStringRelease(root_str);
+        _ = jsc.JSObjectSetProperty(ctx, obj, k_root, jsc.JSValueMakeString(ctx, root_str), jsc.kJSPropertyAttributeNone, null);
+    }
+    {
+        const dir_str = jsc.JSStringCreateWithUTF8CString(dir_z.ptr);
+        defer jsc.JSStringRelease(dir_str);
+        _ = jsc.JSObjectSetProperty(ctx, obj, k_dir, jsc.JSValueMakeString(ctx, dir_str), jsc.kJSPropertyAttributeNone, null);
+    }
+    {
+        const base_str = jsc.JSStringCreateWithUTF8CString(base_z.ptr);
+        defer jsc.JSStringRelease(base_str);
+        _ = jsc.JSObjectSetProperty(ctx, obj, k_base, jsc.JSValueMakeString(ctx, base_str), jsc.kJSPropertyAttributeNone, null);
+    }
+    {
+        const name_str = jsc.JSStringCreateWithUTF8CString(name_z.ptr);
+        defer jsc.JSStringRelease(name_str);
+        _ = jsc.JSObjectSetProperty(ctx, obj, k_name, jsc.JSValueMakeString(ctx, name_str), jsc.kJSPropertyAttributeNone, null);
+    }
+    {
+        const ext_str = jsc.JSStringCreateWithUTF8CString(ext_z.ptr);
+        defer jsc.JSStringRelease(ext_str);
+        _ = jsc.JSObjectSetProperty(ctx, obj, k_ext, jsc.JSValueMakeString(ctx, ext_str), jsc.kJSPropertyAttributeNone, null);
+    }
+    return obj;
+}
+
+/// 从 JS 对象读取字符串属性；若不存在或非字符串则返回 null，否则返回 dupe 的切片（调用方 free）
+fn getObjectStringProperty(allocator: std.mem.Allocator, ctx: jsc.JSContextRef, obj: jsc.JSObjectRef, key_name: [*:0]const u8) ?[]const u8 {
+    const k = jsc.JSStringCreateWithUTF8CString(key_name);
+    defer jsc.JSStringRelease(k);
+    const val = jsc.JSObjectGetProperty(ctx, obj, k, null);
+    if (jsc.JSValueIsUndefined(ctx, val) or jsc.JSValueIsNull(ctx, val)) return null;
+    const str = jsc.JSValueToStringCopy(ctx, val, null);
+    defer jsc.JSStringRelease(str);
+    const max_sz = jsc.JSStringGetMaximumUTF8CStringSize(str);
+    if (max_sz == 0 or max_sz > 65536) return null;
+    const buf = allocator.alloc(u8, max_sz) catch return null;
+    defer allocator.free(buf);
+    const n = jsc.JSStringGetUTF8CString(str, buf.ptr, max_sz);
+    if (n == 0) return null;
+    return allocator.dupe(u8, buf[0 .. n - 1]) catch null;
+}
+
+/// Shu.path.format(pathObject)：从 { root, dir, base, name, ext } 组装路径，与 Node path.format 一致；若提供 dir+base 则 dir+sep+base，否则 root+name+ext（ext 无点时自动加点）
+fn pathFormatCallback(
+    ctx: jsc.JSContextRef,
+    _: jsc.JSObjectRef,
+    _: jsc.JSObjectRef,
+    argumentCount: usize,
+    arguments: [*]const jsc.JSValueRef,
+    _: [*]jsc.JSValueRef,
+) callconv(.c) jsc.JSValueRef {
+    const allocator = globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
+    if (argumentCount < 1) return jsc.JSValueMakeUndefined(ctx);
+    const arg0 = arguments[0];
+    const obj = jsc.JSValueToObject(ctx, arg0, null) orelse return jsc.JSValueMakeUndefined(ctx);
+    const dir = getObjectStringProperty(allocator, ctx, obj, "dir");
+    defer if (dir) |d| allocator.free(d);
+    const root = getObjectStringProperty(allocator, ctx, obj, "root");
+    defer if (root) |r| allocator.free(r);
+    const base = getObjectStringProperty(allocator, ctx, obj, "base");
+    defer if (base) |b| allocator.free(b);
+    const name = getObjectStringProperty(allocator, ctx, obj, "name");
+    defer if (name) |n| allocator.free(n);
+    const ext = getObjectStringProperty(allocator, ctx, obj, "ext");
+    defer if (ext) |e| allocator.free(e);
+    // Node 规则：若有 dir 且（有 base 或 有 name/ext），则优先 dir + sep + (base 或 name+ext)
+    if (dir != null and (base != null or name != null or ext != null)) {
+        const segment = if (base) |b| b else blk: {
+            var list = std.ArrayList(u8).initCapacity(allocator, 0) catch return jsc.JSValueMakeUndefined(ctx);
+            defer list.deinit(allocator);
+            if (name) |n| list.appendSlice(allocator, n) catch return jsc.JSValueMakeUndefined(ctx);
+            if (ext) |e| {
+                if (e.len > 0 and e[0] == '.')
+                    list.appendSlice(allocator, e) catch return jsc.JSValueMakeUndefined(ctx)
+                else {
+                    list.append(allocator, '.') catch return jsc.JSValueMakeUndefined(ctx);
+                    list.appendSlice(allocator, e) catch return jsc.JSValueMakeUndefined(ctx);
+                }
+            }
+            break :blk list.toOwnedSlice(allocator) catch return jsc.JSValueMakeUndefined(ctx);
+        };
+        defer if (base == null) allocator.free(segment);
+        const d = dir.?;
+        const out = std.fs.path.join(allocator, &.{ d, segment }) catch return jsc.JSValueMakeUndefined(ctx);
+        defer allocator.free(out);
+        return stringToJS(ctx, allocator, out);
+    }
+    // 否则用 root + base 或 root + name + ext
+    const r = root orelse "";
+    const segment = if (base) |b| b else blk: {
+        var list = std.ArrayList(u8).initCapacity(allocator, 0) catch return jsc.JSValueMakeUndefined(ctx);
+        defer list.deinit(allocator);
+        if (name) |n| list.appendSlice(allocator, n) catch return jsc.JSValueMakeUndefined(ctx);
+        if (ext) |e| {
+            if (e.len > 0 and e[0] == '.')
+                list.appendSlice(allocator, e) catch return jsc.JSValueMakeUndefined(ctx)
+            else {
+                list.append(allocator, '.') catch return jsc.JSValueMakeUndefined(ctx);
+                list.appendSlice(allocator, e) catch return jsc.JSValueMakeUndefined(ctx);
+            }
+        }
+        break :blk list.toOwnedSlice(allocator) catch return jsc.JSValueMakeUndefined(ctx);
+    };
+    defer if (base == null) allocator.free(segment);
+    if (r.len == 0) return stringToJS(ctx, allocator, segment);
+    const out = std.fs.path.join(allocator, &.{ r, segment }) catch return jsc.JSValueMakeUndefined(ctx);
+    defer allocator.free(out);
+    return stringToJS(ctx, allocator, out);
+}
+
+// ---------- root / name / toNamespacedPath（Shu 特色与 Node 兼容）----------
+
+/// Shu.path.root(path)：仅返回路径的根部分（如 "/"、"C:\\"），与 parse(path).root 一致；纯字符串解析
+fn pathRootCallback(
+    ctx: jsc.JSContextRef,
+    _: jsc.JSObjectRef,
+    _: jsc.JSObjectRef,
+    argumentCount: usize,
+    arguments: [*]const jsc.JSValueRef,
+    _: [*]jsc.JSValueRef,
+) callconv(.c) jsc.JSValueRef {
+    const allocator = globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
+    const path = getPathArg(allocator, ctx, arguments, argumentCount, 0) orelse return jsc.JSValueMakeUndefined(ctx);
+    defer allocator.free(path);
+    const root = pathRootSlice(path);
+    return stringToJS(ctx, allocator, root);
+}
+
+/// Shu.path.name(path)：仅返回文件名无扩展名（即 parse(path).name）；纯字符串解析
+fn pathNameCallback(
+    ctx: jsc.JSContextRef,
+    _: jsc.JSObjectRef,
+    _: jsc.JSObjectRef,
+    argumentCount: usize,
+    arguments: [*]const jsc.JSValueRef,
+    _: [*]jsc.JSValueRef,
+) callconv(.c) jsc.JSValueRef {
+    const allocator = globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
+    const path = getPathArg(allocator, ctx, arguments, argumentCount, 0) orelse return jsc.JSValueMakeUndefined(ctx);
+    defer allocator.free(path);
+    const base = std.fs.path.basename(path);
+    const ext = std.fs.path.extension(path);
+    const name = if (ext.len > 0 and base.len >= ext.len and std.mem.endsWith(u8, base, ext))
+        base[0 .. base.len - ext.len]
+    else
+        base;
+    return stringToJS(ctx, allocator, name);
+}
+
+/// Shu.path.toNamespacedPath(path)：Windows 下转为长路径命名空间 "\\?\\..."，非 Windows 返回规范化路径；需先 resolve 为绝对路径
+fn pathToNamespacedPathCallback(
+    ctx: jsc.JSContextRef,
+    _: jsc.JSObjectRef,
+    _: jsc.JSObjectRef,
+    argumentCount: usize,
+    arguments: [*]const jsc.JSValueRef,
+    _: [*]jsc.JSValueRef,
+) callconv(.c) jsc.JSValueRef {
+    const opts = globals.current_run_options orelse return jsc.JSValueMakeUndefined(ctx);
+    const allocator = globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
+    const path = getPathArg(allocator, ctx, arguments, argumentCount, 0) orelse return jsc.JSValueMakeUndefined(ctx);
+    defer allocator.free(path);
+    const resolved = std.fs.path.resolve(allocator, &.{ opts.cwd, path }) catch return jsc.JSValueMakeUndefined(ctx);
+    defer allocator.free(resolved);
+    if (!is_windows) {
+        return stringToJS(ctx, allocator, resolved);
+    }
+    // Windows：转为 \\?\ 前缀的长路径形式（UNC 为 \\?\UNC\server\share）
+    if (resolved.len >= 2 and (resolved[0] == '/' or resolved[0] == '\\') and (resolved[1] == '/' or resolved[1] == '\\')) {
+        const unc = std.mem.replaceOwned(u8, allocator, resolved, "/", "\\") catch return jsc.JSValueMakeUndefined(ctx);
+        defer allocator.free(unc);
+        const prefix = "\\\\?\\UNC";
+        const result = allocator.alloc(u8, prefix.len + unc.len - 2) catch return jsc.JSValueMakeUndefined(ctx);
+        defer allocator.free(result);
+        @memcpy(result[0..prefix.len], prefix);
+        @memcpy(result[prefix.len..], unc[2..]);
+        return stringToJS(ctx, allocator, result);
+    }
+    const prefix = "\\\\?\\";
+    const result = allocator.alloc(u8, prefix.len + resolved.len) catch return jsc.JSValueMakeUndefined(ctx);
+    defer allocator.free(result);
+    @memcpy(result[0..prefix.len], prefix);
+    const normalized = std.mem.replaceOwned(u8, allocator, resolved, "/", "\\") catch return jsc.JSValueMakeUndefined(ctx);
+    defer allocator.free(normalized);
+    @memcpy(result[prefix.len..], normalized);
+    return stringToJS(ctx, allocator, result);
 }
 
 // ---------- filePathToUrl / urlToFilePath（模仿 Node.js url.pathToFileURL / fileURLToPath）----------
