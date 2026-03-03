@@ -109,6 +109,16 @@ pub fn build(b: *std.Build) void {
     });
     root_module.addImport("io_core", io_core_module);
 
+    // 仅解压 API（gzip/deflate/br），无 jsc 依赖，供 io_core/http raw_body 自动解压与 package/registry 等使用；根为 zlib/decode.zig
+    const shu_zlib_module = b.createModule(.{
+        .root_source_file = b.path("src/runtime/modules/shu/zlib/decode.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    shu_zlib_module.addIncludePath(.{ .cwd_relative = "deps/brotli/c/include" });
+    root_module.addImport("shu_zlib", shu_zlib_module);
+    io_core_module.addImport("shu_zlib", shu_zlib_module);
+
     // 未链接 JSC 时使用 jsc_stub.zig，避免未定义符号；macOS 或 -Djsc_prefix 时用真实 jsc.zig
     const use_real_jsc = is_macos or have_webkit_jsc;
     const jsc_src = if (use_real_jsc) b.path("src/runtime/jsc.zig") else b.path("src/runtime/jsc_stub.zig");
@@ -131,7 +141,7 @@ pub fn build(b: *std.Build) void {
         .name = "shu",
         .root_module = root_module,
     });
-    
+
     // 发布时去掉调试符号以减小体积（ReleaseSmall 时效果明显）；Debug 时保留以便堆栈
     exe.root_module.strip = (optimize != .Debug);
 
@@ -143,7 +153,7 @@ pub fn build(b: *std.Build) void {
         exe.linkSystemLibrary("crypto");
     }
 
-    // Brotli（br）压缩：将 deps/brotli 编码端 C 源直接编进可执行文件，供 server 响应压缩使用
+    // Brotli（br）压缩与解压：deps/brotli 编码端 + 解码端 C 源，供 server 响应压缩与 npm tarball br 解压
     const brotli_include = "deps/brotli/c/include";
     exe.root_module.addIncludePath(.{ .cwd_relative = brotli_include });
     exe.linkLibC();
@@ -175,6 +185,11 @@ pub fn build(b: *std.Build) void {
         "deps/brotli/c/enc/metablock.c",
         "deps/brotli/c/enc/static_dict.c",
         "deps/brotli/c/enc/utf8_util.c",
+        // 解码端：供 decompressBrotli（如 npm tarball Content-Encoding: br）使用
+        "deps/brotli/c/dec/bit_reader.c",
+        "deps/brotli/c/dec/decode.c",
+        "deps/brotli/c/dec/huffman.c",
+        "deps/brotli/c/dec/state.c",
     };
     exe.addCSourceFiles(.{ .files = &brotli_sources, .flags = &.{} });
     switch (target.result.os.tag) {
@@ -183,6 +198,9 @@ pub fn build(b: *std.Build) void {
         .macos => exe.root_module.addCMacro("OS_MACOSX", "1"),
         else => {},
     }
+
+    // libcurl：io_core/http.zig 带超时的 HTTP 路径（替代 curl 子进程），需系统已安装 libcurl-dev / curl-devel
+    exe.linkSystemLibrary("curl");
 
     // macOS：链接系统 JavaScriptCore 框架
     if (is_macos) exe.linkFramework("JavaScriptCore");
@@ -219,6 +237,7 @@ pub fn build(b: *std.Build) void {
     const test_exe = b.addTest(.{
         .root_module = test_module,
     });
+    test_exe.linkSystemLibrary("curl");
     const run_tests = b.addRunArtifact(test_exe);
     const test_step = b.step("test", "Run all tests (目标：全面覆盖)");
     test_step.dependOn(&run_tests.step);
