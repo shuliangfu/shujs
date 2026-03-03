@@ -7,6 +7,8 @@ const io_core = @import("io_core");
 
 /// 默认 registry URL（无 .npmrc 或未配置 registry 时使用）
 pub const DEFAULT_REGISTRY_URL = "https://registry.npmjs.org";
+/// JSR 包使用的 npm 兼容 registry（与 Deno/Bun 一致，.npmrc 未配置 @jsr:registry 时使用）
+pub const JSR_NPM_REGISTRY = "https://npm.jsr.io";
 
 /// 从 ~/.npmrc 读入并合并进 map（存在则解析，不存在则跳过）
 fn loadUserNpmrc(allocator: std.mem.Allocator, map: *std.StringArrayHashMap([]const u8)) void {
@@ -86,7 +88,7 @@ pub fn hostFromRegistryUrl(allocator: std.mem.Allocator, url: []const u8) ![]con
     return allocator.dupe(u8, url[prefix + 3 .. i]);
 }
 
-/// 根据包名得到应使用的 registry URL。包名为 @scope/pkg 时查 @scope:registry，否则查 registry；无则返回默认。返回的切片由调用方 free。
+/// 根据包名得到应使用的 registry URL。@jsr/ 包固定走 JSR npm 兼容 registry（除非 .npmrc 配置 @jsr:registry）；其它 @scope/pkg 查 @scope:registry；否则查 registry；无则返回默认。返回的切片由调用方 free。
 pub fn getRegistryForPackage(allocator: std.mem.Allocator, cwd: []const u8, package_name: []const u8) ![]const u8 {
     var npmrc = load(allocator, cwd) catch return allocator.dupe(u8, DEFAULT_REGISTRY_URL);
     defer {
@@ -103,6 +105,8 @@ pub fn getRegistryForPackage(allocator: std.mem.Allocator, cwd: []const u8, pack
         const key = try std.fmt.allocPrint(allocator, "{s}:registry", .{scope});
         defer allocator.free(key);
         if (npmrc.get(key)) |url| return allocator.dupe(u8, url);
+        // @jsr/ 包未配置 @jsr:registry 时使用 JSR npm 兼容 registry
+        if (std.mem.eql(u8, scope, "@jsr")) return allocator.dupe(u8, JSR_NPM_REGISTRY);
     }
     if (npmrc.get("registry")) |url| return allocator.dupe(u8, url);
     return allocator.dupe(u8, DEFAULT_REGISTRY_URL);
