@@ -199,9 +199,6 @@ pub fn build(b: *std.Build) void {
         else => {},
     }
 
-    // libcurl：io_core/http.zig 带超时的 HTTP 路径（替代 curl 子进程），需系统已安装 libcurl-dev / curl-devel
-    exe.linkSystemLibrary("curl");
-
     // macOS：链接系统 JavaScriptCore 框架
     if (is_macos) exe.linkFramework("JavaScriptCore");
 
@@ -237,7 +234,6 @@ pub fn build(b: *std.Build) void {
     const test_exe = b.addTest(.{
         .root_module = test_module,
     });
-    test_exe.linkSystemLibrary("curl");
     const run_tests = b.addRunArtifact(test_exe);
     const test_step = b.step("test", "Run all tests (目标：全面覆盖)");
     test_step.dependOn(&run_tests.step);
