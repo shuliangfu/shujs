@@ -6,6 +6,7 @@ const builtin = @import("builtin");
 const jsc = @import("jsc");
 const common = @import("../../../common.zig");
 const globals = @import("../../../globals.zig");
+const libs_io = @import("libs_io");
 
 // C 库 getnameinfo（通过 @extern 链接，避免与 std.c 声明冲突）
 const c = std.c;
@@ -69,7 +70,7 @@ const PendingDns = struct {
     const LookupItem = struct { address: []const u8, family: u32 };
 };
 
-var g_dns_pending_mutex: std.Thread.Mutex = .{};
+var g_dns_pending_mutex: std.Io.Mutex = .{ .state = std.atomic.Value(std.Io.Mutex.State).init(.unlocked) };
 var g_dns_pending: ?std.ArrayList(PendingDns) = null;
 var g_dns_servers: ?std.ArrayList([]const u8) = null;
 var g_dns_pending_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
@@ -129,11 +130,12 @@ fn jsValueToUtf8(ctx: jsc.JSContextRef, value: jsc.JSValueRef, allocator: std.me
 /// §4 持锁仅限「移入 taken」，回调与 JSC 操作在锁外执行
 fn drainPendingDns(ctx: jsc.JSContextRef) void {
     const allocator = globals.current_allocator orelse return;
+    const io = libs_io.getProcessIo() orelse return;
     var taken = std.ArrayList(PendingDns).initCapacity(allocator, 0) catch return;
     defer taken.deinit(allocator);
     {
-        g_dns_pending_mutex.lock();
-        defer g_dns_pending_mutex.unlock();
+        g_dns_pending_mutex.lock(io) catch return;
+        defer g_dns_pending_mutex.unlock(io);
         const list = g_dns_pending orelse return;
         if (list.items.len == 0) return;
         taken.ensureTotalCapacity(allocator, list.items.len) catch return;
@@ -293,6 +295,7 @@ fn addrToString(allocator: std.mem.Allocator, addr: *const c.sockaddr, addr_len:
 
 fn lookupThreadMain(args: *LookupArgs) void {
     const allocator = args.allocator;
+    const io = libs_io.getProcessIo() orelse return;
     defer allocator.free(args.hostname);
     defer allocator.destroy(args);
     jsc.JSValueProtect(args.ctx, args.callback);
@@ -313,8 +316,8 @@ fn lookupThreadMain(args: *LookupArgs) void {
     };
     const host_z = allocator.dupeZ(u8, args.hostname) catch {
         result.err_msg = allocator.dupe(u8, "ENOMEM") catch null;
-        g_dns_pending_mutex.lock();
-        defer g_dns_pending_mutex.unlock();
+        g_dns_pending_mutex.lock(io) catch return;
+        defer g_dns_pending_mutex.unlock(io);
         if (g_dns_pending) |*list| list.append(allocator, result) catch {};
         scheduleDnsTick(args.ctx);
         return;
@@ -332,8 +335,8 @@ fn lookupThreadMain(args: *LookupArgs) void {
         const code = std.c.gai_strerror(ret);
         const msg = std.fmt.allocPrint(allocator, "getaddrinfo {s}: {s}", .{ args.hostname, std.mem.span(code) }) catch allocator.dupe(u8, std.mem.span(code)) catch null;
         result.err_msg = msg;
-        g_dns_pending_mutex.lock();
-        defer g_dns_pending_mutex.unlock();
+        g_dns_pending_mutex.lock(io) catch return;
+        defer g_dns_pending_mutex.unlock(io);
         if (g_dns_pending) |*list| list.append(allocator, result) catch {};
         scheduleDnsTick(args.ctx);
         return;
@@ -341,8 +344,8 @@ fn lookupThreadMain(args: *LookupArgs) void {
     defer if (res) |r| std.c.freeaddrinfo(r);
     var addrs = std.ArrayList(PendingDns.LookupItem).initCapacity(allocator, 4) catch {
         result.err_msg = allocator.dupe(u8, "ENOMEM") catch null;
-        g_dns_pending_mutex.lock();
-        defer g_dns_pending_mutex.unlock();
+        g_dns_pending_mutex.lock(io) catch return;
+        defer g_dns_pending_mutex.unlock(io);
         if (g_dns_pending) |*list| list.append(allocator, result) catch {};
         scheduleDnsTick(args.ctx);
         return;
@@ -374,8 +377,8 @@ fn lookupThreadMain(args: *LookupArgs) void {
         result.lookup_family = first.family;
         for (addrs.items[1..]) |e| allocator.free(e.address);
     }
-    g_dns_pending_mutex.lock();
-    defer g_dns_pending_mutex.unlock();
+    g_dns_pending_mutex.lock(io) catch return;
+    defer g_dns_pending_mutex.unlock(io);
     if (g_dns_pending == null) {
         g_dns_pending = std.ArrayList(PendingDns).initCapacity(allocator, 4) catch {
             if (result.lookup_all) |a| {
@@ -458,6 +461,7 @@ const LookupServiceArgs = struct {
 
 fn lookupServiceThreadMain(args: *LookupServiceArgs) void {
     const allocator = args.allocator;
+    const io = libs_io.getProcessIo() orelse return;
     defer allocator.free(args.address);
     defer allocator.destroy(args);
     jsc.JSValueProtect(args.ctx, args.callback);
@@ -479,8 +483,8 @@ fn lookupServiceThreadMain(args: *LookupServiceArgs) void {
     var port_buf: [16]u8 = undefined;
     const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{args.port}) catch {
         result.err_msg = allocator.dupe(u8, "EINVAL") catch null;
-        g_dns_pending_mutex.lock();
-        defer g_dns_pending_mutex.unlock();
+        g_dns_pending_mutex.lock(io) catch return;
+        defer g_dns_pending_mutex.unlock(io);
         if (g_dns_pending) |*list| list.append(allocator, result) catch {};
         scheduleDnsTick(args.ctx);
         return;
@@ -491,8 +495,8 @@ fn lookupServiceThreadMain(args: *LookupServiceArgs) void {
     addr.port = std.mem.nativeToBig(u16, args.port);
     const addr_z = allocator.dupeZ(u8, args.address) catch {
         result.err_msg = allocator.dupe(u8, "ENOMEM") catch null;
-        g_dns_pending_mutex.lock();
-        defer g_dns_pending_mutex.unlock();
+        g_dns_pending_mutex.lock(io) catch return;
+        defer g_dns_pending_mutex.unlock(io);
         if (g_dns_pending) |*list| list.append(allocator, result) catch {};
         scheduleDnsTick(args.ctx);
         return;
@@ -500,8 +504,8 @@ fn lookupServiceThreadMain(args: *LookupServiceArgs) void {
     defer allocator.free(addr_z);
     if (c_inet_pton(std.c.AF.INET, addr_z.ptr, &addr.addr) != 1) {
         result.err_msg = allocator.dupe(u8, "EINVAL") catch null;
-        g_dns_pending_mutex.lock();
-        defer g_dns_pending_mutex.unlock();
+        g_dns_pending_mutex.lock(io) catch return;
+        defer g_dns_pending_mutex.unlock(io);
         if (g_dns_pending) |*list| list.append(allocator, result) catch {};
         scheduleDnsTick(args.ctx);
         return;
@@ -518,8 +522,8 @@ fn lookupServiceThreadMain(args: *LookupServiceArgs) void {
         result.service_hostname = allocator.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(&host_buf)))) catch null;
         result.service_service = allocator.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(&serv_buf)))) catch null;
     }
-    g_dns_pending_mutex.lock();
-    defer g_dns_pending_mutex.unlock();
+    g_dns_pending_mutex.lock(io) catch return;
+    defer g_dns_pending_mutex.unlock(io);
     if (g_dns_pending == null) g_dns_pending = std.ArrayList(PendingDns).initCapacity(allocator, 4) catch null;
     if (g_dns_pending) |*list| list.append(allocator, result) catch {};
     scheduleDnsTick(args.ctx);
@@ -570,6 +574,7 @@ const ReverseArgs = struct {
 
 fn reverseThreadMain(args: *ReverseArgs) void {
     const allocator = args.allocator;
+    const io = libs_io.getProcessIo() orelse return;
     defer allocator.free(args.ip);
     defer allocator.destroy(args);
     jsc.JSValueProtect(args.ctx, args.callback);
@@ -593,8 +598,8 @@ fn reverseThreadMain(args: *ReverseArgs) void {
     addr.family = std.c.AF.INET;
     const ip_z = allocator.dupeZ(u8, args.ip) catch {
         result.err_msg = allocator.dupe(u8, "ENOMEM") catch null;
-        g_dns_pending_mutex.lock();
-        defer g_dns_pending_mutex.unlock();
+        g_dns_pending_mutex.lock(io) catch return;
+        defer g_dns_pending_mutex.unlock(io);
         if (g_dns_pending) |*list| list.append(allocator, result) catch {};
         scheduleDnsTick(args.ctx);
         return;
@@ -602,8 +607,8 @@ fn reverseThreadMain(args: *ReverseArgs) void {
     defer allocator.free(ip_z);
     if (c_inet_pton(std.c.AF.INET, ip_z.ptr, &addr.addr) != 1) {
         result.err_msg = allocator.dupe(u8, "ENOTFOUND") catch null;
-        g_dns_pending_mutex.lock();
-        defer g_dns_pending_mutex.unlock();
+        g_dns_pending_mutex.lock(io) catch return;
+        defer g_dns_pending_mutex.unlock(io);
         if (g_dns_pending) |*list| list.append(allocator, result) catch {};
         scheduleDnsTick(args.ctx);
         return;
@@ -621,8 +626,8 @@ fn reverseThreadMain(args: *ReverseArgs) void {
         if (host) |h| {
             var arr = allocator.alloc([]const u8, 1) catch {
                 allocator.free(h);
-                g_dns_pending_mutex.lock();
-                defer g_dns_pending_mutex.unlock();
+                g_dns_pending_mutex.lock(io) catch return;
+                defer g_dns_pending_mutex.unlock(io);
                 if (g_dns_pending == null) g_dns_pending = std.ArrayList(PendingDns).initCapacity(allocator, 4) catch null;
                 if (g_dns_pending) |*list| list.append(allocator, result) catch {};
                 scheduleDnsTick(args.ctx);
@@ -632,8 +637,8 @@ fn reverseThreadMain(args: *ReverseArgs) void {
             arr[0] = h;
         }
     }
-    g_dns_pending_mutex.lock();
-    defer g_dns_pending_mutex.unlock();
+    g_dns_pending_mutex.lock(io) catch return;
+    defer g_dns_pending_mutex.unlock(io);
     if (g_dns_pending == null) g_dns_pending = std.ArrayList(PendingDns).initCapacity(allocator, 4) catch null;
     if (g_dns_pending) |*list| list.append(allocator, result) catch {};
     scheduleDnsTick(args.ctx);
@@ -682,6 +687,7 @@ const ResolveArgs = struct {
 
 fn resolveThreadMain(args: *ResolveArgs) void {
     const allocator = args.allocator;
+    const io = libs_io.getProcessIo() orelse return;
     defer allocator.free(args.hostname);
     defer allocator.destroy(args);
     jsc.JSValueProtect(args.ctx, args.callback);
@@ -702,8 +708,8 @@ fn resolveThreadMain(args: *ResolveArgs) void {
     };
     const host_z = allocator.dupeZ(u8, args.hostname) catch {
         result.err_msg = allocator.dupe(u8, "ENOMEM") catch null;
-        g_dns_pending_mutex.lock();
-        defer g_dns_pending_mutex.unlock();
+        g_dns_pending_mutex.lock(io) catch return;
+        defer g_dns_pending_mutex.unlock(io);
         if (g_dns_pending) |*list| list.append(allocator, result) catch {};
         scheduleDnsTick(args.ctx);
         return;
@@ -718,8 +724,8 @@ fn resolveThreadMain(args: *ResolveArgs) void {
     if (@intFromEnum(ret) != 0) {
         const code = std.c.gai_strerror(ret);
         result.err_msg = std.fmt.allocPrint(allocator, "getaddrinfo {s}: {s}", .{ args.hostname, std.mem.span(code) }) catch allocator.dupe(u8, std.mem.span(code)) catch null;
-        g_dns_pending_mutex.lock();
-        defer g_dns_pending_mutex.unlock();
+        g_dns_pending_mutex.lock(io) catch return;
+        defer g_dns_pending_mutex.unlock(io);
         if (g_dns_pending) |*list| list.append(allocator, result) catch {};
         scheduleDnsTick(args.ctx);
         return;
@@ -727,8 +733,8 @@ fn resolveThreadMain(args: *ResolveArgs) void {
     defer if (res) |r| std.c.freeaddrinfo(r);
     var addrs = std.ArrayList([]const u8).initCapacity(allocator, 0) catch {
         result.err_msg = allocator.dupe(u8, "ENOMEM") catch null;
-        g_dns_pending_mutex.lock();
-        defer g_dns_pending_mutex.unlock();
+        g_dns_pending_mutex.lock(io) catch return;
+        defer g_dns_pending_mutex.unlock(io);
         if (g_dns_pending) |*list| list.append(allocator, result) catch {};
         scheduleDnsTick(args.ctx);
         return;
@@ -752,8 +758,8 @@ fn resolveThreadMain(args: *ResolveArgs) void {
     } else {
         result.err_msg = allocator.dupe(u8, "ENOTFOUND") catch null;
     }
-    g_dns_pending_mutex.lock();
-    defer g_dns_pending_mutex.unlock();
+    g_dns_pending_mutex.lock(io) catch return;
+    defer g_dns_pending_mutex.unlock(io);
     if (g_dns_pending == null) g_dns_pending = std.ArrayList(PendingDns).initCapacity(allocator, 4) catch null;
     if (g_dns_pending) |*list| list.append(allocator, result) catch {};
     scheduleDnsTick(args.ctx);
@@ -954,8 +960,8 @@ fn isIPCallback(
     const allocator = globals.current_allocator orelse return jsc.JSValueMakeNumber(ctx, 0);
     const s = jsValueToUtf8(ctx, arguments[0], allocator) orelse return jsc.JSValueMakeNumber(ctx, 0);
     defer allocator.free(s);
-    _ = std.net.Address.parseIp4(s, 0) catch {
-        _ = std.net.Address.parseIp6(s, 0) catch return jsc.JSValueMakeNumber(ctx, 0);
+    _ = std.Io.net.IpAddress.parseIp4(s, 0) catch {
+        _ = std.Io.net.IpAddress.parseIp6(s, 0) catch return jsc.JSValueMakeNumber(ctx, 0);
         return jsc.JSValueMakeNumber(ctx, 6);
     };
     return jsc.JSValueMakeNumber(ctx, 4);
