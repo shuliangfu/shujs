@@ -166,8 +166,10 @@ pub fn addSpecifiersThenInstall(allocator: std.mem.Allocator, cwd_owned: []const
     const reporter = pkg_install.InstallReporter{
         .ctx = &progress_state,
         .onResolving = onResolving,
+        .onResolvingComplete = onResolvingComplete,
         .onResolveFailure = onResolveFailure,
         .onStart = onInstallStart,
+        .onProgress = onInstallProgress,
         .onPackage = onInstallPackage,
         .onDone = onInstallDone,
         .onPackageAdded = onPackageAddedPrint,
@@ -205,8 +207,10 @@ pub fn install(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional
         const reporter = pkg_install.InstallReporter{
             .ctx = &progress_state,
             .onResolving = onResolving,
+            .onResolvingComplete = onResolvingComplete,
             .onResolveFailure = onResolveFailure,
             .onStart = onInstallStart,
+            .onProgress = onInstallProgress,
             .onPackage = onInstallPackage,
             .onDone = onInstallDone,
         };
@@ -286,13 +290,15 @@ const c_dim = "\x1b[2m";
 const c_green = "\x1b[32m";
 const c_cyan = "\x1b[36m";
 
-/// 进度回调共享状态：总数、是否启用颜色、开始时间（毫秒）、解析阶段是否首次（用于两行刷新）
-const ProgressState = struct { total: usize, use_color: bool, start_time: i64, resolving_first: bool = true };
+/// 进度回调共享状态：总数、是否启用颜色、开始时间（毫秒）、解析/安装阶段是否首次（用于两行刷新）、第二遍是否已打过换行（避免进度条跳行）
+const ProgressState = struct { total: usize, use_color: bool, start_time: i64, resolving_first: bool = true, installing_first: bool = true, install_done_newline: bool = false };
 
 /// ANSI 清除从光标到行末，避免上次内容残留
 const c_erase_to_eol = "\x1b[K";
-/// 光标上移 1 行，从进度条行回到 Resolving 行后重写两行
+/// 光标上移 1 行，Resolving 两行刷新时用
 const c_cursor_up_1 = "\x1b[1A";
+/// 光标上移 2 行，Installing 两行刷新时用（当前在第二行末尾，需回到第一行重写两行）
+const c_cursor_up_2 = "\x1b[2A";
 
 /// 环境变量 SHU_NO_PROGRESS 非空时关闭进度条，便于调试时看清 [shu install] failed 等 stderr 诊断。
 fn progressDisabled() bool {
@@ -305,7 +311,13 @@ fn onResolveFailure(ctx: ?*anyopaque) void {
     _ = std.posix.write(1, "\n") catch return;
 }
 
-/// InstallReporter.onResolving：有进度条时两行原地更新（Resolving + [###...]）；SHU_NO_PROGRESS 时每包一行「Resolving (N) name...」，失败时易看出是哪个包。
+/// InstallReporter.onResolvingComplete：仅当本轮曾输出过 onResolving 时调用，在 Resolving 与 Installing 之间输出一个空行；跳过解析时不会调用，避免出现多余空行。
+fn onResolvingComplete(ctx: ?*anyopaque) void {
+    _ = ctx;
+    _ = std.posix.write(1, "\n") catch return;
+}
+
+/// InstallReporter.onResolving：有进度条时两行原地更新，进度条在上、Resolving (N) name 在下；SHU_NO_PROGRESS 时每包一行「Resolving (N) name...」。
 fn onResolving(ctx: ?*anyopaque, name: []const u8, current_in_run: usize, total_to_resolve: usize) void {
     if (progressDisabled()) {
         var buf: [256]u8 = undefined;
@@ -317,25 +329,27 @@ fn onResolving(ctx: ?*anyopaque, name: []const u8, current_in_run: usize, total_
     const use_color = if (ctx) |c| @as(*ProgressState, @ptrCast(@alignCast(c))).use_color else false;
     const filled: usize = if (total_to_resolve > 0) (current_in_run * progress_bar_width) / total_to_resolve else 0;
 
-    var line1_buf: [160]u8 = undefined;
+    // 第一行：进度条 [###...] current/total
+    var line1_buf: [80]u8 = undefined;
     var fbs1 = std.io.fixedBufferStream(&line1_buf);
     const w1 = fbs1.writer();
-    if (use_color) w1.print("{s}", .{c_dim}) catch return;
-    w1.print("Resolving ({d}) {s}...{s}", .{ total_to_resolve, name, c_erase_to_eol }) catch return;
-    if (use_color) w1.print("{s}", .{c_reset}) catch return;
-    const line1 = fbs1.getWritten();
-
-    var line2_buf: [80]u8 = undefined;
-    var fbs2 = std.io.fixedBufferStream(&line2_buf);
-    const w2 = fbs2.writer();
-    if (use_color) w2.print("{s}", .{c_cyan}) catch return;
-    w2.print("[", .{}) catch return;
+    if (use_color) w1.print("{s}", .{c_cyan}) catch return;
+    w1.print("[", .{}) catch return;
     var i: usize = 0;
     while (i < progress_bar_width) : (i += 1) {
         const ch: u8 = if (i < filled) '#' else ' ';
-        w2.print("{c}", .{ch}) catch return;
+        w1.print("{c}", .{ch}) catch return;
     }
-    w2.print("] {d}/{d} {s}", .{ current_in_run, total_to_resolve, c_erase_to_eol }) catch return;
+    w1.print("] {d}/{d} {s}", .{ current_in_run, total_to_resolve, c_erase_to_eol }) catch return;
+    if (use_color) w1.print("{s}", .{c_reset}) catch return;
+    const line1 = fbs1.getWritten();
+
+    // 第二行：Resolving (N) name...
+    var line2_buf: [160]u8 = undefined;
+    var fbs2 = std.io.fixedBufferStream(&line2_buf);
+    const w2 = fbs2.writer();
+    if (use_color) w2.print("{s}", .{c_dim}) catch return;
+    w2.print("Resolving ({d}) {s}...{s}", .{ total_to_resolve, name, c_erase_to_eol }) catch return;
     if (use_color) w2.print("{s}", .{c_reset}) catch return;
     const line2 = fbs2.getWritten();
 
@@ -347,16 +361,64 @@ fn onResolving(ctx: ?*anyopaque, name: []const u8, current_in_run: usize, total_
         if (f) state.resolving_first = false;
         break :blk f;
     } else true;
-    // 标题已带一空行（version.printCommandHeader 的 \n\n）；首次不再多打换行，避免出现两空行
     if (first) {
-        stdout_w.interface.print("{s}\n{s}", .{ line1, line2 }) catch return;
+        stdout_w.interface.print("\n{s}\n{s}", .{ line1, line2 }) catch return;
     } else {
-        stdout_w.interface.print("\r{s}{s}\n{s}", .{ c_cursor_up_1, line1, line2 }) catch return;
+        stdout_w.interface.print("{s}\r{s}\n{s}", .{ c_cursor_up_1, line1, line2 }) catch return;
     }
     stdout_w.interface.flush() catch return;
 }
 
-/// InstallReporter.onStart：total 为本轮新安装数量；为 0 时不画进度条（already up to date），否则先换行结束解析行再画 0/total。SHU_NO_PROGRESS 时只打一行提示进入安装阶段。
+/// 安装阶段第二行包名最大显示长度，避免终端折行
+const install_line_name_max = 48;
+
+/// InstallReporter.onProgress：两行（进度条上、Installing 下）。onInstallStart 已输出两行，这里始终用 \x1b[1A 上移一行再重写两行，不再额外换行，避免出现四行。
+fn onInstallProgress(ctx: ?*anyopaque, current: usize, total: usize, last_completed_name: ?[]const u8) void {
+    if (progressDisabled() or total == 0) return;
+    const use_color = if (ctx) |c| @as(*ProgressState, @ptrCast(@alignCast(c))).use_color else false;
+
+    // 第一行：进度条 [###...] current/total（与 onResolving 一致）
+    const filled: usize = if (total > 0) (current * progress_bar_width) / total else 0;
+    var line1_buf: [80]u8 = undefined;
+    var fbs1 = std.io.fixedBufferStream(&line1_buf);
+    const w1 = fbs1.writer();
+    if (use_color) w1.print("{s}", .{c_cyan}) catch return;
+    w1.print("[", .{}) catch return;
+    var i: usize = 0;
+    while (i < progress_bar_width) : (i += 1) {
+        const ch: u8 = if (i < filled) '#' else ' ';
+        w1.print("{c}", .{ch}) catch return;
+    }
+    w1.print("] {d}/{d} {s}", .{ current, total, c_erase_to_eol }) catch return;
+    if (use_color) w1.print("{s}", .{c_reset}) catch return;
+    const line1 = fbs1.getWritten();
+
+    // 第二行：Installing (current/total) name... 或 packages...（与 onResolving 第二行一致）
+    var line2_buf: [120]u8 = undefined;
+    var fbs2 = std.io.fixedBufferStream(&line2_buf);
+    const w2 = fbs2.writer();
+    if (use_color) w2.print("{s}", .{c_dim}) catch return;
+    if (last_completed_name) |name| {
+        const n = @min(name.len, install_line_name_max);
+        if (n > 0) {
+            w2.print("Installing ({d}/{d}) {s}...{s}", .{ current, total, name[0..n], c_erase_to_eol }) catch return;
+        } else {
+            w2.print("Installing ({d}/{d}) packages...{s}", .{ current, total, c_erase_to_eol }) catch return;
+        }
+    } else {
+        w2.print("Installing ({d}/{d}) packages...{s}", .{ current, total, c_erase_to_eol }) catch return;
+    }
+    if (use_color) w2.print("{s}", .{c_reset}) catch return;
+    const line2 = fbs2.getWritten();
+
+    var out_buf: [220]u8 = undefined;
+    var stdout_w = std.fs.File.stdout().writer(&out_buf);
+    // onInstallStart 已画好两行，这里只上移一行再重写两行，不再额外 \n，避免变成四行
+    stdout_w.interface.print("{s}\r{s}\n{s}", .{ c_cursor_up_1, line1, line2 }) catch return;
+    stdout_w.interface.flush() catch return;
+}
+
+/// InstallReporter.onStart：新起一行后输出两行（进度条 0/total、Installing (0/total) packages...），后续 onInstallProgress 用 \x1b[1A 上移一行再重写，只占两行。
 fn onInstallStart(ctx: ?*anyopaque, total: usize) void {
     if (progressDisabled()) {
         if (total > 0) _ = std.posix.write(1, "\nInstalling packages...\n") catch {};
@@ -368,11 +430,27 @@ fn onInstallStart(ctx: ?*anyopaque, total: usize) void {
     }
     if (total == 0) return;
     const use_color = if (ctx) |c| @as(*ProgressState, @ptrCast(@alignCast(c))).use_color else false;
-    var out_buf: [8]u8 = undefined;
+    var line1_buf: [80]u8 = undefined;
+    var fbs1 = std.io.fixedBufferStream(&line1_buf);
+    const w1 = fbs1.writer();
+    if (use_color) w1.print("{s}", .{c_cyan}) catch return;
+    w1.print("[", .{}) catch return;
+    var i: usize = 0;
+    while (i < progress_bar_width) : (i += 1) w1.print(" ", .{}) catch return;
+    w1.print("] 0/{d} {s}", .{ total, c_erase_to_eol }) catch return;
+    if (use_color) w1.print("{s}", .{c_reset}) catch return;
+    const line1 = fbs1.getWritten();
+    var line2_buf: [80]u8 = undefined;
+    var fbs2 = std.io.fixedBufferStream(&line2_buf);
+    const w2 = fbs2.writer();
+    if (use_color) w2.print("{s}", .{c_dim}) catch return;
+    w2.print("Installing (0/{d}) packages...{s}", .{ total, c_erase_to_eol }) catch return;
+    if (use_color) w2.print("{s}", .{c_reset}) catch return;
+    const line2 = fbs2.getWritten();
+    var out_buf: [200]u8 = undefined;
     var stdout_w = std.fs.File.stdout().writer(&out_buf);
-    stdout_w.interface.print("\n", .{}) catch return;
+    stdout_w.interface.print("\n{s}\n{s}", .{ line1, line2 }) catch return;
     stdout_w.interface.flush() catch return;
-    writeProgressBarOnly(use_color, 0, total);
 }
 
 /// 仅写进度条行「[###...] current/total」到 stdout，不换行，供底部单行进度条原地更新
@@ -399,11 +477,12 @@ fn writeProgressBarOnly(use_color: bool, current: usize, total: usize) void {
     const line = fbs.getWritten();
     var out_buf: [96]u8 = undefined;
     var stdout_w = std.fs.File.stdout().writer(&out_buf);
-    stdout_w.interface.print("{s}", .{line}) catch return;
+    // 先 \r 回到行首再写进度条，保证轮询刷新时原地覆盖同一行，避免满屏重复
+    stdout_w.interface.print("\r{s}", .{line}) catch return;
     stdout_w.interface.flush() catch return;
 }
 
-/// InstallReporter.onPackage：仅在新安装时调用；更新进度条 current/total（total 为本轮新安装数）并可选打印 +name。SHU_NO_PROGRESS 时每包一行「Installing current/total name」，失败时易看出是哪个包。
+/// InstallReporter.onPackage：下载完成后第二遍按 install_order 回调；仅在新安装时打印 +name，不再刷新进度条（394 满即止，避免下面再出一行进度条）。首次打印前先换行，避免与两行进度块挤在同一行。
 fn onInstallPackage(ctx: ?*anyopaque, index: usize, total: usize, name: []const u8, ver: []const u8, newly_installed: bool) void {
     if (progressDisabled()) {
         if (total == 0) return;
@@ -414,12 +493,44 @@ fn onInstallPackage(ctx: ?*anyopaque, index: usize, total: usize, name: []const 
         _ = std.posix.write(1, fbs.getWritten()) catch return;
         return;
     }
-    const current = index + 1;
     if (total == 0) return;
     const use_color = if (ctx) |c| @as(*ProgressState, @ptrCast(@alignCast(c))).use_color else false;
     var out_buf: [256]u8 = undefined;
     var stdout_w = std.fs.File.stdout().writer(&out_buf);
-    stdout_w.interface.print("\r{s}", .{c_erase_to_eol}) catch return;
+    if (ctx) |c| {
+        const state = @as(*ProgressState, @ptrCast(@alignCast(c)));
+        if (!state.install_done_newline) {
+            state.install_done_newline = true;
+            // 第二遍首次：先强制把进度条刷成 total/total（修复单包时一直是 0/1），再换行打 +name
+            if (total > 0) {
+                var line1_buf: [80]u8 = undefined;
+                var fbs1 = std.io.fixedBufferStream(&line1_buf);
+                const w1 = fbs1.writer();
+                if (use_color) w1.print("{s}", .{c_cyan}) catch return;
+                w1.print("[", .{}) catch return;
+                var i: usize = 0;
+                while (i < progress_bar_width) : (i += 1) w1.print("#", .{}) catch return;
+                w1.print("] {d}/{d} {s}", .{ total, total, c_erase_to_eol }) catch return;
+                if (use_color) w1.print("{s}", .{c_reset}) catch return;
+                const line1 = fbs1.getWritten();
+                var line2_buf: [120]u8 = undefined;
+                var fbs2 = std.io.fixedBufferStream(&line2_buf);
+                const w2 = fbs2.writer();
+                if (use_color) w2.print("{s}", .{c_dim}) catch return;
+                const n = @min(name.len, install_line_name_max);
+                if (n > 0) {
+                    w2.print("Installing ({d}/{d}) {s}...{s}", .{ total, total, name[0..n], c_erase_to_eol }) catch return;
+                } else {
+                    w2.print("Installing ({d}/{d}) packages...{s}", .{ total, total, c_erase_to_eol }) catch return;
+                }
+                if (use_color) w2.print("{s}", .{c_reset}) catch return;
+                const line2 = fbs2.getWritten();
+                stdout_w.interface.print("{s}\r{s}\n{s}", .{ c_cursor_up_1, line1, line2 }) catch return;
+                stdout_w.interface.flush() catch return;
+            }
+            stdout_w.interface.print("\n", .{}) catch return;
+        }
+    }
     if (newly_installed) {
         if (use_color) {
             stdout_w.interface.print("+ {s}{s}@{s}{s}\n", .{ c_green, name, ver, c_reset }) catch return;
@@ -428,7 +539,6 @@ fn onInstallPackage(ctx: ?*anyopaque, index: usize, total: usize, name: []const 
         }
     }
     stdout_w.interface.flush() catch return;
-    writeProgressBarOnly(use_color, current, total);
 }
 
 /// add 流程下 install 结束后对本次添加的包打印「+ name@version」，即使已是 Already up to date
@@ -442,28 +552,28 @@ fn onPackageAddedPrint(ctx: ?*anyopaque, name: []const u8, ver: []const u8) void
 }
 
 /// InstallReporter.onDone：换行结束进度条，打 "N new, M total packages" 或 "M packages installed"（无新装时）。
-/// 输出逻辑：进度条后 \n\n 接总结行（1 空行）；总结行末尾 \n\n 再 1 空行回到 shell；全流程不出现连续两空行。
+/// 输出逻辑：进度条后 \n 接总结行（1 空行）；总结行末尾 \n\n 再 1 空行回到 shell。
 fn onInstallDone(ctx: ?*anyopaque, total_count: usize, new_count: usize) void {
     const use_color = if (ctx) |c| @as(*ProgressState, @ptrCast(@alignCast(c))).use_color else false;
     const start_time = if (ctx) |c| @as(*ProgressState, @ptrCast(@alignCast(c))).start_time else std.time.milliTimestamp();
     const elapsed_ms: i64 = std.time.milliTimestamp() - start_time;
     if (new_count == 0) {
         if (use_color) {
-            printToStdout("\n\n{s}Already up to date ({d} packages){s}\n\n", .{ c_green, total_count, c_reset }) catch {};
+            printToStdout("\n{s}Already up to date ({d} packages){s}\n\n", .{ c_green, total_count, c_reset }) catch {};
         } else {
-            printToStdout("\n\nAlready up to date ({d} packages)\n\n", .{total_count}) catch {};
+            printToStdout("\nAlready up to date ({d} packages)\n\n", .{total_count}) catch {};
         }
     } else if (new_count == total_count) {
         if (use_color) {
-            printToStdout("\n\n{s}{d} packages installed [{d}.00ms]{s}\n\n", .{ c_green, total_count, elapsed_ms, c_reset }) catch {};
+            printToStdout("\n{s}{d} packages installed [{d}.00ms]{s}\n\n", .{ c_green, total_count, elapsed_ms, c_reset }) catch {};
         } else {
-            printToStdout("\n\n{d} packages installed [{d}.00ms]\n\n", .{ total_count, elapsed_ms }) catch {};
+            printToStdout("\n{d} packages installed [{d}.00ms]\n\n", .{ total_count, elapsed_ms }) catch {};
         }
     } else {
         if (use_color) {
-            printToStdout("\n\n{s}{d} new, {d} total packages [{d}.00ms]{s}\n\n", .{ c_green, new_count, total_count, elapsed_ms, c_reset }) catch {};
+            printToStdout("\n{s}{d} new, {d} total packages [{d}.00ms]{s}\n\n", .{ c_green, new_count, total_count, elapsed_ms, c_reset }) catch {};
         } else {
-            printToStdout("\n\n{d} new, {d} total packages [{d}.00ms]\n\n", .{ new_count, total_count, elapsed_ms }) catch {};
+            printToStdout("\n{d} new, {d} total packages [{d}.00ms]\n\n", .{ new_count, total_count, elapsed_ms }) catch {};
         }
     }
 }
