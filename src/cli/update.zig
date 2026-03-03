@@ -13,20 +13,23 @@
 
 const std = @import("std");
 const args = @import("args.zig");
+const errors = @import("errors");
+const libs_process = @import("libs_process");
 const version = @import("version.zig");
 const manifest = @import("../package/manifest.zig");
 const lockfile = @import("../package/lockfile.zig");
 const registry = @import("../package/registry.zig");
 const npmrc = @import("../package/npmrc.zig");
 const pkg_install = @import("../package/install.zig");
-const io_core = @import("io_core");
+const libs_io = @import("libs_io");
 
 /// 执行 shu update [包名...]：若无参数则对所有 dependencies 与 devDependencies 按当前版本范围重新向 registry 解析，更新 shu.lock 后 install；若有包名则仅更新这些包。
 pub fn update(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional: []const []const u8) !void {
     _ = parsed;
-    try version.printCommandHeader("update");
-    var cwd_buf: [1024]u8 = undefined;
-    const cwd = std.posix.getcwd(&cwd_buf) catch return error.CwdFailed;
+    const io = libs_process.getProcessIo() orelse return error.NoProcessIo;
+    try version.printCommandHeader(io, "update");
+    var cwd_buf: [libs_io.max_path_bytes]u8 = undefined;
+    const cwd = libs_io.realpath(".", &cwd_buf) catch return error.CwdFailed;
     const cwd_owned = allocator.dupe(u8, cwd) catch return error.OutOfMemory;
     defer allocator.free(cwd_owned);
 
@@ -40,7 +43,7 @@ pub fn update(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional:
     defer loaded.arena.deinit();
     const m = &loaded.manifest;
 
-    const lock_path = try io_core.pathJoin(allocator, &.{ cwd_owned, lockfile.lock_file_name });
+    const lock_path = try libs_io.pathJoin(allocator, &.{ cwd_owned, lockfile.lock_file_name });
     defer allocator.free(lock_path);
     var locked = lockfile.load(allocator, lock_path) catch std.StringArrayHashMap([]const u8).init(allocator);
     defer {
@@ -117,8 +120,9 @@ pub fn update(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional:
 }
 
 fn printToStdout(comptime fmt: []const u8, fargs: anytype) !void {
+    const io_out = libs_process.getProcessIo() orelse return error.NoProcessIo;
     var buf: [256]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf);
+    var w = std.Io.File.Writer.init(std.Io.File.stdout(), io_out, &buf);
     try w.interface.print(fmt, fargs);
     try w.interface.flush();
 }
