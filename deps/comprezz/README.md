@@ -2,11 +2,14 @@
 
 ![](./docs/ziguanasssss.jpg)
 
-A single-file [gzip/deflate compression library](https://bkataru.bearblog.dev/comprezzzig/) and CLI binary for Zig, based on code from the Zig 0.14 standard library.
+A single-file
+[gzip/deflate compression library](https://bkataru.bearblog.dev/comprezzzig/)
+and CLI binary for Zig, based on code from the Zig 0.14 standard library.
 
 ## Features
 
-- **Full LZ77 + Huffman implementation** - Complete deflate algorithm implementation
+- **Full LZ77 + Huffman implementation** - Complete deflate algorithm
+  implementation
 - **Configurable compression levels** - Fast, default, best, and levels 4-9
 - **Gzip format** - Proper headers and CRC32 checksums
 - **Library + CLI** - Use as a dependency or command-line tool
@@ -56,14 +59,14 @@ const comprezz = @import("comprezz");
 pub fn main() !void {
     var compressed_buffer: [1024]u8 = undefined;
     var fixed_writer = std.Io.Writer.fixed(&compressed_buffer);
-    
+
     const data = "Hello, World!";
     var input_buffer: [1024]u8 = undefined;
     @memcpy(input_buffer[0..data.len], data);
     var input_reader = std.Io.Reader.fixed(input_buffer[0..data.len]);
-    
+
     try comprezz.compress(&input_reader, &fixed_writer, .{});
-    
+
     // Find the end of compressed data by checking for non-zero bytes
     var written: usize = 0;
     for (compressed_buffer, 0..) |byte, i| {
@@ -84,16 +87,17 @@ pub fn main() !void {
     const input_file = try std.fs.cwd().openFile("input.txt", .{});
     defer input_file.close();
     var input_reader = input_file.reader();
-    
+
     const output_file = try std.fs.cwd().createFile("output.gz", .{});
     defer output_file.close();
     var output_writer = output_file.writer();
-    
+
     try comprezz.compress(&input_reader, &output_writer, .{ .level = .best });
 }
 ```
 
 Available compression levels:
+
 - `.fast` - Fastest compression
 - `.default` - Good balance (default)
 - `.best` - Best compression ratio
@@ -111,13 +115,13 @@ pub fn main() !void {
     const output_file = try std.fs.cwd().createFile("output.gz", .{});
     defer output_file.close();
     var output_writer = output_file.writer();
-    
+
     var comp = try comprezz.compressor(&output_writer, .{ .level = .fast });
-    
+
     const input_file = try std.fs.cwd().openFile("input.txt", .{});
     defer input_file.close();
     var input_reader = input_file.reader();
-    
+
     try comp.compress(&input_reader);
     try comp.finish();
 }
@@ -256,13 +260,16 @@ Examples:
 
 ## License
 
-This code is based on the Zig 0.14 standard library, which is part of the Zig project and uses the MIT license. This implementation maintains the same license.
+This code is based on the Zig 0.14 standard library, which is part of the Zig
+project and uses the MIT license. This implementation maintains the same
+license.
 
 ## Credits
 
 - Original implementation based on Zig 0.14 standard library
 - Deflate algorithm implementation inspired by zlib and Go's compress/flate
-- Adapted for Zig 0.15 compatibility with its new `std.Io.Reader` and `std.Io.Writer` interfaces
+- Adapted for Zig 0.15 compatibility with its new `std.Io.Reader` and
+  `std.Io.Writer` interfaces
 
 ## Limitations
 
@@ -271,6 +278,8 @@ This code is based on the Zig 0.14 standard library, which is part of the Zig pr
 
 ## Contributing
 
-This is a single-file library copied from Zig's standard library. For Zig language development, see [ziglang.org](https://ziglang.org/).
+This is a single-file library copied from Zig's standard library. For Zig
+language development, see [ziglang.org](https://ziglang.org/).
 
-For issues or improvements to this specific package, open an issue on this GitHub repo and/or raise a PR.
+For issues or improvements to this specific package, open an issue on this
+GitHub repo and/or raise a PR.
