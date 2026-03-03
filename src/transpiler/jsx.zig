@@ -86,8 +86,7 @@ fn transformImpl(allocator: std.mem.Allocator, source: []const u8, options: Tran
             continue;
         }
         if (in_template) {
-            if (c == '`') in_template = false
-            else if (c == '\\') {
+            if (c == '`') in_template = false else if (c == '\\') {
                 try out.append(arena_alloc, c);
                 i += 1;
                 if (i < source.len) {
@@ -101,8 +100,7 @@ fn transformImpl(allocator: std.mem.Allocator, source: []const u8, options: Tran
             continue;
         }
         if (brace_depth > 0) {
-            if (c == '{') brace_depth += 1
-            else if (c == '}') brace_depth -= 1;
+            if (c == '{') brace_depth += 1 else if (c == '}') brace_depth -= 1;
             try out.append(arena_alloc, c);
             i += 1;
             continue;
@@ -237,8 +235,7 @@ fn transformJsxElement(
                 i += 1;
                 while (i < source.len and depth > 0) {
                     const ch = source[i];
-                    if (ch == '{') depth += 1
-                    else if (ch == '}') depth -= 1;
+                    if (ch == '{') depth += 1 else if (ch == '}') depth -= 1;
                     try out.append(allocator, ch);
                     i += 1;
                 }
@@ -285,8 +282,7 @@ fn transformJsxElement(
             var depth: u32 = 0;
             while (i < source.len) {
                 const ch = source[i];
-                if (ch == '{') depth += 1
-                else if (ch == '}') {
+                if (ch == '{') depth += 1 else if (ch == '}') {
                     if (depth == 0) break;
                     depth -= 1;
                 }
@@ -336,8 +332,7 @@ fn transformJsxElement(
                 var depth: u32 = 1;
                 while (i < source.len and depth > 0) {
                     const ch = source[i];
-                    if (ch == '{') depth += 1
-                    else if (ch == '}') depth -= 1;
+                    if (ch == '{') depth += 1 else if (ch == '}') depth -= 1;
                     try props_buf.appendByte(ch);
                     i += 1;
                 }
@@ -436,8 +431,7 @@ fn transformJsxElement(
                 i += 1;
                 while (i < source.len and depth > 0) {
                     const ch = source[i];
-                    if (ch == '{') depth += 1
-                    else if (ch == '}') depth -= 1;
+                    if (ch == '{') depth += 1 else if (ch == '}') depth -= 1;
                     try out.append(allocator, ch);
                     i += 1;
                 }
@@ -520,9 +514,7 @@ inline fn appendEscapedJsString(allocator: std.mem.Allocator, out: *std.ArrayLis
     for (trimmed) |b| {
         if (b == '\\' or b == '"' or b == '\n' or b == '\r') {
             try out.append(allocator, '\\');
-            if (b == '\n') try out.append(allocator, 'n')
-            else if (b == '\r') try out.append(allocator, 'r')
-            else try out.append(allocator, b);
+            if (b == '\n') try out.append(allocator, 'n') else if (b == '\r') try out.append(allocator, 'r') else try out.append(allocator, b);
         } else {
             try out.append(allocator, b);
         }

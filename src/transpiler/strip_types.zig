@@ -95,8 +95,7 @@ pub fn strip(allocator: std.mem.Allocator, source: []const u8) ![]const u8 {
             var depth: u32 = 1;
             var k = i + 1;
             while (k < source.len and depth > 0) {
-                if (source[k] == '<') depth += 1
-                else if (source[k] == '>') depth -= 1;
+                if (source[k] == '<') depth += 1 else if (source[k] == '>') depth -= 1;
                 k += 1;
             }
             i = k;
@@ -118,8 +117,7 @@ inline fn skipTypeAnnotation(source: []const u8, start: usize) usize {
         var depth: u32 = 1;
         i += 1;
         while (i < source.len and depth > 0) {
-            if (source[i] == '<') depth += 1
-            else if (source[i] == '>') depth -= 1;
+            if (source[i] == '<') depth += 1 else if (source[i] == '>') depth -= 1;
             i += 1;
         }
     }
