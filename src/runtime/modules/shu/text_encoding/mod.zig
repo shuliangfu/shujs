@@ -87,9 +87,7 @@ fn textEncoderEncodeCallback(
     defer escaped.deinit(allocator);
     escaped.appendSlice(allocator, "(function(b64){var s=atob(b64);var a=new Uint8Array(s.length);for(var i=0;i<s.length;i++)a[i]=s.charCodeAt(i);return a;})('") catch return jsc.JSValueMakeUndefined(ctx);
     for (b64_buf[0..written.len]) |c| {
-        if (c == '\\') escaped.appendSlice(allocator, "\\\\") catch return jsc.JSValueMakeUndefined(ctx)
-        else if (c == '\'') escaped.appendSlice(allocator, "\\'") catch return jsc.JSValueMakeUndefined(ctx)
-        else escaped.append(allocator, c) catch return jsc.JSValueMakeUndefined(ctx);
+        if (c == '\\') escaped.appendSlice(allocator, "\\\\") catch return jsc.JSValueMakeUndefined(ctx) else if (c == '\'') escaped.appendSlice(allocator, "\\'") catch return jsc.JSValueMakeUndefined(ctx) else escaped.append(allocator, c) catch return jsc.JSValueMakeUndefined(ctx);
     }
     escaped.appendSlice(allocator, "')") catch return jsc.JSValueMakeUndefined(ctx);
     const script_z = allocator.dupeZ(u8, escaped.items) catch return jsc.JSValueMakeUndefined(ctx);

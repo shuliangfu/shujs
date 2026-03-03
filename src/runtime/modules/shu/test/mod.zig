@@ -78,13 +78,10 @@ fn runTestJob(ctx: jsc.JSContextRef, suite: *runner.Suite, test_idx: usize, has_
     const t_entry = &suite.tests.items[test_idx];
     if (t_entry.skip) return .{ .value = jsc.JSValueMakeUndefined(ctx), .defer_advance = false };
     if (t_entry.skip_if_ref) |skip_if| {
-        const cond = if (jsc.JSObjectIsFunction(ctx, @ptrCast(skip_if)))
-            blk: {
-                var no_args: [0]jsc.JSValueRef = undefined;
-                break :blk jsc.JSObjectCallAsFunction(ctx, @ptrCast(skip_if), null, 0, &no_args, null);
-            }
-        else
-            skip_if;
+        const cond = if (jsc.JSObjectIsFunction(ctx, @ptrCast(skip_if))) blk: {
+            var no_args: [0]jsc.JSValueRef = undefined;
+            break :blk jsc.JSObjectCallAsFunction(ctx, @ptrCast(skip_if), null, 0, &no_args, null);
+        } else skip_if;
         if (!jsc.JSValueIsUndefined(ctx, cond) and !jsc.JSValueIsNull(ctx, cond) and jsc.JSValueToBoolean(ctx, cond))
             return .{ .value = jsc.JSValueMakeUndefined(ctx), .defer_advance = false };
     }
@@ -94,7 +91,7 @@ fn runTestJob(ctx: jsc.JSContextRef, suite: *runner.Suite, test_idx: usize, has_
     defer jsc.JSStringRelease(k_done);
     const advance = getAdvanceFn(ctx);
     _ = jsc.JSObjectSetProperty(ctx, t_ctx, k_done, advance, jsc.kJSPropertyAttributeNone, null);
-    var args = [_]jsc.JSValueRef{ t_ctx };
+    var args = [_]jsc.JSValueRef{t_ctx};
     const ret = jsc.JSObjectCallAsFunction(ctx, @ptrCast(t_entry.fn_ref), null, 1, &args, null);
     if (t_entry.todo) return .{ .value = jsc.JSValueMakeUndefined(ctx), .defer_advance = false };
     const defer_advance = jsc.JSValueIsUndefined(ctx, ret) and !isThenable(ctx, ret);
@@ -234,7 +231,7 @@ fn describeCallback(
     common.setMethod(ctx, suite_ctx, "afterEach", afterEachCallback);
     common.setMethod(ctx, suite_ctx, "describe", describeCallback);
 
-    var args = [_]jsc.JSValueRef{ suite_ctx };
+    var args = [_]jsc.JSValueRef{suite_ctx};
     _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(fn_val), null, 1, &args, null);
     return jsc.JSValueMakeUndefined(ctx);
 }
@@ -442,7 +439,7 @@ fn rejectWrapperCallback(
         }
     }
     const err = if (argumentCount >= 1) arguments[0] else jsc.JSValueMakeUndefined(ctx);
-    var args = [_]jsc.JSValueRef{ err };
+    var args = [_]jsc.JSValueRef{err};
     _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(state.reject_ref), null, 1, &args, null);
     return jsc.JSValueMakeUndefined(ctx);
 }
@@ -473,7 +470,7 @@ fn runCallback(
     const k_executor = jsc.JSStringCreateWithUTF8CString("");
     defer jsc.JSStringRelease(k_executor);
     const executor_fn = jsc.JSObjectMakeFunctionWithCallback(ctx, k_executor, runExecutorCallback);
-    var args = [_]jsc.JSValueRef{ executor_fn };
+    var args = [_]jsc.JSValueRef{executor_fn};
     return jsc.JSObjectCallAsConstructor(ctx, @ptrCast(promise_ctor), 1, &args, null);
 }
 
@@ -571,8 +568,7 @@ fn skipIfCallback(
     if (argumentCount < 1) return jsc.JSValueMakeUndefined(ctx);
     const condition = arguments[0];
     const allocator = globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
-    const script_z = allocator.dupeZ(u8,
-        "(function(cond){ var it = globalThis.__shu_test_exports && globalThis.__shu_test_exports.it; return function(name, optsOrFn, fn){ var opts = (typeof optsOrFn === 'function') ? { skipIf: cond } : (function(){ var o = {}; for(var k in optsOrFn) o[k]=optsOrFn[k]; o.skipIf=cond; return o; })(); return it ? it(name, opts, typeof optsOrFn === 'function' ? optsOrFn : fn) : undefined; }; })") catch return jsc.JSValueMakeUndefined(ctx);
+    const script_z = allocator.dupeZ(u8, "(function(cond){ var it = globalThis.__shu_test_exports && globalThis.__shu_test_exports.it; return function(name, optsOrFn, fn){ var opts = (typeof optsOrFn === 'function') ? { skipIf: cond } : (function(){ var o = {}; for(var k in optsOrFn) o[k]=optsOrFn[k]; o.skipIf=cond; return o; })(); return it ? it(name, opts, typeof optsOrFn === 'function' ? optsOrFn : fn) : undefined; }; })") catch return jsc.JSValueMakeUndefined(ctx);
     defer allocator.free(script_z);
     const script_ref = jsc.JSStringCreateWithUTF8CString(script_z.ptr);
     defer jsc.JSStringRelease(script_ref);

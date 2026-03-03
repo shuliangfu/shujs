@@ -11,7 +11,7 @@ const std = @import("std");
 const jsc = @import("jsc");
 const node_compat = @import("../node_compat/mod.zig");
 
-const METHOD_NAMES = [_][]const u8{ "WASI" };
+const METHOD_NAMES = [_][]const u8{"WASI"};
 
 pub fn getExports(ctx: jsc.JSContextRef, allocator: std.mem.Allocator) jsc.JSValueRef {
     return node_compat.buildStubExports(ctx, allocator, "wasi", &METHOD_NAMES);

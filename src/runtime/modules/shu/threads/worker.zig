@@ -66,7 +66,7 @@ pub fn setCurrentChannel(channel: *ThreadChannel) void {
 
 /// 向 process_obj 挂载 send、receiveSync（使用 thread channel）
 pub fn registerProcessThreaded(ctx: jsc.JSContextRef, process_obj: jsc.JSObjectRef, channel_ptr: *anyopaque) void {
-    const channel: *ThreadChannel = @alignCast(@ptrCast(channel_ptr));
+    const channel: *ThreadChannel = @ptrCast(@alignCast(channel_ptr));
     setCurrentChannel(channel);
     common.setMethod(ctx, process_obj, "send", threadProcessSendCallback);
     common.setMethod(ctx, process_obj, "receiveSync", threadProcessReceiveSyncCallback);
