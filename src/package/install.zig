@@ -214,9 +214,11 @@ const NpmInstallWorkerCtx = struct {
     worker_id: usize,
 };
 
-/// npm 安装 worker：每 worker 持有一个 CurlClient 和独立临时文件路径；取任务后查缓存→未命中则解析/下载→写缓存→解压；失败写 results[i] 并在 mutex 下写 first_error/error_detail。
+/// npm 安装 worker：每 worker 持有一个 std.http.Client（Zig 路径）、一个 CurlClient（回退）和独立临时文件路径；取任务后查缓存→未命中则下载（先 Zig 再 Curl）→写缓存→解压；失败写 results[i] 并在 mutex 下写 first_error/error_detail。
 fn npmInstallWorker(ctx: *const NpmInstallWorkerCtx) void {
     const page = std.heap.page_allocator;
+    var zig_client = std.http.Client{ .allocator = page };
+    defer zig_client.deinit();
     var curl = io_core.http.CurlClient.init();
     defer curl.deinit();
     const temp_tgz = std.fmt.allocPrint(page, "{s}/.tmp-download-{d}.tgz", .{ ctx.cache_root, ctx.worker_id }) catch return;
@@ -264,9 +266,13 @@ fn npmInstallWorker(ctx: *const NpmInstallWorkerCtx) void {
             var last_dl_err: anyerror = undefined;
             for (0..INSTALL_NETWORK_RETRIES) |ri| {
                 if (ri > 0) std.Thread.sleep(INSTALL_NETWORK_RETRY_DELAY_NS);
-                registry.downloadToPathWithCurlClient(@constCast(&curl), page, turl, temp_tgz) catch |e| {
+                // 先走 Zig client 验证 tarball 下载；失败则回退到 CurlClient
+                registry.downloadToPathWithClient(&zig_client, page, turl, temp_tgz) catch |e| {
                     last_dl_err = e;
-                    continue;
+                    registry.downloadToPathWithCurlClient(@constCast(&curl), page, turl, temp_tgz) catch |e2| {
+                        last_dl_err = e2;
+                        continue;
+                    };
                 };
                 download_ok = true;
                 break;
