@@ -526,7 +526,7 @@ pub const HighPerfIO = struct {
         else
             @as([*]const u8, @ptrCast(&[_]u8{}));
 
-        const client_stream: std.net.Stream = .{ .handle = accept_socket };
+        const client_stream: std.Io.net.Stream = .{ .handle = accept_socket };
         if (self.completion_count < self.completion_buffer.len) {
             self.completion_buffer[self.completion_count] = .{
                 .user_data = user_data,
@@ -572,7 +572,7 @@ pub const HighPerfIO = struct {
     }
 
     /// 在连接上提交一次 recv：从池取块、占 conn_io 槽位、associate socket 后 WSARecv；完成时 tag=recv、chunk_index 有效，用毕须 releaseChunk
-    pub fn submitRecv(self: *HighPerfIO, stream: std.net.Stream, user_data: usize) void {
+    pub fn submitRecv(self: *HighPerfIO, stream: std.Io.net.Stream, user_data: usize) void {
         const slot_index = self.conn_io_free.popOrNull() orelse return;
         const chunk_index = self.chunk_cache.acquire() orelse {
             _ = self.conn_io_free.append(slot_index) catch {};
@@ -616,7 +616,7 @@ pub const HighPerfIO = struct {
     }
 
     /// 在连接上提交 send：占 conn_io 槽位、存 buf 引用、associate 后 WSASend；完成前 data 须保持有效，完成时 tag=send、len=已发送字节数
-    pub fn submitSend(self: *HighPerfIO, stream: std.net.Stream, data: []const u8, user_data: usize) void {
+    pub fn submitSend(self: *HighPerfIO, stream: std.Io.net.Stream, data: []const u8, user_data: usize) void {
         if (data.len == 0) return;
         const slot_index = self.conn_io_free.popOrNull() orelse return;
         const socket: ws2.SOCKET = @ptrCast(stream.handle);
@@ -654,7 +654,7 @@ const TRANSMIT_FILE_MAX_CHUNK: u64 = std.math.maxInt(win.DWORD);
 
 /// 零拷贝：文件 → 网络（TransmitFile）；count 超 DWORD 时循环直至发完。
 /// 进阶：小文件（<4KB）可考虑 TF_USE_DEFAULT_WORKER 减少线程切换；短连接压榨可配合 DisconnectEx + TF_REUSE_SOCKET 复用 socket 句柄，绕过创建开销。
-pub fn sendFile(stream: std.net.Stream, file: std.fs.File, offset: u64, count: u64) api.SendFileError!void {
+pub fn sendFile(stream: std.Io.net.Stream, file: std.fs.File, offset: u64, count: u64) api.SendFileError!void {
     const h_socket: ws2.SOCKET = @ptrCast(stream.handle);
     const h_file: win.HANDLE = file.handle;
     var sent: u64 = 0;
