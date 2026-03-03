@@ -113,6 +113,7 @@ const NpmResolveWorkerCtx = struct {
 };
 
 /// npm 解析 worker：每 worker 持有一个 Client，循环取任务并调用 resolveVersionTarballAndDeps，结果写入 results[i]（page 分配，主线程释放）。
+/// 后续可考虑改为 per-worker Arena（§1.2），worker 结束时一次性 deinit，减少主线程逐项 free。
 fn npmResolveWorker(ctx: *const NpmResolveWorkerCtx) void {
     const page = std.heap.page_allocator;
     var client = std.http.Client{ .allocator = page };
@@ -378,6 +379,7 @@ const INSTALL_NETWORK_RETRIES = 3;
 const INSTALL_NETWORK_RETRY_DELAY_NS = 500_000_000;
 
 /// 解析阶段 JSR 单条 worker：每 worker 持有一个 Client 复用连接，每 JSR_RESOLVE_CLIENT_REUSE_LIMIT 次请求重建 Client 避免长连接异常；结果写入 results[i]。
+/// 当前用 page_allocator，主线程合并后释放；后续可考虑 per-worker Arena（§1.2）。
 fn jsrResolveWorker(ctx: *const JsrResolveWorkerCtx) void {
     const page = std.heap.page_allocator;
     while (true) {
@@ -1678,7 +1680,7 @@ fn linkPackageBins(
 }
 
 /// 在 bin_dir 下创建一条 bin 链接：bin_dir/<bin_name> -> pkg_dir/<normalized_path>。
-/// target 须为绝对路径，否则 std.fs.symLinkAbsolute 会断言失败。
+/// target 须为绝对路径，否则 io_core.symLinkAbsolute 会断言失败。
 /// Unix：创建后对目标脚本 fchmod +x，使 exec .bin/<name> 时 shebang 能执行。
 /// Windows：无「可执行位」概念，不需 chmod；额外写 .bin/<bin_name>.cmd 包装脚本（@node "target" %*），
 /// 以便在 cmd 中直接运行 <name> 时能正确执行。
@@ -1811,7 +1813,8 @@ fn debugLogTarballExtractFailed(tgz_path: []const u8, err: anyerror) void {
 /// 兼容任意单层顶层目录：从第一条条目的路径推断前缀（如 package/、ws/、foo/ 等），只解压该前缀下的文件到 dest_dir。
 fn extractRawTarFromSlice(tgz_path: []const u8, content: []const u8, dest_dir: []const u8) !void {
     try io_core.makePathAbsolute(dest_dir);
-    var dest_dir_handle = std.fs.openDirAbsolute(dest_dir, .{}) catch |e| {
+    // §3.0: 目录打开经 io_core，与模块约定一致
+    var dest_dir_handle = io_core.openDirAbsolute(dest_dir, .{}) catch |e| {
         logExtractFailureStep(tgz_path, "open_dest_dir", dest_dir, e);
         return error.TarballExtractFailed;
     };
@@ -1917,7 +1920,8 @@ fn extractRawTarFromSlice(tgz_path: []const u8, content: []const u8, dest_dir: [
 }
 
 /// 将 .tgz 解压到指定目录 dest_dir（tgz 内 package/ 前缀下的内容写入 dest_dir）。使用 io_core.mapFileReadOnly 映射 tgz，gzip 解压后流式解析 tar。
-/// 通过 openDirAbsolute(dest_dir) + Dir.createFile/makePath 写文件，避免依赖 *Absolute 路径语义。
+/// 通过 io_core.openDirAbsolute(dest_dir) + Dir.createFile/makePath 写文件。
+/// allocator 用于 gzip 一次性解压的临时缓冲；若由安装 worker 调用，建议传入该 worker 的 Arena 或独立 allocator。
 fn extractTarballToDir(allocator: std.mem.Allocator, tgz_path: []const u8, dest_dir: []const u8) !void {
     var mapped = io_core.mapFileReadOnly(tgz_path) catch |e| {
         debugLogTarballExtractFailed(tgz_path, e);
@@ -1947,7 +1951,8 @@ fn extractTarballToDir(allocator: std.mem.Allocator, tgz_path: []const u8, dest_
     var dec = std.compress.flate.Decompress.init(&in_reader, .gzip, &[0]u8{});
 
     try io_core.makePathAbsolute(dest_dir);
-    var dest_dir_handle = std.fs.openDirAbsolute(dest_dir, .{}) catch |e| {
+    // §3.0: 目录打开经 io_core
+    var dest_dir_handle = io_core.openDirAbsolute(dest_dir, .{}) catch |e| {
         logExtractFailureStep(tgz_path, "open_dest_dir(stream)", dest_dir, e);
         return error.TarballExtractFailed;
     };

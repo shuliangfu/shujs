@@ -347,9 +347,9 @@ fn onResolving(ctx: ?*anyopaque, name: []const u8, current_in_run: usize, total_
         if (f) state.resolving_first = false;
         break :blk f;
     } else true;
-    // 仅在有 Resolving 时：首次多打一换行，使标题下有一空行；不改 header/onStart，避免有 lock 时出现两空行
+    // 标题已带一空行（version.printCommandHeader 的 \n\n）；首次不再多打换行，避免出现两空行
     if (first) {
-        stdout_w.interface.print("\n{s}\n{s}", .{ line1, line2 }) catch return;
+        stdout_w.interface.print("{s}\n{s}", .{ line1, line2 }) catch return;
     } else {
         stdout_w.interface.print("\r{s}{s}\n{s}", .{ c_cursor_up_1, line1, line2 }) catch return;
     }
