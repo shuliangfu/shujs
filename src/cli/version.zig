@@ -33,9 +33,9 @@ pub fn printCommandHeader(cmd: []const u8) !void {
     var w = std.fs.File.stdout().writer(&buf);
     const use_color = std.posix.isatty(1);
     if (use_color) {
-        try w.interface.print("{s}shu {s} v{s}{s}\n\n", .{ c_cyan, cmd, VERSION, c_reset });
+        try w.interface.print("{s}shu {s} v{s}{s}\n", .{ c_cyan, cmd, VERSION, c_reset });
     } else {
-        try w.interface.print("shu {s} v{s}\n\n", .{ cmd, VERSION });
+        try w.interface.print("shu {s} v{s}\n", .{ cmd, VERSION });
     }
     try w.interface.flush();
 }
