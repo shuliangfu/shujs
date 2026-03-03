@@ -1,6 +1,8 @@
 // shu:net — Node 风格 API：与 node:net 对齐
 // createServer、server.listen(port|path|options)、close、address；
 // socket：write/end/destroy、on('data'/'end')、remoteAddress 等；createConnection；isIP 等工具
+//
+// 0.16.0-dev：网络 API 已迁至 std.Io.net；当前仍使用 std.net 以保持与现有 io_core/server 一致，待 io_core 或 std.Io 稳定后迁移（见规则 03 §4、§0）。
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -8,15 +10,32 @@ const build_options = @import("build_options");
 const jsc = @import("jsc");
 const common = @import("../../../common.zig");
 const globals = @import("../../../globals.zig");
-const errors = @import("../../../../errors.zig");
+const errors = @import("errors");
+const libs_process = @import("libs_process");
 const tls = @import("tls");
 
 /// 是否 Windows（comptime 分派，用于 Unix socket / 平台分支）
 const is_windows = builtin.os.tag == .windows;
 
+/// 0.16：std.Io.net 无 Address，用 sockaddr_storage 存 getpeername/getsockname 结果，供 Node 风格 remoteAddress/localAddress 格式化
+const NodeNetAddress = struct {
+    any: std.posix.sockaddr.storage,
+    pub fn getPort(self: NodeNetAddress) u16 {
+        if (self.any.family == std.posix.AF.INET) {
+            const in4 = @as(*const std.posix.sockaddr.in, @ptrCast(&self.any));
+            return @byteSwap(in4.port);
+        }
+        if (self.any.family == std.posix.AF.INET6) {
+            const in6 = @as(*const std.posix.sockaddr.in6, @ptrCast(&self.any));
+            return @byteSwap(in6.port);
+        }
+        return 0;
+    }
+};
+
 /// 单条 net server 记录：listen 的 Server、connection 回调、server_id 与 address 信息；allowHalfOpen 等从 createServer(options) 传入
 const NetServerEntry = struct {
-    server: std.net.Server,
+    server: std.Io.net.Server,
     listener: jsc.JSValueRef,
     ctx: jsc.JSContextRef,
     server_id: u32,
@@ -32,7 +51,7 @@ const NetServerEntry = struct {
 /// 全局 net server 列表；首次 listen 时用 current_allocator 创建
 var g_net_servers: ?std.ArrayList(NetServerEntry) = null;
 /// socket id -> stream，供 socket.write/end/destroy 使用
-var g_net_sockets: ?std.AutoHashMap(u32, std.net.Stream) = null;
+var g_net_sockets: ?std.AutoHashMap(u32, std.Io.net.Stream) = null;
 /// socket id -> socket JS 对象（供 read tick 取 on('data') 等）
 var g_net_socket_objs: ?std.AutoHashMap(u32, jsc.JSObjectRef) = null;
 /// Node 兼容：每个 socket 的 bytesWritten/bytesRead 计数
@@ -61,7 +80,7 @@ const SocketAddrInfo = struct {
 
 /// createConnection 异步结果：由工作线程 push，主线程在 netTick 中 drain 并调 connectListener；若 user_callback 非 null 则调用 user_callback(null, socket) 或 user_callback(err)
 const PendingConnect = struct {
-    stream: ?std.net.Stream,
+    stream: ?std.Io.net.Stream,
     err_msg: ?[]const u8, // 由主线程 free
     ctx: jsc.JSContextRef,
     callback: jsc.JSValueRef,
@@ -69,51 +88,56 @@ const PendingConnect = struct {
     user_callback: ?jsc.JSValueRef = null,
     timeout_ms: ?u32 = null, // createConnection(options) 的 options.timeout，连接成功后对 socket 设 setTimeout
 };
-var g_net_pending_mutex: std.Thread.Mutex = .{};
+var g_net_pending_mutex: std.Io.Mutex = .{ .state = std.atomic.Value(std.Io.Mutex.State).init(.unlocked) };
 var g_net_pending_connects: ?std.ArrayList(PendingConnect) = null;
 /// 未处理完的 createConnection 数量（spawn 时 +1，主线程处理一条时 -1），用于 has_work 调度
 var g_net_pending_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 
-/// 将 fd 设为非阻塞（POSIX: fcntl O_NONBLOCK，Windows: ioctlsocket FIONBIO）
+/// 将 fd 设为非阻塞（POSIX: fcntl O_NONBLOCK，Windows: ioctlsocket FIONBIO）。0.16：fcntl 在 std.c
 fn setNonBlocking(fd: std.posix.socket_t) void {
     if (is_windows) {
         var mode: std.c.uint = 1;
         _ = std.c.ioctlsocket(@as(std.c.socket_t, @intCast(fd)), std.c.FIONBIO, &mode);
         return;
     }
-    const flags = std.posix.fcntl(fd, std.posix.F.GETFL, 0) catch return;
-    _ = std.posix.fcntl(fd, std.posix.F.SETFL, flags | 0x4) catch {}; // O_NONBLOCK
+    const flags = std.c.fcntl(fd, std.c.F.GETFL);
+    _ = std.c.fcntl(fd, std.c.F.SETFL, flags | 0x4); // O_NONBLOCK
 }
 
-/// 从已连接的 stream 获取对端地址（Node 兼容：remoteAddress/remotePort），失败返回 null
-fn getStreamRemoteAddress(stream: std.net.Stream) ?std.net.Address {
-    var addr: std.net.Address = undefined;
-    var len: std.posix.socklen_t = @sizeOf(std.net.Address);
-    std.posix.getpeername(stream.handle, @ptrCast(&addr.any), &len) catch return null;
+/// 从已连接的 stream 获取对端地址（Node 兼容：remoteAddress/remotePort），失败返回 null。0.16：Stream 为 .socket.handle
+fn getStreamRemoteAddress(stream: std.Io.net.Stream) ?NodeNetAddress {
+    var addr: NodeNetAddress = undefined;
+    var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+    if (std.c.getpeername(stream.socket.handle, @ptrCast(&addr.any), &len) != 0) return null;
     return addr;
 }
 
 /// 从已连接的 stream 获取本端地址（Node 兼容：localAddress/localPort），失败返回 null
-fn getStreamLocalAddress(stream: std.net.Stream) ?std.net.Address {
-    var addr: std.net.Address = undefined;
-    var len: std.posix.socklen_t = @sizeOf(std.net.Address);
-    std.posix.getsockname(stream.handle, @ptrCast(&addr.any), &len) catch return null;
+fn getStreamLocalAddress(stream: std.Io.net.Stream) ?NodeNetAddress {
+    var addr: NodeNetAddress = undefined;
+    var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+    if (std.c.getsockname(stream.socket.handle, @ptrCast(&addr.any), &len) != 0) return null;
     return addr;
 }
 
-/// 将 std.net.Address 格式化为 Node 风格字符串（IPv4 "x.x.x.x"，IPv6 "[::1]" 等），allocator 分配且以 null 结尾，调用方负责 free
-fn addressToNodeStringZ(allocator: std.mem.Allocator, addr: std.net.Address) []const u8 {
-    const s = std.fmt.allocPrint(allocator, "{any}", .{addr}) catch return allocator.dupeZ(u8, "unknown") catch "";
-    const z = allocator.dupeZ(u8, s) catch {
-        allocator.free(s);
-        return allocator.dupeZ(u8, "unknown") catch "";
+/// 将 NodeNetAddress 格式化为 Node 风格字符串（IPv4 "x.x.x.x"，IPv6 "[::1]" 等），allocator 分配且以 null 结尾，调用方负责 free
+fn addressToNodeStringZ(allocator: std.mem.Allocator, addr: NodeNetAddress) []const u8 {
+    var buf: [128]u8 = undefined;
+    const s = switch (addr.any.family) {
+        std.posix.AF.INET => blk: {
+            const in4 = @as(*const std.posix.sockaddr.in, @ptrCast(&addr.any));
+            const addr_bytes = std.mem.asBytes(&in4.addr);
+            break :blk std.fmt.bufPrint(&buf, "{d}.{d}.{d}.{d}", .{ addr_bytes[0], addr_bytes[1], addr_bytes[2], addr_bytes[3] }) catch "0.0.0.0";
+        },
+        std.posix.AF.INET6 => "::1",
+        std.posix.AF.UNIX => "unix",
+        else => "unknown",
     };
-    allocator.free(s);
-    return z;
+    return allocator.dupeZ(u8, s) catch allocator.dupeZ(u8, "unknown") catch "";
 }
 
 /// 根据 remote/local 两个 Address 构建 SocketAddrInfo，字符串由 allocator 分配且以 null 结尾，调用方负责 free 各 slice
-fn getSocketAddrInfo(allocator: std.mem.Allocator, remote: std.net.Address, local: std.net.Address) SocketAddrInfo {
+fn getSocketAddrInfo(allocator: std.mem.Allocator, remote: NodeNetAddress, local: NodeNetAddress) SocketAddrInfo {
     const family_str = switch (remote.any.family) {
         std.posix.AF.INET => "IPv4",
         std.posix.AF.INET6 => "IPv6",
@@ -148,7 +172,7 @@ pub fn getExports(ctx: jsc.JSContextRef, allocator: std.mem.Allocator) jsc.JSVal
 }
 
 /// 根据 socket id 取回 stream；供 shu:tls 在连接建立后做 TLS 握手（connect 需传入底层 stream）
-pub fn getStreamById(socket_id: u32) ?std.net.Stream {
+pub fn getStreamById(socket_id: u32) ?std.Io.net.Stream {
     if (g_net_sockets) |*sockets| return sockets.get(socket_id) else return null;
 }
 
@@ -293,7 +317,7 @@ fn listenCallback(
     const listener_val = jsc.JSObjectGetProperty(ctx, this, k_listener, null);
     if (!jsc.JSObjectIsFunction(ctx, @ptrCast(listener_val))) return jsc.JSValueMakeUndefined(ctx);
     const allocator = globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
-    var server: std.net.Server = undefined;
+    var server: std.Io.net.Server = undefined;
     var port: u16 = 0;
     var host_len: usize = 0;
     var host_buf: [256]u8 = undefined;
@@ -312,17 +336,18 @@ fn listenCallback(
         path_len -= 1;
         break :blk true;
     };
+    const proc_io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
     if (is_unix) {
         const path_z = path_buf[0..path_len];
         const path_null = allocator.dupeZ(u8, path_z) catch return jsc.JSValueMakeUndefined(ctx);
         defer allocator.free(path_null);
-        const addr = std.net.Address.initUnix(path_null) catch |e| {
+        var ua = std.Io.net.UnixAddress.init(path_null) catch |e| {
             var msg_buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrint(&msg_buf, "net.listen unix failed: {s}", .{@errorName(e)}) catch "net.listen failed";
             errors.reportToStderr(.{ .code = .unknown, .message = msg }) catch {};
             return jsc.JSValueMakeUndefined(ctx);
         };
-        server = addr.listen(.{ .reuse_address = true }) catch |e| {
+        server = std.Io.net.UnixAddress.listen(&ua, proc_io, .{ .kernel_backlog = std.Io.net.default_kernel_backlog }) catch |e| {
             var msg_buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrint(&msg_buf, "net.listen unix failed: {s}", .{@errorName(e)}) catch "net.listen failed";
             errors.reportToStderr(.{ .code = .unknown, .message = msg }) catch {};
@@ -349,29 +374,29 @@ fn listenCallback(
         }
         var addr_z_buf: [256]u8 = undefined;
         const host_z = std.fmt.bufPrintZ(&addr_z_buf, "{s}", .{host_slice}) catch return jsc.JSValueMakeUndefined(ctx);
-        const addr = std.net.Address.parseIp(host_z, port) catch |e| {
+        const addr = std.Io.net.IpAddress.parse(host_z, port) catch |e| {
             var msg_buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrint(&msg_buf, "net.listen failed: {s}", .{@errorName(e)}) catch "net.listen failed";
             errors.reportToStderr(.{ .code = .unknown, .message = msg }) catch {};
             return jsc.JSValueMakeUndefined(ctx);
         };
-        server = addr.listen(.{ .reuse_address = true }) catch |e| {
+        server = std.Io.net.IpAddress.listen(addr, proc_io, .{ .kernel_backlog = std.Io.net.default_kernel_backlog }) catch |e| {
             var msg_buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrint(&msg_buf, "net.listen failed: {s}", .{@errorName(e)}) catch "net.listen failed";
             errors.reportToStderr(.{ .code = .unknown, .message = msg }) catch {};
             return jsc.JSValueMakeUndefined(ctx);
         };
     }
-    setNonBlocking(server.stream.handle);
+    setNonBlocking(server.socket.handle);
     if (g_net_servers == null) {
         const list = std.ArrayList(NetServerEntry).initCapacity(allocator, 4) catch {
-            server.deinit();
+            server.deinit(proc_io);
             return jsc.JSValueMakeUndefined(ctx);
         };
         g_net_servers = list;
     }
     if (g_net_sockets == null) {
-        g_net_sockets = std.AutoHashMap(u32, std.net.Stream).init(allocator);
+        g_net_sockets = std.AutoHashMap(u32, std.Io.net.Stream).init(allocator);
     }
     if (g_net_socket_objs == null) {
         g_net_socket_objs = std.AutoHashMap(u32, jsc.JSObjectRef).init(allocator);
@@ -406,7 +431,7 @@ fn listenCallback(
     };
     g_net_servers.?.append(allocator, entry) catch {
         jsc.JSValueUnprotect(ctx, listener_val);
-        server.deinit();
+        server.deinit(proc_io);
         return jsc.JSValueMakeUndefined(ctx);
     };
     const k_listening = jsc.JSStringCreateWithUTF8CString("listening");
@@ -454,7 +479,8 @@ fn serverCloseCallback(
         if (servers.items[i].server_id == server_id) {
             var removed = servers.swapRemove(i);
             jsc.JSValueUnprotect(removed.ctx, removed.listener);
-            removed.server.deinit();
+            const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
+            removed.server.deinit(io);
             _ = jsc.JSObjectSetProperty(ctx, this, k_sid, jsc.JSValueMakeUndefined(ctx), jsc.kJSPropertyAttributeNone, null);
             const k_listening = jsc.JSStringCreateWithUTF8CString("listening");
             defer jsc.JSStringRelease(k_listening);
@@ -537,11 +563,12 @@ fn getOptStrFromObj(ctx: jsc.JSContextRef, obj: jsc.JSObjectRef, key: [*]const u
 /// §4 持锁仅限「移入 taken」，回调与 JSC/stream 操作在锁外执行
 fn drainPendingConnects(ctx: jsc.JSContextRef) void {
     const allocator = globals.current_allocator orelse return;
+    const io = libs_process.getProcessIo() orelse return;
     var taken = std.ArrayList(PendingConnect).initCapacity(allocator, 0) catch return;
     defer taken.deinit(allocator);
     {
-        g_net_pending_mutex.lock();
-        defer g_net_pending_mutex.unlock();
+        g_net_pending_mutex.lock(io) catch return;
+        defer g_net_pending_mutex.unlock(io);
         const pending_list = g_net_pending_connects orelse return;
         if (pending_list.items.len == 0) return;
         taken.ensureTotalCapacity(allocator, pending_list.items.len) catch return;
@@ -560,7 +587,7 @@ fn drainPendingConnects(ctx: jsc.JSContextRef) void {
         defer jsc.JSValueUnprotect(ctx, item.callback);
         if (item.stream) |stream| {
             if (g_net_sockets == null) {
-                g_net_sockets = std.AutoHashMap(u32, std.net.Stream).init(allocator);
+                g_net_sockets = std.AutoHashMap(u32, std.Io.net.Stream).init(allocator);
             }
             if (g_net_socket_objs == null) {
                 g_net_socket_objs = std.AutoHashMap(u32, jsc.JSObjectRef).init(allocator);
@@ -569,13 +596,14 @@ fn drainPendingConnects(ctx: jsc.JSContextRef) void {
             const objs = &g_net_socket_objs.?;
             const id = g_next_socket_id;
             g_next_socket_id +%= 1;
-            setNonBlocking(stream.handle);
+            setNonBlocking(stream.socket.handle);
             sockets.put(id, stream) catch {
-                stream.close();
+                stream.close(io);
                 continue;
             };
             if (g_net_socket_meta == null) g_net_socket_meta = std.AutoHashMap(u32, SocketMeta).init(allocator);
-            g_net_socket_meta.?.put(id, .{ .bytes_written = 0, .bytes_read = 0, .last_activity_ms = @intCast(std.time.milliTimestamp()) }) catch {};
+            const now_ms = @as(u64, @intCast(@divTrunc(std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds, 1_000_000)));
+            g_net_socket_meta.?.put(id, .{ .bytes_written = 0, .bytes_read = 0, .last_activity_ms = now_ms }) catch {};
             const remote_opt = getStreamRemoteAddress(stream);
             const local_opt = getStreamLocalAddress(stream);
             var socket_obj: jsc.JSObjectRef = undefined;
@@ -638,7 +666,7 @@ fn makeJsError(ctx: jsc.JSContextRef, message: []const u8) jsc.JSValueRef {
     return err_obj;
 }
 
-/// setImmediate 每轮调用：drain 已完成连接、accept、读 socket、再 setImmediate（仅当 has_work 时）
+/// setImmediate 每轮调用：drain 已完成连接、accept、读 socket、再 setImmediate（仅当 has_work 时）。0.16：accept(io)、stream.close(io)、stream.socket.handle
 fn netTickCallback(
     ctx: jsc.JSContextRef,
     _: jsc.JSObjectRef,
@@ -652,6 +680,10 @@ fn netTickCallback(
         if (g_net_pending_count.load(.monotonic) > 0) scheduleNetTick(ctx);
         return jsc.JSValueMakeUndefined(ctx);
     };
+    const io = libs_process.getProcessIo() orelse {
+        if (g_net_pending_count.load(.monotonic) > 0) scheduleNetTick(ctx);
+        return jsc.JSValueMakeUndefined(ctx);
+    };
     if (g_net_servers == null) {
         if (g_net_pending_count.load(.monotonic) > 0) scheduleNetTick(ctx);
         return jsc.JSValueMakeUndefined(ctx);
@@ -659,33 +691,39 @@ fn netTickCallback(
     const servers = &g_net_servers.?;
     // 有 server 时确保 g_net_sockets/g_net_socket_objs/g_net_socket_meta 已初始化，以便 accept 可放入 socket
     if (g_net_sockets == null) {
-        g_net_sockets = std.AutoHashMap(u32, std.net.Stream).init(allocator);
+        g_net_sockets = std.AutoHashMap(u32, std.Io.net.Stream).init(allocator);
         g_net_socket_objs = std.AutoHashMap(u32, jsc.JSObjectRef).init(allocator);
         g_net_socket_meta = std.AutoHashMap(u32, SocketMeta).init(allocator);
     }
     const sockets = &g_net_sockets.?;
+    const now_ms = @as(u64, @intCast(@divTrunc(std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds, 1_000_000)));
     var i: usize = 0;
     while (i < servers.items.len) : (i += 1) {
         const entry = &servers.items[i];
         var accept_count: u32 = 0;
         while (accept_count < 32) {
-            const accepted = entry.server.accept() catch |e| {
+            const accepted = entry.server.accept(io) catch |e| {
                 if (e == error.WouldBlock) break;
                 continue;
             };
             accept_count += 1;
-            setNonBlocking(accepted.stream.handle);
+            setNonBlocking(accepted.socket.handle);
             const id = g_next_socket_id;
             g_next_socket_id +%= 1;
-            sockets.put(id, accepted.stream) catch {
-                accepted.stream.close();
+            sockets.put(id, accepted) catch {
+                accepted.close(io);
                 continue;
             };
             if (g_net_socket_meta == null) g_net_socket_meta = std.AutoHashMap(u32, SocketMeta).init(allocator);
-            g_net_socket_meta.?.put(id, .{ .bytes_written = 0, .bytes_read = 0, .last_activity_ms = @intCast(std.time.milliTimestamp()) }) catch {};
+            g_net_socket_meta.?.put(id, .{ .bytes_written = 0, .bytes_read = 0, .last_activity_ms = now_ms }) catch {};
             var socket_obj: jsc.JSObjectRef = undefined;
-            if (getStreamLocalAddress(accepted.stream)) |local_addr| {
-                var info = getSocketAddrInfo(allocator, accepted.address, local_addr);
+            if (getStreamLocalAddress(accepted)) |local_addr| {
+                const remote_addr = getStreamRemoteAddress(accepted) orelse {
+                    accepted.close(io);
+                    _ = sockets.remove(id);
+                    continue;
+                };
+                var info = getSocketAddrInfo(allocator, remote_addr, local_addr);
                 defer {
                     allocator.free(info.remote_address);
                     allocator.free(info.local_address);
@@ -729,8 +767,9 @@ fn scheduleNetTick(ctx: jsc.JSContextRef) void {
     }
 }
 
-/// 对 g_net_sockets 中每个 stream 做非阻塞 read，有数据则触发对应 socket 的 on('data')，读关闭则触发 on('end')
+/// 对 g_net_sockets 中每个 stream 做非阻塞 read，有数据则触发对应 socket 的 on('data')，读关闭则触发 on('end')。0.16：stream.close(io)
 fn netTickRead(ctx: jsc.JSContextRef) void {
+    const io = libs_process.getProcessIo() orelse return;
     if (g_net_sockets == null or g_net_socket_objs == null) return;
     const sockets = &g_net_sockets.?;
     const objs = &g_net_socket_objs.?;
@@ -752,19 +791,24 @@ fn netTickRead(ctx: jsc.JSContextRef) void {
                         if (e == error.WantRead or e == error.WantWrite) continue;
                         if (objs.get(id)) |socket_obj| emitSocketEvent(ctx, socket_obj, "error", jsc.JSValueMakeUndefined(ctx));
                         to_remove.append(allocator, id) catch {};
-                        tls_ptr.close();
+                        tls_ptr.close(io);
                         if (g_net_socket_tls) |*tls_map| _ = tls_map.fetchRemove(id);
                         continue;
                     };
                     break :blk r;
                 }
             }
-            break :blk stream.read(read_buf[0..]) catch |e| {
-                if (e == error.WouldBlock) continue;
-                if (objs.get(id)) |socket_obj| emitSocketEvent(ctx, socket_obj, "error", jsc.JSValueMakeUndefined(ctx));
-                to_remove.append(allocator, id) catch {};
-                stream.close();
-                continue;
+            break :blk blk2: {
+                var io_buf: [4096]u8 = undefined;
+                var r = stream.reader(io, &io_buf);
+                var dest: [1][]u8 = .{read_buf[0..]};
+                break :blk2 std.Io.Reader.readVec(&r.interface, &dest) catch |e| {
+                    if (e == error.WouldBlock) continue;
+                    if (objs.get(id)) |socket_obj| emitSocketEvent(ctx, socket_obj, "error", jsc.JSValueMakeUndefined(ctx));
+                    to_remove.append(allocator, id) catch {};
+                    stream.close(io);
+                    continue;
+                };
             };
         };
         if (n == 0) {
@@ -782,17 +826,17 @@ fn netTickRead(ctx: jsc.JSContextRef) void {
             var closed_tls = false;
             if (build_options.have_tls and g_net_socket_tls != null) {
                 if (g_net_socket_tls.?.fetchRemove(id)) |tls_kv| {
-                    tls_kv.value.close();
+                    tls_kv.value.close(io);
                     closed_tls = true;
                 }
             }
-            if (!closed_tls) stream.close();
+            if (!closed_tls) stream.close(io);
             continue;
         }
         if (g_net_socket_meta) |*meta| {
             if (meta.getPtr(id)) |m| {
                 m.bytes_read += n;
-                m.last_activity_ms = @intCast(std.time.milliTimestamp());
+                m.last_activity_ms = @intCast(@divTrunc(std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds, 1_000_000));
             }
         }
         if (objs.get(id)) |socket_obj| {
@@ -811,14 +855,14 @@ fn netTickRead(ctx: jsc.JSContextRef) void {
         var had_tls = false;
         if (build_options.have_tls and g_net_socket_tls != null) {
             if (g_net_socket_tls.?.fetchRemove(id)) |tls_kv| {
-                tls_kv.value.close();
+                tls_kv.value.close(io);
                 had_tls = true;
             }
         }
         _ = objs.fetchRemove(id);
         if (g_net_socket_meta) |*meta| _ = meta.fetchRemove(id);
         if (sockets.fetchRemove(id)) |kv| {
-            if (!had_tls) kv.value.close();
+            if (!had_tls) kv.value.close(io);
         }
     }
     netTickTimeoutCheck(ctx);
@@ -827,9 +871,10 @@ fn netTickRead(ctx: jsc.JSContextRef) void {
 /// 检查各 socket 的 _timeout，超时未收到数据则触发 'timeout' 事件并刷新 last_activity_ms
 fn netTickTimeoutCheck(ctx: jsc.JSContextRef) void {
     if (g_net_socket_objs == null or g_net_socket_meta == null) return;
+    const io = libs_process.getProcessIo() orelse return;
     const objs = &g_net_socket_objs.?;
     const meta = &g_net_socket_meta.?;
-    const now_ms: u64 = @intCast(std.time.milliTimestamp());
+    const now_ms: u64 = @intCast(@divTrunc(std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds, 1_000_000));
     const k_timeout = jsc.JSStringCreateWithUTF8CString("_timeout");
     defer jsc.JSStringRelease(k_timeout);
     var it = objs.iterator();
@@ -1010,14 +1055,19 @@ fn socketWriteCallback(
     const n = jsc.JSStringGetUTF8CString(js_str, buf.ptr, max_sz);
     if (n == 0) return jsc.JSValueMakeUndefined(ctx);
     const written = buf[0 .. n - 1].len;
+    const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
     if (build_options.have_tls and g_net_socket_tls != null) {
         if (g_net_socket_tls.?.get(id)) |tls_ptr| {
             tls_ptr.writeAll(buf[0 .. n - 1]) catch return jsc.JSValueMakeUndefined(ctx);
         } else {
-            stream_ptr.writeAll(buf[0 .. n - 1]) catch return jsc.JSValueMakeUndefined(ctx);
+            var wbuf: [4096]u8 = undefined;
+            var w = stream_ptr.writer(io, &wbuf);
+            _ = std.Io.Writer.writeVec(&w.interface, &.{buf[0 .. n - 1]}) catch return jsc.JSValueMakeUndefined(ctx);
         }
     } else {
-        stream_ptr.writeAll(buf[0 .. n - 1]) catch return jsc.JSValueMakeUndefined(ctx);
+        var wbuf: [4096]u8 = undefined;
+        var w = stream_ptr.writer(io, &wbuf);
+        _ = std.Io.Writer.writeVec(&w.interface, &.{buf[0 .. n - 1]}) catch return jsc.JSValueMakeUndefined(ctx);
     }
     if (g_net_socket_meta) |*meta| {
         if (meta.getPtr(id)) |m| {
@@ -1048,18 +1098,19 @@ fn socketEndCallback(
     const k_destroyed = jsc.JSStringCreateWithUTF8CString("destroyed");
     defer jsc.JSStringRelease(k_destroyed);
     _ = jsc.JSObjectSetProperty(ctx, this, k_destroyed, jsc.JSValueMakeBoolean(ctx, true), jsc.kJSPropertyAttributeNone, null);
+    const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
     var had_tls = false;
     if (build_options.have_tls and g_net_socket_tls != null) {
         if (g_net_socket_tls.?.fetchRemove(id)) |tls_kv| {
-            tls_kv.value.close();
+            tls_kv.value.close(io);
             had_tls = true;
         }
     }
     if (g_net_sockets) |*sockets| {
         if (sockets.fetchRemove(id)) |kv| {
             if (!had_tls) {
-                std.posix.shutdown(kv.value.handle, .send) catch {};
-                kv.value.close();
+                kv.value.shutdown(io, .send) catch {};
+                kv.value.close(io);
             }
         }
     }
@@ -1081,16 +1132,17 @@ fn socketDestroyCallback(
     const k_destroyed = jsc.JSStringCreateWithUTF8CString("destroyed");
     defer jsc.JSStringRelease(k_destroyed);
     _ = jsc.JSObjectSetProperty(ctx, this, k_destroyed, jsc.JSValueMakeBoolean(ctx, true), jsc.kJSPropertyAttributeNone, null);
+    const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
     var had_tls = false;
     if (build_options.have_tls and g_net_socket_tls != null) {
         if (g_net_socket_tls.?.fetchRemove(id)) |tls_kv| {
-            tls_kv.value.close();
+            tls_kv.value.close(io);
             had_tls = true;
         }
     }
     if (g_net_sockets) |*sockets| {
         if (sockets.fetchRemove(id)) |kv| {
-            if (!had_tls) kv.value.close();
+            if (!had_tls) kv.value.close(io);
         }
     }
     if (g_net_socket_objs) |*objs| _ = objs.fetchRemove(id);
@@ -1153,7 +1205,7 @@ fn socketSetNoDelayCallback(
     const stream_ptr = sockets.getPtr(id) orelse return @ptrCast(this);
     const enable: c_int = if (argumentCount < 1 or jsc.JSValueToBoolean(ctx, arguments[0])) 1 else 0;
     if (!is_windows) {
-        std.posix.setsockopt(stream_ptr.handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&enable)) catch {};
+        std.posix.setsockopt(stream_ptr.socket.handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&enable)) catch {};
     }
     return @ptrCast(this);
 }
@@ -1283,6 +1335,7 @@ const ConnectArgs = struct {
 };
 
 fn connectThreadMain(args: *ConnectArgs) void {
+    const io = libs_process.getProcessIo() orelse return;
     defer {
         if (args.is_unix) args.allocator.free(args.path) else args.allocator.free(args.host);
         if (args.local_address) |la| args.allocator.free(la);
@@ -1298,73 +1351,42 @@ fn connectThreadMain(args: *ConnectArgs) void {
         .timeout_ms = args.timeout_ms,
     };
     if (args.is_unix) {
-        const stream = std.net.connectUnixSocket(args.path) catch |e| {
+        var ua = std.Io.net.UnixAddress.init(args.path) catch |e| {
             result.err_msg = std.fmt.allocPrint(args.allocator, "connect {s}: {s}", .{ args.path, @errorName(e) }) catch null;
-            g_net_pending_mutex.lock();
-            defer g_net_pending_mutex.unlock();
+            g_net_pending_mutex.lock(io) catch return;
+            defer g_net_pending_mutex.unlock(io);
+            if (g_net_pending_connects) |*list| list.append(args.allocator, result) catch {};
+            return;
+        };
+        const stream = std.Io.net.UnixAddress.connect(&ua, io) catch |e| {
+            result.err_msg = std.fmt.allocPrint(args.allocator, "connect {s}: {s}", .{ args.path, @errorName(e) }) catch null;
+            g_net_pending_mutex.lock(io) catch return;
+            defer g_net_pending_mutex.unlock(io);
             if (g_net_pending_connects) |*list| list.append(args.allocator, result) catch {};
             return;
         };
         result.stream = stream;
     } else {
-        // Node 兼容：若指定 localAddress/localPort，先创建 socket、bind 到本地再 connect；否则用 tcpConnectToHost
-        const use_local_bind = args.local_address != null and args.local_port != null;
-        if (use_local_bind) {
-            const remote_addr = std.net.Address.resolveIp(args.host, args.port) catch |e| {
-                result.err_msg = std.fmt.allocPrint(args.allocator, "connect {s}:{d}: {s}", .{ args.host, args.port, @errorName(e) }) catch null;
-                g_net_pending_mutex.lock();
-                defer g_net_pending_mutex.unlock();
-                if (g_net_pending_connects) |*list| list.append(args.allocator, result) catch {};
-                return;
-            };
-            const fd = std.posix.socket(remote_addr.any.family, std.posix.SOCK.STREAM, 0) catch |e| {
-                result.err_msg = std.fmt.allocPrint(args.allocator, "socket: {s}", .{@errorName(e)}) catch null;
-                g_net_pending_mutex.lock();
-                defer g_net_pending_mutex.unlock();
-                if (g_net_pending_connects) |*list| list.append(args.allocator, result) catch {};
-                return;
-            };
-            const local_addr = std.net.Address.resolveIp(args.local_address.?, args.local_port.?) catch |e| {
-                std.posix.close(fd);
-                result.err_msg = std.fmt.allocPrint(args.allocator, "localAddress {s}:{d}: {s}", .{ args.local_address.?, args.local_port.?, @errorName(e) }) catch null;
-                g_net_pending_mutex.lock();
-                defer g_net_pending_mutex.unlock();
-                if (g_net_pending_connects) |*list| list.append(args.allocator, result) catch {};
-                return;
-            };
-            std.posix.bind(fd, &local_addr.any, local_addr.getOsSockLen()) catch |e| {
-                std.posix.close(fd);
-                result.err_msg = std.fmt.allocPrint(args.allocator, "bind {s}:{d}: {s}", .{ args.local_address.?, args.local_port.?, @errorName(e) }) catch null;
-                g_net_pending_mutex.lock();
-                defer g_net_pending_mutex.unlock();
-                if (g_net_pending_connects) |*list| list.append(args.allocator, result) catch {};
-                return;
-            };
-            std.posix.connect(fd, &remote_addr.any, remote_addr.getOsSockLen()) catch |e| {
-                std.posix.close(fd);
-                result.err_msg = std.fmt.allocPrint(args.allocator, "connect {s}:{d}: {s}", .{ args.host, args.port, @errorName(e) }) catch null;
-                g_net_pending_mutex.lock();
-                defer g_net_pending_mutex.unlock();
-                if (g_net_pending_connects) |*list| list.append(args.allocator, result) catch {};
-                return;
-            };
-            setNonBlocking(fd);
-            result.stream = .{ .handle = fd };
-        } else {
-            const stream = std.net.tcpConnectToHost(args.allocator, args.host, args.port) catch |e| {
-                result.err_msg = std.fmt.allocPrint(args.allocator, "connect {s}:{d}: {s}", .{ args.host, args.port, @errorName(e) }) catch null;
-                g_net_pending_mutex.lock();
-                defer g_net_pending_mutex.unlock();
-                if (g_net_pending_connects) |*list| list.append(args.allocator, result) catch {};
-                return;
-            };
-            result.stream = stream;
-        }
+        // 0.16：IpAddress.resolve + connect；localAddress/localPort 暂不实现
+        const addr = std.Io.net.IpAddress.resolve(io, args.host, args.port) catch |e| {
+            result.err_msg = std.fmt.allocPrint(args.allocator, "connect {s}:{d}: {s}", .{ args.host, args.port, @errorName(e) }) catch null;
+            g_net_pending_mutex.lock(io) catch return;
+            defer g_net_pending_mutex.unlock(io);
+            if (g_net_pending_connects) |*list| list.append(args.allocator, result) catch {};
+            return;
+        };
+        result.stream = std.Io.net.IpAddress.connect(addr, io, .{ .mode = .stream }) catch |e| {
+            result.err_msg = std.fmt.allocPrint(args.allocator, "connect {s}:{d}: {s}", .{ args.host, args.port, @errorName(e) }) catch null;
+            g_net_pending_mutex.lock(io) catch return;
+            defer g_net_pending_mutex.unlock(io);
+            if (g_net_pending_connects) |*list| list.append(args.allocator, result) catch {};
+            return;
+        };
     }
-    g_net_pending_mutex.lock();
-    defer g_net_pending_mutex.unlock();
+    g_net_pending_mutex.lock(io) catch return;
+    defer g_net_pending_mutex.unlock(io);
     if (g_net_pending_connects) |*list| list.append(args.allocator, result) catch {
-        if (result.stream) |s| s.close();
+        if (result.stream) |s| s.close(io);
     };
 }
 
