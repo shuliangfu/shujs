@@ -5,10 +5,12 @@
 const std = @import("std");
 const jsc = @import("jsc");
 const globals = @import("../../../globals.zig");
-const errors = @import("../../../../errors.zig");
+const errors = @import("errors");
+const libs_process = @import("libs_process");
 const node_builtin = @import("../../node/builtin.zig");
 const shu_builtin = @import("../builtin.zig");
 const pkg_resolver = @import("../../../../package/resolver.zig");
+const libs_io = @import("libs_io");
 
 /// 单条 import 的绑定类型
 const ImportKind = enum { default_import, named_imports, namespace };
@@ -241,16 +243,19 @@ fn resolveSpecifier(allocator: std.mem.Allocator, parent_dir: []const u8, specif
     return .{ .file_path = pkg_result.file_path, .cache_key = pkg_result.cache_key };
 }
 
-/// 读取文件内容
+/// 读取文件内容。Zig 0.16：经 io_core 打开，reader + allocRemaining 读全文件；调用方 free 返回切片。
 fn readFileContent(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-    const file = std.fs.openFileAbsolute(path, .{}) catch |e| {
+    const io = libs_process.getProcessIo() orelse return error.ProcessIoNotSet;
+    const file = libs_io.openFileAbsolute(path, .{}) catch |e| {
         var msg_buf: [512]u8 = undefined;
         const msg = std.fmt.bufPrintZ(&msg_buf, "Cannot find module: {s}", .{path}) catch "Cannot find module";
         errors.reportToStderr(.{ .code = .file_not_found, .message = msg }) catch {};
         return e;
     };
-    defer file.close();
-    return file.readToEndAlloc(allocator, std.math.maxInt(usize));
+    defer file.close(io);
+    var read_buf: [4096]u8 = undefined;
+    var file_reader = file.reader(io, read_buf[0..]);
+    return file_reader.interface.allocRemaining(allocator, std.Io.Limit.unlimited);
 }
 
 /// 构建模块图：从入口开始递归加载，返回线性列表（含入口），dep_indices 指向同列表下标；入口 source 会被复制一份以统一释放
@@ -424,20 +429,31 @@ fn transformModuleToIIFE(
     defer out.deinit(allocator);
 
     out.appendSlice(allocator, "(function(__filename, __dirname, ") catch return error.OutOfMemory;
+    var fmt_buf: [32]u8 = undefined;
     for (dep_indices, 0..) |_, i| {
         if (i > 0) out.appendSlice(allocator, ", ") catch {};
-        try std.fmt.format(out.writer(allocator), "__dep{d}", .{i});
+        const s = std.fmt.bufPrint(&fmt_buf, "__dep{d}", .{i}) catch return error.OutOfMemory;
+        try out.appendSlice(allocator, s);
     }
     out.appendSlice(allocator, ") {\n\"use strict\";\nvar __exports = {};\n") catch return error.OutOfMemory;
 
     // 注入 import 绑定
     for (parse.imports.items, dep_indices) |imp, dep_i| {
+        var line_buf: [256]u8 = undefined;
         switch (imp.kind) {
-            .default_import => try std.fmt.format(out.writer(allocator), "var {s} = __dep{d}.default;\n", .{ imp.binding, dep_i }),
-            .namespace => try std.fmt.format(out.writer(allocator), "var {s} = __dep{d};\n", .{ imp.binding, dep_i }),
+            .default_import => {
+                const s = std.fmt.bufPrint(&line_buf, "var {s} = __dep{d}.default;\n", .{ imp.binding, dep_i }) catch return error.OutOfMemory;
+                try out.appendSlice(allocator, s);
+            },
+            .namespace => {
+                const s = std.fmt.bufPrint(&line_buf, "var {s} = __dep{d};\n", .{ imp.binding, dep_i }) catch return error.OutOfMemory;
+                try out.appendSlice(allocator, s);
+            },
             .named_imports => {
-                for (imp.named_list) |n|
-                    try std.fmt.format(out.writer(allocator), "var {s} = __dep{d}.{s};\n", .{ n, dep_i, n });
+                for (imp.named_list) |n| {
+                    const s = std.fmt.bufPrint(&line_buf, "var {s} = __dep{d}.{s};\n", .{ n, dep_i, n }) catch return error.OutOfMemory;
+                    try out.appendSlice(allocator, s);
+                }
             },
         }
     }
@@ -445,11 +461,16 @@ fn transformModuleToIIFE(
     out.appendSlice(allocator, parse.body.items) catch return error.OutOfMemory;
 
     // 命名导出：__exports.x = x
-    for (parse.named_exports.items) |n|
-        try std.fmt.format(out.writer(allocator), "__exports[\"{s}\"] = {s};\n", .{ n, n });
+    var line_buf: [256]u8 = undefined;
+    for (parse.named_exports.items) |n| {
+        const s = std.fmt.bufPrint(&line_buf, "__exports[\"{s}\"] = {s};\n", .{ n, n }) catch return error.OutOfMemory;
+        try out.appendSlice(allocator, s);
+    }
 
-    if (parse.has_default_export and parse.default_expr.len > 0)
-        try std.fmt.format(out.writer(allocator), "__exports.default = {s};\n", .{parse.default_expr});
+    if (parse.has_default_export and parse.default_expr.len > 0) {
+        const s = std.fmt.bufPrint(&line_buf, "__exports.default = {s};\n", .{parse.default_expr}) catch return error.OutOfMemory;
+        try out.appendSlice(allocator, s);
+    }
 
     out.appendSlice(allocator, "return __exports;\n})") catch return error.OutOfMemory;
     return out.toOwnedSlice(allocator);
