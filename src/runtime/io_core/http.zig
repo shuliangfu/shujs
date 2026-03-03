@@ -5,24 +5,23 @@
 //!
 //! ## 设计
 //!
-//! - **双路径**：
-//!   - **Zig 路径**：优先使用 `std.http.Client`，无额外依赖，进程内完成请求；Zig 0.15 标准库无请求超时选项，长时间无响应会阻塞。
-//!   - **libcurl 路径**：需超时（`timeout_sec > 0`）或 Zig 路径返回空 body 时，使用系统 libcurl（C 库、进程内），通过 `CURLOPT_TIMEOUT` / `CURLOPT_CONNECTTIMEOUT` 实现超时，无子进程。
-//! - **构建依赖**：使用本模块的可执行文件需链接 libcurl（build.zig 中 `linkSystemLibrary("curl")`），系统需已安装 libcurl-dev / curl-devel。
+//! - **对外只暴露 Zig 路径**：默认使用 `std.http.Client` 发请求；Zig 路径失败（ReadFailed、2xx 但 body 为空）时在**本模块内部**自动回退到 libcurl 重试，调用方无需感知。
+//! - **libcurl 仅作内部回退**：不对外提供 CurlClient / getWithCurlClient 等接口；需超时（request/get 的 timeout_sec > 0）时仍走 libcurl 以支持 CURLOPT_TIMEOUT。
+//! - **构建依赖**：使用本模块需链接 libcurl（build.zig 中 `linkSystemLibrary("curl")`），系统需已安装 libcurl-dev / curl-devel。
 //!
 //! ## 公开 API
 //!
 //! - **request(allocator, url, RequestOptions) !Response**
-//!   发起任意方法的 HTTP 请求，返回 status、status_text、body。调用方负责 free `response.body` 与 `response.status_text`。
+//!   发起任意方法的 HTTP 请求，返回 status、status_text、body。默认 Zig 路径，失败时内部回退 libcurl。调用方负责 free `response.body` 与 `response.status_text`。
 //! - **get(allocator, url, GetOptions) ![]const u8**
 //!   便捷 GET：仅返回响应体，非 2xx 时返回 `error.BadStatus`。调用方 free 返回的切片。
+//! - **getWithClient(client, allocator, url, GetOptions) ![]const u8**
+//!   使用已有 std.http.Client 做 GET，便于连接复用；Zig 失败时内部回退 libcurl。调用方 free 返回的切片。
 //! - **Method**：GET / HEAD / POST / PUT / PATCH / DELETE / OPTIONS。
 //! - **Header**：`{ name, value }`，用于 RequestOptions.headers 或 GetOptions.extra_headers。
 //! - **RequestOptions**：method、body、max_response_bytes、timeout_sec、user_agent、headers。
 //! - **GetOptions**：accept、max_bytes、timeout_sec、user_agent、extra_headers（内部转成 RequestOptions 调用 request）。
 //! - **Response**：status (u16)、status_text ([]const u8)、body ([]const u8)。
-//! - **CurlClient**：可复用的 libcurl 句柄，init/deinit 后多次 getWithCurlClient 同一 host 即连接复用（Keep-Alive）。
-//! - **getWithCurlClient(curl_client, allocator, url, GetOptions) ![]const u8**：用 CurlClient 做 GET，调用方 free 返回的切片。
 //!
 //! ## 内存约定
 //!
@@ -36,6 +35,11 @@
 //! - `error.CurlFailed`：libcurl 执行失败（如网络不可达、超时、TLS 错误等）。
 //! - `error.ResponseTooLarge`：响应体超过 max_response_bytes。
 //! - `error.WriteFailed`：Zig 路径写请求体失败。
+//!
+//! ## 测试 libcurl 回退路径
+//!
+//! 设置环境变量 **SHU_HTTP_FORCE_CURL=1** 后，所有请求将跳过 Zig 路径、直接走 libcurl，用于验证回退路径是否正常。例如：`SHU_HTTP_FORCE_CURL=1 shu install` 或 `SHU_HTTP_FORCE_CURL=1 shu add lodash`。
+//! 设置 **SHU_DEBUG_HTTP=1** 时，除打印失败 URL/错误外，会开启 libcurl 的 CURLOPT_VERBOSE，将连接/TLS/耗时等调试信息输出到 stderr，便于排查超时(code 28)或 SSL(code 35) 等问题。
 //!
 //! ## 示例
 //!
@@ -153,11 +157,23 @@ const tarball_default_accept_encoding = "gzip";
 // 公开 API
 // -----------------------------------------------------------------------------
 
+/// 当环境变量 SHU_HTTP_FORCE_CURL 非空时返回 true，用于测试或故障时强制走 libcurl。
+fn forceCurl() bool {
+    const v = std.posix.getenv("SHU_HTTP_FORCE_CURL") orelse return false;
+    return v.len > 0;
+}
+
 /// 同步发起任意方法的 HTTP 请求，返回完整响应。调用方 free response.body 与 response.status_text。
 /// Zig 路径返回 ReadFailed 时自动回退到 libcurl 一次，避免向调用方直接抛出 ReadFailed（install 等流程易因此终止）。
+/// 若 SHU_HTTP_FORCE_CURL=1 则跳过 Zig、直接走 libcurl（用于验证回退路径）。
 pub fn request(allocator: std.mem.Allocator, url: []const u8, options: RequestOptions) !Response {
     if (options.timeout_sec > 0) {
         return requestViaLibCurl(allocator, url, options);
+    }
+    if (forceCurl()) {
+        var opts = options;
+        opts.timeout_sec = if (options.timeout_sec > 0) options.timeout_sec else 60;
+        return requestViaLibCurl(allocator, url, opts);
     }
     const resp = requestViaZig(allocator, url, options) catch |e| {
         if (e == error.ReadFailed) return requestViaLibCurl(allocator, url, options);
@@ -199,13 +215,13 @@ pub fn get(allocator: std.mem.Allocator, url: []const u8, options: GetOptions) !
     return resp.body;
 }
 
-/// 当 SHU_DEBUG_HTTP 非空且 raw_body 为空时，向 stderr 打印 url、status、content_encoding、content_length，便于区分「服务端返回空」与「Zig 路径未读到 body」。
+/// 当 SHU_DEBUG_HTTP 非空且 raw_body 为空时，向 stderr 打印 url、status、content_encoding、content_length，便于区分「服务端返回空」与「Zig 路径未读到 body」。开头 \n 避免与进度条同显时接在同一行。
 fn debugLogEmptyRawBody(url: []const u8, status: u16, content_encoding: std.http.ContentEncoding, content_length: ?u64) void {
     const env = std.posix.getenv("SHU_DEBUG_HTTP") orelse return;
     if (env.len == 0) return;
     var buf: [512]u8 = undefined;
     var w = std.fs.File.stderr().writer(&buf);
-    w.interface.print("[shu http debug] empty raw_body url={s} status={d} content_encoding={s} content_length={?d}\n", .{
+    w.interface.print("\n[shu http debug] empty raw_body url={s} status={d} content_encoding={s} content_length={?d}\n", .{
         url,
         status,
         @tagName(content_encoding),
@@ -214,45 +230,46 @@ fn debugLogEmptyRawBody(url: []const u8, status: u16, content_encoding: std.http
     w.interface.flush() catch return;
 }
 
-/// 当 SHU_DEBUG_HTTP 非空且读 body 失败时，向 stderr 打印 url、错误名与可选 reason（path=zig 表示 Zig 路径；reason=empty_raw_body 表示头有 Content-Length 但读到 0 字节）。
+/// 当 SHU_DEBUG_HTTP 非空且读 body 失败时，向 stderr 打印 url、错误名与可选 reason（path=zig 表示 Zig 路径；reason=empty_raw_body 表示头有 Content-Length 但读到 0 字节）。开头 \n 避免与进度条同显时接在同一行。
 fn debugLogReadFailed(url: []const u8, read_err: anyerror, reason: ?[]const u8) void {
     const env = std.posix.getenv("SHU_DEBUG_HTTP") orelse return;
     if (env.len == 0) return;
     var buf: [640]u8 = undefined;
     var w = std.fs.File.stderr().writer(&buf);
     if (reason) |r| {
-        w.interface.print("[shu http] read failed url={s} error={s} path=zig reason={s}\n", .{ url, @errorName(read_err), r }) catch return;
+        w.interface.print("\n[shu http] read failed url={s} error={s} path=zig reason={s}\n", .{ url, @errorName(read_err), r }) catch return;
     } else {
-        w.interface.print("[shu http] read failed url={s} error={s} path=zig\n", .{ url, @errorName(read_err) }) catch return;
+        w.interface.print("\n[shu http] read failed url={s} error={s} path=zig\n", .{ url, @errorName(read_err) }) catch return;
     }
     w.interface.flush() catch return;
 }
 
 /// libcurl perform 失败时向 stderr 打印 url 与 CURLcode。探测请求（URL 含 /-/ping）失败不打印，避免用户误以为进度总数里包含探测请求、已完成与总数对不上。
+/// 开头加 \n 避免与 CLI 进度条（stdout 无换行）同显时 stderr 接在同一行导致乱序。
 fn debugLogCurlFailed(url: []const u8, code: c.CURLcode) void {
     if (std.mem.indexOf(u8, url, "/-/ping") != null) return;
     const msg = c.curl_easy_strerror(code);
     const msg_z: [*:0]const u8 = if (msg != null) msg else "?";
     var buf: [512]u8 = undefined;
     var w = std.fs.File.stderr().writer(&buf);
-    w.interface.print("[shu http] curl failed url={s} code={d} ({s})\n", .{ url, code, std.mem.span(msg_z) }) catch return;
+    w.interface.print("\n[shu http] curl failed url={s} code={d} ({s})\n", .{ url, code, std.mem.span(msg_z) }) catch return;
     w.interface.flush() catch return;
 }
 
-/// 当 SHU_DEBUG_HTTP 非空且触发 ResponseTooLarge 时，向 stderr 打印 url 与 max_response_bytes，便于定位是哪个请求、用的哪个 limit。
+/// 当 SHU_DEBUG_HTTP 非空且触发 ResponseTooLarge 时，向 stderr 打印 url 与 max_response_bytes，便于定位是哪个请求、用的哪个 limit。开头 \n 避免与进度条同显时接在同一行。
 fn debugLogResponseTooLarge(url: []const u8, max_response_bytes: usize) void {
     const env = std.posix.getenv("SHU_DEBUG_HTTP") orelse return;
     if (env.len == 0) return;
     var buf: [512]u8 = undefined;
     var w = std.fs.File.stderr().writer(&buf);
-    w.interface.print("[shu http] ResponseTooLarge url={s} limit={d}\n", .{ url, max_response_bytes }) catch return;
+    w.interface.print("\n[shu http] ResponseTooLarge url={s} limit={d}\n", .{ url, max_response_bytes }) catch return;
     w.interface.flush() catch return;
 }
 
 /// ReadFailed 时 libcurl 最大重试次数（每次间隔 1 秒，用于 JSR/高并发下连接被关等瞬断）
 const read_failed_curl_retries = 3;
 
-/// 使用已有 Client 做 GET，便于同一 host 连接复用（Keep-Alive）。仅走 Zig 路径、不设超时；若 2xx 且 body 为空或读 body 时 ReadFailed（连接复用导致连接被关常见于 JSR）则用 libcurl 重试最多 read_failed_curl_retries 次、每次间隔 1 秒。调用方负责 client 生命周期。
+/// 使用已有 Client 做 GET，便于同一 host 连接复用（Keep-Alive）。仅走 Zig 路径、不设超时；若 2xx 且 body 为空或读 body 时 ReadFailed（连接复用导致连接被关常见于 JSR）则用 libcurl 重试最多 read_failed_curl_retries 次、每次间隔 1 秒。调用方负责 client 生命周期。SHU_HTTP_FORCE_CURL=1 时跳过 Zig、直接走 libcurl。
 pub fn getWithClient(client: *std.http.Client, allocator: std.mem.Allocator, url: []const u8, options: GetOptions) ![]const u8 {
     var headers: [16]Header = undefined;
     var n: usize = 0;
@@ -279,6 +296,16 @@ pub fn getWithClient(client: *std.http.Client, allocator: std.mem.Allocator, url
         .accept_encoding = options.accept_encoding,
         .headers = headers[0..n],
     };
+    if (forceCurl()) {
+        const resp = try requestViaLibCurl(allocator, url, curl_opts);
+        if (resp.status < 200 or resp.status >= 300) {
+            allocator.free(resp.body);
+            allocator.free(resp.status_text);
+            return error.BadStatus;
+        }
+        allocator.free(resp.status_text);
+        return resp.body;
+    }
     var resp = requestViaZigWithClient(client, allocator, url, opts) catch |e| {
         if (e == error.ReadFailed) {
             var last_err: anyerror = e;
@@ -311,10 +338,14 @@ pub fn getWithClient(client: *std.http.Client, allocator: std.mem.Allocator, url
         }
         return e;
     };
+    // 2xx 且 body 为空（Zig 路径常见于 Keep-Alive 复用导致连接被关）：用 libcurl 回退，失败则再试一次、间隔 1s，提高瞬断场景成功率
     if (resp.status >= 200 and resp.status < 300 and resp.body.len == 0) {
         allocator.free(resp.body);
         allocator.free(resp.status_text);
-        resp = requestViaLibCurl(allocator, url, curl_opts) catch return error.CurlFailed;
+        resp = requestViaLibCurl(allocator, url, curl_opts) catch blk: {
+            std.Thread.sleep(1_000_000_000);
+            break :blk requestViaLibCurl(allocator, url, curl_opts) catch return error.CurlFailed;
+        };
     }
     if (resp.status < 200 or resp.status >= 300) {
         allocator.free(resp.body);
@@ -325,8 +356,8 @@ pub fn getWithClient(client: *std.http.Client, allocator: std.mem.Allocator, url
     return resp.body;
 }
 
-/// 使用已有 CurlClient 做 GET，复用连接（Keep-Alive）；走 libcurl 路径，适合 JSR 等多请求同 host。调用方 free 返回的切片。
-pub fn getWithCurlClient(curl_client: *CurlClient, allocator: std.mem.Allocator, url: []const u8, options: GetOptions) ![]const u8 {
+/// 内部：使用已有 CurlClient 做 GET（libcurl 路径）；不对外暴露，仅保留供将来若有内部复用需求。调用方 free 返回的切片。
+fn getWithCurlClient(curl_client: *CurlClient, allocator: std.mem.Allocator, url: []const u8, options: GetOptions) ![]const u8 {
     var headers: [16]Header = undefined;
     var n: usize = 0;
     headers[n] = .{ .name = "Accept", .value = options.accept };
@@ -359,7 +390,7 @@ pub fn getWithCurlClient(curl_client: *CurlClient, allocator: std.mem.Allocator,
 }
 
 /// tarball 下载专用：默认 raw_body true、keep_compressed false，在 HTTP 层解压 gzip 后返回 tar 字节，写入 .tgz 文件后由 extractRawTarFromSlice 解析，避免镜像 gzip 与本地流式解压不兼容。调用方 free 返回的切片。
-pub fn getTarballWithCurlClient(curl_client: *CurlClient, allocator: std.mem.Allocator, url: []const u8, options: TarballGetOptions) ![]const u8 {
+fn getTarballWithCurlClient(curl_client: *CurlClient, allocator: std.mem.Allocator, url: []const u8, options: TarballGetOptions) ![]const u8 {
     return getWithCurlClient(curl_client, allocator, url, .{
         .accept = options.accept orelse tarball_default_accept,
         .accept_encoding = options.accept_encoding orelse tarball_default_accept_encoding,
@@ -371,8 +402,8 @@ pub fn getTarballWithCurlClient(curl_client: *CurlClient, allocator: std.mem.All
     });
 }
 
-/// 使用已有 CurlClient 做 GET 并返回完整 Response（含 content_encoding，当 options.raw_body 时）。调用方 free resp.body、status_text、content_encoding。
-pub fn getWithCurlClientResponse(curl_client: *CurlClient, allocator: std.mem.Allocator, url: []const u8, options: GetOptions) !Response {
+/// 内部：使用已有 CurlClient 做 GET 并返回完整 Response；不对外暴露。
+fn getWithCurlClientResponse(curl_client: *CurlClient, allocator: std.mem.Allocator, url: []const u8, options: GetOptions) !Response {
     var headers: [16]Header = undefined;
     var n: usize = 0;
     headers[n] = .{ .name = "Accept", .value = options.accept };
@@ -564,10 +595,25 @@ fn statusCodeToStatic(code: u16) []const u8 {
 // libcurl 路径：进程内 C 库，支持 CURLOPT_TIMEOUT，无子进程；支持 CurlClient 连接复用
 // -----------------------------------------------------------------------------
 
+/// 进程级只执行一次 curl_global_init，避免每次请求重复初始化（SSL/协议表等开销大且非线程安全）。由 main 启动时调用，或首次使用 libcurl 时惰性调用。
+pub fn ensureCurlGlobalInit() void {
+    curl_global_mutex.lock();
+    defer curl_global_mutex.unlock();
+    if (!curl_global_done) {
+        _ = c.curl_global_init(c.CURL_GLOBAL_DEFAULT);
+        curl_global_done = true;
+    }
+}
+
+var curl_global_mutex: std.Thread.Mutex = .{};
+var curl_global_done: bool = false;
+
 const LibCurlWriteContext = struct {
     list: std.ArrayList(u8),
     allocator: std.mem.Allocator,
     max_bytes: usize,
+    /// 由 header 回调解析得到时，首包写入前 ensureTotalCapacity 以减重分配与拷贝
+    content_length: ?usize = null,
 };
 
 fn curlWriteCallback(ptr: [*]const u8, size: usize, nmemb: usize, userdata: ?*anyopaque) callconv(.c) usize {
@@ -576,9 +622,69 @@ fn curlWriteCallback(ptr: [*]const u8, size: usize, nmemb: usize, userdata: ?*an
     if (chunk == 0) return 0;
     const remain = ctx.max_bytes - ctx.list.items.len;
     if (remain == 0) return 0;
+    // Content-Length 已知且为首包时预分配，减少 ArrayList 多次扩容与拷贝
+    if (ctx.list.items.len == 0) {
+        if (ctx.content_length) |cl| {
+            if (cl <= ctx.max_bytes)
+                ctx.list.ensureTotalCapacity(ctx.allocator, cl) catch {};
+        }
+    }
     const to_append = @min(chunk, remain);
     ctx.list.appendSlice(ctx.allocator, ptr[0..to_append]) catch return 0;
     return to_append;
+}
+
+/// 仅解析 Content-Length 响应头并写入 *?usize，不分配；供 requestViaLibCurl 预分配 body 缓冲。
+fn curlContentLengthHeaderCallback(ptr: [*]const u8, size: usize, nmemb: usize, userdata: ?*anyopaque) callconv(.c) usize {
+    const out = @as(*?usize, @ptrCast(@alignCast(userdata orelse return size * nmemb)));
+    if (out.* != null) return size * nmemb;
+    const n = size * nmemb;
+    if (n < 16) return n;
+    const line = ptr[0..n];
+    const prefix = "Content-Length:";
+    if (line.len >= prefix.len and std.ascii.eqlIgnoreCase(line[0..prefix.len], prefix)) {
+        const rest = std.mem.trim(u8, line[prefix.len..], " \t\r\n");
+        out.* = std.fmt.parseInt(usize, rest, 10) catch null;
+    }
+    return n;
+}
+
+/// 单缓冲构建 curl_slist：所有 "Name: Value\0" 写入 buf，避免每头 allocPrint+dupeZ 双重分配。调用方在 perform 后负责 buf.deinit(allocator) 与 slist_free_all。
+fn buildCurlHeaderSlist(allocator: std.mem.Allocator, ua: []const u8, accept_encoding: ?[]const u8, headers: []const Header) !struct { slist: ?*c.curl_slist, buf: std.ArrayList(u8) } {
+    var buf = std.ArrayList(u8).initCapacity(allocator, 512) catch return error.OutOfMemory;
+    var starts = std.ArrayList(usize).initCapacity(allocator, headers.len + 2) catch return error.OutOfMemory;
+    defer starts.deinit(allocator);
+
+    // User-Agent：直接 append 字符串 + \0，避免 default 时也 allocPrint
+    try starts.append(allocator, buf.items.len);
+    try buf.appendSlice(allocator, "User-Agent: ");
+    try buf.appendSlice(allocator, ua);
+    try buf.append(allocator, 0);
+
+    if (accept_encoding) |enc| {
+        try starts.append(allocator, buf.items.len);
+        try buf.appendSlice(allocator, "Accept-Encoding: ");
+        try buf.appendSlice(allocator, enc);
+        try buf.append(allocator, 0);
+    }
+    for (headers) |h| {
+        try starts.append(allocator, buf.items.len);
+        try buf.appendSlice(allocator, h.name);
+        try buf.appendSlice(allocator, ": ");
+        try buf.appendSlice(allocator, h.value);
+        try buf.append(allocator, 0);
+    }
+
+    var slist: ?*c.curl_slist = null;
+    for (starts.items) |start| {
+        const new_slist = c.curl_slist_append(slist, buf.items.ptr + start);
+        if (new_slist == null) {
+            if (slist) |s| c.curl_slist_free_all(s);
+            return error.OutOfMemory;
+        }
+        slist = new_slist;
+    }
+    return .{ .slist = slist, .buf = buf };
 }
 
 /// raw_body 时从响应头解析 Content-Encoding、Content-Length（用于截断校验）。
@@ -686,19 +792,19 @@ fn debugLogDecompress(enc: []const u8, before: usize, after: usize) void {
     _ = std.posix.write(2, fbs.getWritten()) catch {};
 }
 
-/// 可复用的 libcurl easy 句柄，用于同一 host 的连续请求以复用 TCP 连接（HTTP/1.1 Keep-Alive）。调用方 init 后多次请求、最后 deinit。
-pub const CurlClient = struct {
+/// 内部：可复用的 libcurl easy 句柄，不对外暴露；Zig 失败回退使用 requestViaLibCurl（单次请求），不依赖本类型。
+const CurlClient = struct {
     easy: ?*c.CURL = null,
 
-    /// 创建并持有 libcurl easy 句柄；内部会 curl_global_init（不在此处 cleanup，与单次请求路径兼容）。
-    pub fn init() CurlClient {
-        _ = c.curl_global_init(c.CURL_GLOBAL_DEFAULT);
+    /// 创建并持有 libcurl easy 句柄；依赖进程级 ensureCurlGlobalInit（main 或首次使用时已初始化）。
+    fn init() CurlClient {
+        ensureCurlGlobalInit();
         const easy = c.curl_easy_init();
         return .{ .easy = easy };
     }
 
     /// 释放 easy 句柄；不调用 curl_global_cleanup。
-    pub fn deinit(self: *CurlClient) void {
+    fn deinit(self: *CurlClient) void {
         if (self.easy) |e| {
             c.curl_easy_cleanup(e);
             self.easy = null;
@@ -720,35 +826,9 @@ fn requestViaLibCurlWithClient(curl_client: *CurlClient, allocator: std.mem.Allo
     };
     defer write_ctx.list.deinit(allocator);
 
-    const header_cap = options.headers.len + 2;
-    var header_z_list = std.ArrayList([]const u8).initCapacity(allocator, header_cap) catch return error.OutOfMemory;
-    defer header_z_list.deinit(allocator);
-    defer for (header_z_list.items) |z| allocator.free(z.ptr[0 .. z.len + 1]);
-
-    const ua_hdr = try std.fmt.allocPrint(allocator, "User-Agent: {s}", .{ua});
-    const ua_z = try allocator.dupeZ(u8, ua_hdr);
-    allocator.free(ua_hdr);
-    try header_z_list.append(allocator, ua_z);
-    var slist: ?*c.curl_slist = null;
-    defer if (slist) |s| c.curl_slist_free_all(s);
-    slist = c.curl_slist_append(slist, ua_z.ptr);
-    if (slist == null) return error.OutOfMemory;
-    if (options.accept_encoding) |enc| {
-        const enc_hdr = try std.fmt.allocPrint(allocator, "Accept-Encoding: {s}", .{enc});
-        const enc_z = try allocator.dupeZ(u8, enc_hdr);
-        allocator.free(enc_hdr);
-        try header_z_list.append(allocator, enc_z);
-        slist = c.curl_slist_append(slist, enc_z.ptr);
-        if (slist == null) return error.OutOfMemory;
-    }
-    for (options.headers) |h| {
-        const s = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ h.name, h.value });
-        const z = try allocator.dupeZ(u8, s);
-        allocator.free(s);
-        try header_z_list.append(allocator, z);
-        slist = c.curl_slist_append(slist, z.ptr);
-        if (slist == null) return error.OutOfMemory;
-    }
+    var slist_ctx = buildCurlHeaderSlist(allocator, ua, options.accept_encoding, options.headers) catch return error.OutOfMemory;
+    defer slist_ctx.buf.deinit(allocator);
+    defer if (slist_ctx.slist) |s| c.curl_slist_free_all(s);
 
     _ = c.curl_easy_setopt(easy, c.CURLOPT_URL, url_z.ptr);
     _ = c.curl_easy_setopt(easy, c.CURLOPT_FOLLOWLOCATION, @as(c_long, 1));
@@ -756,16 +836,20 @@ fn requestViaLibCurlWithClient(curl_client: *CurlClient, allocator: std.mem.Allo
         _ = c.curl_easy_setopt(easy, c.CURLOPT_TIMEOUT, options.timeout_sec);
         _ = c.curl_easy_setopt(easy, c.CURLOPT_CONNECTTIMEOUT, @as(c_long, 10));
     }
-    _ = c.curl_easy_setopt(easy, c.CURLOPT_HTTPHEADER, slist);
+    // SHU_DEBUG_HTTP 时开启 libcurl 详细日志到 stderr，便于排查超时/SSL
+    if (std.posix.getenv("SHU_DEBUG_HTTP")) |e| {
+        if (e.len > 0) _ = c.curl_easy_setopt(easy, c.CURLOPT_VERBOSE, @as(c_long, 1));
+    }
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_HTTPHEADER, slist_ctx.slist);
     _ = c.curl_easy_setopt(easy, c.CURLOPT_WRITEFUNCTION, curlWriteCallback);
     _ = c.curl_easy_setopt(easy, c.CURLOPT_WRITEDATA, &write_ctx);
 
-    var header_ctx = LibCurlHeaderContext{ .allocator = allocator };
+    var resp_header_ctx = LibCurlHeaderContext{ .allocator = allocator };
     // raw_body 时：解析 Content-Encoding 响应头；不设 CURLOPT_ACCEPT_ENCODING 以便请求头 Accept-Encoding 照常发送；
     // 显式关闭 curl 对响应的解压，保证拿到原始 gzip 字节写回 .tgz。
     if (options.raw_body) {
         _ = c.curl_easy_setopt(easy, c.CURLOPT_HEADERFUNCTION, curlHeaderCallback);
-        _ = c.curl_easy_setopt(easy, c.CURLOPT_HEADERDATA, &header_ctx);
+        _ = c.curl_easy_setopt(easy, c.CURLOPT_HEADERDATA, &resp_header_ctx);
         _ = c.curl_easy_setopt(easy, c.CURLOPT_HTTP_CONTENT_DECODING, @as(c_long, 0));
     }
 
@@ -813,14 +897,14 @@ fn requestViaLibCurlWithClient(curl_client: *CurlClient, allocator: std.mem.Allo
     }
 
     const body = write_ctx.list.toOwnedSlice(allocator) catch return error.OutOfMemory;
-    if (options.raw_body and header_ctx.content_length != null and body.len < header_ctx.content_length.?) {
+    if (options.raw_body and resp_header_ctx.content_length != null and body.len < resp_header_ctx.content_length.?) {
         allocator.free(body);
         if (std.posix.getenv("SHU_DEBUG_HTTP")) |_| {
             var buf: [256]u8 = undefined;
             var fbs = std.io.fixedBufferStream(&buf);
             fbs.writer().print("[shu http] body truncated (curl) url={s} expected={d} got={d}\n", .{
                 url,
-                header_ctx.content_length.?,
+                resp_header_ctx.content_length.?,
                 body.len,
             }) catch {};
             _ = std.posix.write(2, fbs.getWritten()) catch {};
@@ -832,7 +916,7 @@ fn requestViaLibCurlWithClient(curl_client: *CurlClient, allocator: std.mem.Allo
         .status = status,
         .status_text = status_text,
         .body = body,
-        .content_encoding = header_ctx.content_encoding,
+        .content_encoding = resp_header_ctx.content_encoding,
     };
     if (options.raw_body and !options.keep_compressed) {
         try decompressResponseBodyIfNeeded(allocator, &resp);
@@ -841,12 +925,11 @@ fn requestViaLibCurlWithClient(curl_client: *CurlClient, allocator: std.mem.Allo
 }
 
 fn requestViaLibCurl(allocator: std.mem.Allocator, url: []const u8, options: RequestOptions) !Response {
+    ensureCurlGlobalInit();
+
     const url_z = try allocator.dupeZ(u8, url);
     defer allocator.free(url_z);
     const ua = options.user_agent orelse default_user_agent;
-
-    _ = c.curl_global_init(c.CURL_GLOBAL_DEFAULT);
-    defer c.curl_global_cleanup();
 
     const easy = c.curl_easy_init() orelse return error.CurlFailed;
     defer c.curl_easy_cleanup(easy);
@@ -858,36 +941,9 @@ fn requestViaLibCurl(allocator: std.mem.Allocator, url: []const u8, options: Req
     };
     defer write_ctx.list.deinit(allocator);
 
-    // 每个元素均为 dupeZ 分配（多 1 字节 \0），free 时须传入完整块以与 GPA 记录一致；+2 为 UA 与可选的 Accept-Encoding
-    const header_cap = options.headers.len + 2;
-    var header_z_list = std.ArrayList([]const u8).initCapacity(allocator, header_cap) catch return error.OutOfMemory;
-    defer header_z_list.deinit(allocator);
-    defer for (header_z_list.items) |z| allocator.free(z.ptr[0 .. z.len + 1]);
-
-    const ua_hdr = try std.fmt.allocPrint(allocator, "User-Agent: {s}", .{ua});
-    const ua_z = try allocator.dupeZ(u8, ua_hdr);
-    defer allocator.free(ua_hdr);
-    try header_z_list.append(allocator, ua_z);
-    var slist: ?*c.curl_slist = null;
-    defer if (slist) |s| c.curl_slist_free_all(s);
-    slist = c.curl_slist_append(slist, ua_z.ptr);
-    if (slist == null) return error.OutOfMemory;
-    if (options.accept_encoding) |enc| {
-        const enc_hdr = try std.fmt.allocPrint(allocator, "Accept-Encoding: {s}", .{enc});
-        const enc_z = try allocator.dupeZ(u8, enc_hdr);
-        allocator.free(enc_hdr);
-        try header_z_list.append(allocator, enc_z);
-        slist = c.curl_slist_append(slist, enc_z.ptr);
-        if (slist == null) return error.OutOfMemory;
-    }
-    for (options.headers) |h| {
-        const s = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ h.name, h.value });
-        const z = try allocator.dupeZ(u8, s);
-        allocator.free(s);
-        try header_z_list.append(allocator, z);
-        slist = c.curl_slist_append(slist, z.ptr);
-        if (slist == null) return error.OutOfMemory;
-    }
+    var header_ctx = buildCurlHeaderSlist(allocator, ua, options.accept_encoding, options.headers) catch return error.OutOfMemory;
+    defer header_ctx.buf.deinit(allocator);
+    defer if (header_ctx.slist) |s| c.curl_slist_free_all(s);
 
     _ = c.curl_easy_setopt(easy, c.CURLOPT_URL, url_z.ptr);
     _ = c.curl_easy_setopt(easy, c.CURLOPT_FOLLOWLOCATION, @as(c_long, 1));
@@ -895,7 +951,13 @@ fn requestViaLibCurl(allocator: std.mem.Allocator, url: []const u8, options: Req
         _ = c.curl_easy_setopt(easy, c.CURLOPT_TIMEOUT, options.timeout_sec);
         _ = c.curl_easy_setopt(easy, c.CURLOPT_CONNECTTIMEOUT, @as(c_long, 10));
     }
-    _ = c.curl_easy_setopt(easy, c.CURLOPT_HTTPHEADER, slist);
+    // SHU_DEBUG_HTTP 时开启 libcurl 详细日志到 stderr，便于排查超时/SSL
+    if (std.posix.getenv("SHU_DEBUG_HTTP")) |e| {
+        if (e.len > 0) _ = c.curl_easy_setopt(easy, c.CURLOPT_VERBOSE, @as(c_long, 1));
+    }
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_HTTPHEADER, header_ctx.slist);
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_HEADERFUNCTION, curlContentLengthHeaderCallback);
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_HEADERDATA, &write_ctx.content_length);
     _ = c.curl_easy_setopt(easy, c.CURLOPT_WRITEFUNCTION, curlWriteCallback);
     _ = c.curl_easy_setopt(easy, c.CURLOPT_WRITEDATA, &write_ctx);
 
