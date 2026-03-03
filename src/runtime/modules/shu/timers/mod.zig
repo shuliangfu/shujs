@@ -3,6 +3,8 @@
 
 const std = @import("std");
 const jsc = @import("jsc");
+const errors = @import("errors");
+const libs_process = @import("libs_process");
 const globals = @import("../../../globals.zig");
 const common = @import("../../../common.zig");
 const cron = @import("../crond/mod.zig");
@@ -139,7 +141,10 @@ pub fn scheduleWithDelay(ctx: jsc.JSContextRef, callback: jsc.JSValueRef, delay_
         .callback = callback,
         .ms = delay_ms,
         .is_interval = is_interval,
-        .scheduled_at = std.time.milliTimestamp() + @as(i64, @intCast(delay_ms)),
+        .scheduled_at = blk: {
+            const io = libs_process.getProcessIo() orelse break :blk @as(i64, 0);
+            break :blk @as(i64, @intCast(@divTrunc(std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds, 1_000_000))) + @as(i64, @intCast(delay_ms));
+        },
         .is_crond = is_crond,
         .async_id = ids.async_id,
         .trigger_async_id = ids.trigger_async_id,
@@ -172,7 +177,8 @@ pub fn scheduleCron(ctx: jsc.JSContextRef, callback: jsc.JSValueRef, expression:
     if (!jsc.JSObjectIsFunction(ctx, @ptrCast(callback))) return 0;
     var parsed = cron.parse(state.allocator, expression) catch return 0;
     defer parsed.deinit();
-    const now_sec = @divTrunc(std.time.milliTimestamp(), 1000);
+    const io = libs_process.getProcessIo() orelse return 0;
+    const now_sec = @divTrunc(@as(i64, @intCast(@divTrunc(std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds, 1_000_000))), 1000);
     const next_sec = cron.nextRun(&parsed, now_sec) orelse return 0;
     const next_ms: i64 = next_sec * 1000;
     const expr_copy = state.allocator.dupe(u8, expression) catch return 0;
