@@ -87,8 +87,9 @@ pub const HighPerfIO = struct {
 
     /// 初始化 Darwin I/O 子系统：创建 kqueue、分配完成项/events/changelist/client 槽位（§4.1 每线程独立 kqueue）
     pub fn init(allocator: std.mem.Allocator, options: api.InitOptions) !HighPerfIO {
-        const kq_fd = posix.kqueue() catch return error.SystemResources;
-        errdefer posix.close(kq_fd);
+        const kq_fd = std.c.kqueue();
+        if (kq_fd == -1) return error.SystemResources;
+        errdefer _ = std.c.close(kq_fd);
 
         const completion_buffer = try allocator.alloc(api.Completion, options.max_completions);
         errdefer allocator.free(completion_buffer);
@@ -136,9 +137,9 @@ pub const HighPerfIO = struct {
         const op_kinds = self.slot_data.items(.op_kind);
         const client_fds = self.slot_data.items(.client_fd);
         for (op_kinds, client_fds) |op, fd| {
-            if (fd >= 0 and op == .accept_first_read) posix.close(fd);
+            if (fd >= 0 and op == .accept_first_read) _ = std.c.close(fd);
         }
-        posix.close(self.kq_fd);
+        _ = std.c.close(self.kq_fd);
         self.allocator.free(self.completion_buffer);
         self.allocator.free(self.events);
         self.slot_data.deinit(self.allocator);
@@ -208,13 +209,22 @@ pub const HighPerfIO = struct {
             break :blk &ts;
         };
         const ch_slice = self.changelist[0..self.changelist_len];
-        const n = posix.kevent(self.kq_fd, ch_slice, self.events, timeout_ptr) catch return self.completion_buffer[0..self.completion_count];
+        const n = std.c.kevent(
+            self.kq_fd,
+            ch_slice.ptr,
+            @as(c_int, @intCast(ch_slice.len)),
+            self.events.ptr,
+            @as(c_int, @intCast(self.events.len)),
+            timeout_ptr,
+        );
+        if (n < 0) return self.completion_buffer[0..self.completion_count];
         self.changelist_len = 0;
 
         const pool_ptr = self.pool_ptr;
         const op_kinds = self.slot_data.items(.op_kind);
         const client_fds = self.slot_data.items(.client_fd);
-        for (self.events[0..n]) |*ev| {
+        const n_u = @as(usize, @intCast(n));
+        for (self.events[0..n_u]) |*ev| {
             const fd = @as(i32, @intCast(ev.ident));
             if (self.listen_fds.contains(fd)) {
                 self.handleListenReady(fd, pool_ptr);
@@ -249,8 +259,9 @@ pub const HighPerfIO = struct {
             };
             var addr: posix.sockaddr = undefined;
             var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
-            const client_fd = posix.accept(listen_fd, &addr, &addr_len, posix.SOCK.NONBLOCK) catch |err| {
-                if (err == posix.AcceptError.WouldBlock) {
+            const client_fd = std.c.accept(listen_fd, @ptrCast(&addr), @ptrCast(&addr_len));
+            if (client_fd < 0) {
+                if (std.c._errno().* == @intFromEnum(std.c.E.AGAIN)) {
                     self.pending_accepts.append(self.allocator, .{ .listen_fd = listen_fd, .user_data = user_data }) catch {};
                     self.chunk_cache.release(chunk_index);
                     return;
@@ -258,15 +269,15 @@ pub const HighPerfIO = struct {
                 self.pushCompletion(user_data, null, 0, error.SocketWrite, null);
                 self.chunk_cache.release(chunk_index);
                 return;
-            };
-            setNonBlocking(client_fd) catch {
-                posix.close(client_fd);
+            }
+            setNonBlocking(@as(i32, @intCast(client_fd))) catch {
+                _ = std.c.close(client_fd);
                 self.chunk_cache.release(chunk_index);
                 self.pending_accepts.append(self.allocator, .{ .listen_fd = listen_fd, .user_data = user_data }) catch {};
                 return;
             };
             const slot_index = self.free_slots.pop() orelse {
-                posix.close(client_fd);
+                _ = std.c.close(client_fd);
                 self.chunk_cache.release(chunk_index);
                 self.pending_accepts.append(self.allocator, .{ .listen_fd = listen_fd, .user_data = user_data }) catch {};
                 return;
@@ -282,7 +293,7 @@ pub const HighPerfIO = struct {
             })) {
                 self.slot_data.set(slot_index, .{ .op_kind = .accept_first_read, .client_fd = -1 });
                 self.free_slots.append(self.allocator, slot_index) catch {};
-                posix.close(client_fd);
+                _ = std.c.close(client_fd);
                 self.chunk_cache.release(chunk_index);
                 self.pending_accepts.append(self.allocator, .{ .listen_fd = listen_fd, .user_data = user_data }) catch {};
                 return;
@@ -324,10 +335,10 @@ pub const HighPerfIO = struct {
             .udata = 0,
         });
         defer self.chunk_cache.release(chunk_index);
-        const client_stream: std.net.Stream = .{ .handle = client_fd };
+        const client_stream: std.Io.net.Stream = .{ .socket = .{ .handle = @as(i32, @intCast(client_fd)), .address = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } } } };
 
         if (chunk_index >= self.chunk_count) {
-            posix.close(client_fd);
+            _ = std.c.close(client_fd);
             return;
         }
         const buf = @as([*]u8, @ptrCast(@constCast(pool_ptr + chunk_index * CHUNK_SIZE)))[0..CHUNK_SIZE];
@@ -369,8 +380,8 @@ pub const HighPerfIO = struct {
     }
 
     /// 在连接上提交一次 recv；数据写入池块，完成时 tag=recv、chunk_index 有效，用毕须 releaseChunk
-    pub fn submitRecv(self: *HighPerfIO, stream: std.net.Stream, user_data: usize) void {
-        const client_fd = stream.handle;
+    pub fn submitRecv(self: *HighPerfIO, stream: std.Io.net.Stream, user_data: usize) void {
+        const client_fd = stream.socket.handle;
         const chunk_index = self.chunk_cache.take() orelse return;
         const slot_index = self.free_slots.pop() orelse {
             self.chunk_cache.release(chunk_index);
@@ -393,11 +404,11 @@ pub const HighPerfIO = struct {
     }
 
     /// 在连接上提交 send；data 在完成前须保持有效；完成时 tag=send、len=已发送字节数（暂为桩，后续实现 EVFILT_WRITE + write）
-    pub fn submitSend(self: *HighPerfIO, _: std.net.Stream, _: []const u8, _: usize) void {
+    pub fn submitSend(self: *HighPerfIO, _: std.Io.net.Stream, _: []const u8, _: usize) void {
         _ = self;
     }
 
-    inline fn pushCompletion(self: *HighPerfIO, user_data: usize, buffer_ptr: ?[*]const u8, len: usize, err: ?api.SendFileError, client_stream: ?std.net.Stream) void {
+    inline fn pushCompletion(self: *HighPerfIO, user_data: usize, buffer_ptr: ?[*]const u8, len: usize, err: ?api.SendFileError, client_stream: ?std.Io.net.Stream) void {
         if (self.completion_count >= self.completion_buffer.len) return;
         self.completion_buffer[self.completion_count] = .{
             .user_data = user_data,
@@ -427,8 +438,9 @@ pub const HighPerfIO = struct {
 };
 
 fn setNonBlocking(fd: i32) !void {
-    const flags = posix.fcntl(fd, posix.F.GETFL, 0) catch return error.SocketWrite;
-    _ = posix.fcntl(fd, posix.F.SETFL, flags | 0x4) catch return error.SocketWrite; // O_NONBLOCK on Darwin
+    const flags = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
+    if (flags < 0) return error.SocketWrite;
+    if (std.c.fcntl(fd, std.c.F.SETFL, @as(c_int, flags | 0x4)) < 0) return error.SocketWrite; // O_NONBLOCK on Darwin
 }
 
 /// Darwin 专用：将当前线程 QoS 设为 USER_INTERACTIVE，利于调度到 P 核；非 macOS 编译为 no-op，不引用 Darwin 符号
@@ -441,9 +453,9 @@ fn setDarwinThreadQosUserInteractive() void {
 
 /// 零拷贝：文件 → 网络（Darwin/BSD sendfile）；len 为 in/out，需循环直至发送完或错误（§4.1）。
 /// 进阶：macOS sendfile 支持 sf_hdtr（header + file + trailer 一次提交），可在发送文件前后附加 HTTP 头或签名，相比 Linux 的 writev + sendfile 可省一次系统调用；需要时可扩展本函数接受 optional hdtr。
-pub fn sendFile(stream: std.net.Stream, file: std.fs.File, offset: u64, count: u64) api.SendFileError!void {
+pub fn sendFile(stream: std.Io.net.Stream, file: std.fs.File, offset: u64, count: u64) api.SendFileError!void {
     const file_fd = file.handle;
-    const socket_fd = stream.handle;
+    const socket_fd = stream.socket.handle;
     var sent: u64 = 0;
     while (sent < count) {
         var len: i64 = @intCast(count - sent);
