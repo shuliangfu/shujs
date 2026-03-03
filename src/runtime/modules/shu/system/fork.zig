@@ -3,7 +3,8 @@
 
 const std = @import("std");
 const jsc = @import("jsc");
-const errors = @import("../../../../errors.zig");
+const errors = @import("errors");
+const libs_process = @import("libs_process");
 const globals = @import("../../../globals.zig");
 const common = @import("../../../common.zig");
 const run_mod = @import("run.zig");
@@ -110,7 +111,8 @@ fn forkCallback(
     }
     defer if (cwd_opt) |c| allocator.free(c);
 
-    const self_exe = std.fs.selfExePathAlloc(allocator) catch return jsc.JSValueMakeUndefined(ctx);
+    const proc_io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
+    const self_exe = std.process.executablePathAlloc(proc_io, allocator) catch return jsc.JSValueMakeUndefined(ctx);
     defer allocator.free(self_exe);
 
     var argv_list = std.ArrayList([]const u8).empty;
@@ -120,17 +122,19 @@ fn forkCallback(
     argv_list.append(allocator, module_path) catch return jsc.JSValueMakeUndefined(ctx);
     if (args_slices) |s| for (s) |arg| argv_list.append(allocator, arg) catch return jsc.JSValueMakeUndefined(ctx);
 
-    var env_map = std.process.getEnvMap(allocator) catch return jsc.JSValueMakeUndefined(ctx);
+    const env_block = libs_process.getProcessEnviron() orelse std.process.Environ.empty;
+    var env_map = std.process.Environ.createMap(env_block, allocator) catch return jsc.JSValueMakeUndefined(ctx);
     defer env_map.deinit();
     env_map.put("SHU_FORKED", "1") catch return jsc.JSValueMakeUndefined(ctx);
 
-    const handle = fork_parent.createForkHandle(allocator, argv_list.items, cwd_opt, &env_map) catch return jsc.JSValueMakeUndefined(ctx);
+    const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
+    const handle = fork_parent.createForkHandle(allocator, argv_list.items, cwd_opt, &env_map, io) catch return jsc.JSValueMakeUndefined(ctx);
     if (!fork_registry_ready) {
         fork_parent.initRegistry(allocator);
         fork_registry_ready = true;
     }
     const id = fork_parent.registerHandle(allocator, handle) catch {
-        _ = handle.child.kill() catch {};
+        std.process.Child.kill(&handle.child, io);
         handle.reader_thread.join();
         allocator.destroy(handle);
         return jsc.JSValueMakeUndefined(ctx);
