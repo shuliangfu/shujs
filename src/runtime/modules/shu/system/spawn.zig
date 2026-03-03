@@ -3,7 +3,8 @@
 
 const std = @import("std");
 const jsc = @import("jsc");
-const errors = @import("../../../../errors.zig");
+const errors = @import("errors");
+const libs_process = @import("libs_process");
 const globals = @import("../../../globals.zig");
 const common = @import("../../../common.zig");
 const system_allocator = @import("allocator.zig");
@@ -88,7 +89,8 @@ fn spawnSyncCallback(
     const cwd = run_mod.getOptionsCwd(allocator, ctx, options_obj);
     defer if (cwd) |c| allocator.free(c);
     const cwd_opt = if (cwd) |c| c else opts.cwd;
-    const result = child_run.runProcess(allocator, cmd_slices, cwd_opt) catch return jsc.JSValueMakeUndefined(ctx);
+    const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
+    const result = child_run.runProcess(allocator, cmd_slices, cwd_opt, io) catch return jsc.JSValueMakeUndefined(ctx);
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
     return makeSpawnResultObject(ctx, result.code, result.stdout, result.stderr);
