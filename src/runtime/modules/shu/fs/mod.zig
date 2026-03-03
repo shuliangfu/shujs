@@ -50,24 +50,25 @@
 //!
 //! ## 性能与约定
 //! - 异步：纯 Zig 实现，无内联 JS；Promise 构造时入延迟队列，在 drain（drainFileIOCompletions）中执行同步逻辑并 resolve/reject
-//! - readSync(path, { encoding: null }) 返回 Buffer 时：小文件 Zig 分配 + JSC NoCopy；大文件（≥FS_MAP_THRESHOLD）走 io_core.mapFileReadOnly，零拷贝
+//! - readSync(path, { encoding: null }) 返回 Buffer 时：小文件 Zig 分配 + JSC NoCopy；大文件（≥FS_MAP_THRESHOLD）走 libs_io.mapFileReadOnly，零拷贝
 //! - copySync 大文件：源 mmap + 整块写，减少 OOM 与拷贝
 //! - 所有需要分配内存的路径均使用调用方传入的 allocator（globals.current_allocator），谁分配谁释放
 //!
 //! ## §3.0 性能规则：I/O 经 io_core
 //! - 文件/目录操作：openFileAbsolute、openDirAbsolute、realpath、makeDirAbsolute、deleteFileAbsolute、deleteDirAbsolute、renameAbsolute、accessAbsolute、createFileAbsolute 均经 io_core（file.zig 薄封装）。
-//! - 大文件/异步：readSync(encoding:null) 大文件 → io_core.mapFileReadOnly；copySync 大文件 → mapFileReadOnly + 整块写；异步 read/write → io_core.AsyncFileIO。
+//! - 大文件/异步：readSync(encoding:null) 大文件 → libs_io.mapFileReadOnly；copySync 大文件 → mapFileReadOnly + 整块写；异步 read/write → libs_io.AsyncFileIO。
 //! - 符号链接与路径解析：readLinkAbsolute、symLinkAbsolute、pathDirname/pathBasename/pathJoin/pathResolve 等均经 io_core（file.zig 薄封装）。
 
 const std = @import("std");
 const jsc = @import("jsc");
-const io_core = @import("io_core");
+const libs_io = @import("libs_io");
 // 从 modules/shu/fs 引用 runtime 上层与 engine
-const errors = @import("../../../../errors.zig");
+const errors = @import("errors");
+const libs_process = @import("libs_process");
 const globals = @import("../../../globals.zig");
 const common = @import("../../../common.zig");
 
-/// 超过此大小的文件在 readSync(encoding:null) 时用 io_core.mapFileReadOnly；copySync 源文件超过此值时用 mmap 读+整块写
+/// 超过此大小的文件在 readSync(encoding:null) 时用 libs_io.mapFileReadOnly；copySync 源文件超过此值时用 mmap 读+整块写
 const FS_MAP_THRESHOLD = 256 * 1024;
 /// 异步 read 单次提交最大字节数，超过则回退 setTimeout+readSync
 const ASYNC_READ_MAX_BYTES = 64 * 1024 * 1024;
@@ -84,10 +85,10 @@ const FileBufferDeallocContext = struct {
     slice: []u8,
 };
 
-/// 大文件 readSync(encoding:null) 时用 io_core.mapFileReadOnly；JSC 回收时调 mapped.deinit 并释放本结构
+/// 大文件 readSync(encoding:null) 时用 libs_io.mapFileReadOnly；JSC 回收时调 mapped.deinit 并释放本结构
 const MappedFileContext = struct {
     allocator: std.mem.Allocator,
-    mapped: io_core.MappedFile,
+    mapped: libs_io.MappedFile,
 };
 fn mappedFileDeallocator(bytes: *anyopaque, deallocator_context: ?*anyopaque) callconv(.c) void {
     _ = bytes;
@@ -96,13 +97,13 @@ fn mappedFileDeallocator(bytes: *anyopaque, deallocator_context: ?*anyopaque) ca
     ctx.allocator.destroy(ctx);
 }
 
-// ---------- 异步文件 I/O 状态（io_core.AsyncFileIO + pending 表，drain 时 resolve/reject）----------
+// ---------- 异步文件 I/O 状态（libs_io.AsyncFileIO + pending 表，drain 时 resolve/reject）----------
 
 /// 单条待完成的异步文件操作：read 或 write，完成时由 drain 根据 user_data 查表并 resolve/reject
 const PendingEntry = struct {
     resolve: jsc.JSValueRef,
     reject: jsc.JSValueRef,
-    file: io_core.File,
+    file: libs_io.File,
     allocator: std.mem.Allocator,
     kind: enum { read, write },
     /// read 时：读入数据的 buffer，drain 时交 JSC 或 free
@@ -118,7 +119,7 @@ const FsAsyncState = struct {
     allocator: std.mem.Allocator,
     pending: std.AutoHashMap(usize, PendingEntry),
     next_id: usize,
-    async_file_io: *io_core.AsyncFileIO,
+    async_file_io: *libs_io.AsyncFileIO,
 };
 var fs_async_state: ?*FsAsyncState = null;
 
@@ -131,8 +132,8 @@ var fs_write_promise_args: ?struct { resolved: []const u8, content: []const u8 }
 fn ensureAsyncFileIO() !*FsAsyncState {
     if (fs_async_state) |s| return s;
     const allocator = globals.current_allocator orelse return error.NoAllocator;
-    var fio = allocator.create(io_core.AsyncFileIO) catch return error.OutOfMemory;
-    fio.* = io_core.AsyncFileIO.init(allocator) catch |e| {
+    var fio = allocator.create(libs_io.AsyncFileIO) catch return error.OutOfMemory;
+    fio.* = libs_io.AsyncFileIO.init(allocator) catch |e| {
         allocator.destroy(fio);
         return e;
     };
@@ -281,14 +282,18 @@ fn runDeferredFsOp(ctx: jsc.JSContextRef, op: *const DeferredFsOp) void {
             _ = jsc.JSObjectCallAsFunction(ctx_ref, fn_obj, null, 1, &arg, null);
         }
     }.f;
+    const io = libs_process.getProcessIo() orelse {
+        do_reject(ctx, reject_fn, allocator, "process io not set");
+        return;
+    };
     switch (op.tag) {
         .realpath => {
             if (!opts.permissions.allow_read) {
                 do_reject(ctx, reject_fn, allocator, "Shu.fs.realpath requires --allow-read");
                 return;
             }
-            var buf: [io_core.max_path_bytes]u8 = undefined;
-            const canonical = io_core.realpath(op.path, &buf) catch {
+            var buf: [libs_io.max_path_bytes]u8 = undefined;
+            const canonical = libs_io.realpath(op.path, &buf) catch {
                 do_reject(ctx, reject_fn, allocator, "realpath failed");
                 return;
             };
@@ -309,24 +314,24 @@ fn runDeferredFsOp(ctx: jsc.JSContextRef, op: *const DeferredFsOp) void {
                 do_reject(ctx, reject_fn, allocator, "Shu.fs.lstat requires --allow-read");
                 return;
             }
-            const dir_path = io_core.pathDirname(op.path) orelse ".";
-            const base = io_core.pathBasename(op.path);
-            var dir = io_core.openDirAbsolute(dir_path, .{}) catch {
+            const dir_path = libs_io.pathDirname(op.path) orelse ".";
+            const base = libs_io.pathBasename(op.path);
+            var dir = libs_io.openDirAbsolute(dir_path, .{}) catch {
                 do_reject(ctx, reject_fn, allocator, "lstat failed");
                 return;
             };
-            defer dir.close();
-            const s = if (base.len == 0) dir.stat() catch {
+            defer dir.close(io);
+            const s = if (base.len == 0) dir.stat(io) catch {
                 do_reject(ctx, reject_fn, allocator, "lstat failed");
                 return;
-            } else dir.statFile(base) catch {
+            } else dir.statFile(io, base, .{}) catch {
                 do_reject(ctx, reject_fn, allocator, "lstat failed");
                 return;
             };
             const is_file = (s.kind == .file);
             const is_dir = (s.kind == .directory);
             const is_sym = (s.kind == .sym_link);
-            const mtime_ns: i64 = @intCast(@min(s.mtime, std.math.maxInt(i64)));
+            const mtime_ns: i64 = @intCast(@min(s.mtime.nanoseconds, std.math.maxInt(i64)));
             const obj = makeStatObjectWithSymlink(ctx, is_file, is_dir, is_sym, s.size, mtime_ns);
             var res_arg: [1]jsc.JSValueRef = .{obj};
             _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 1, &res_arg, null);
@@ -336,15 +341,16 @@ fn runDeferredFsOp(ctx: jsc.JSContextRef, op: *const DeferredFsOp) void {
                 do_reject(ctx, reject_fn, allocator, "Shu.fs.truncate requires --allow-write");
                 return;
             }
-            const file = io_core.openFileAbsolute(op.path, .{ .mode = .read_write }) catch {
+            const file = libs_io.openFileAbsolute(op.path, .{ .mode = .read_write }) catch {
                 do_reject(ctx, reject_fn, allocator, "truncate failed");
                 return;
             };
-            defer file.close();
-            std.posix.ftruncate(file.handle, op.len) catch {
+            defer file.close(io);
+            if (std.c.ftruncate(file.handle, @as(std.c.off_t, @intCast(op.len))) < 0) {
+                std.posix.unexpectedErrno(std.c.errno(-1)) catch {};
                 do_reject(ctx, reject_fn, allocator, "ftruncate failed");
                 return;
-            };
+            }
             const empty: [0]jsc.JSValueRef = .{};
             _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 0, &empty, null);
         },
@@ -354,10 +360,10 @@ fn runDeferredFsOp(ctx: jsc.JSContextRef, op: *const DeferredFsOp) void {
                 _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 1, &false_arg, null);
                 return;
             }
-            var flags: io_core.FileOpenFlags = .{};
+            var flags: libs_io.FileOpenFlags = .{};
             if (op.mode & 1 != 0) flags.mode = .read_only;
             if (op.mode & 2 != 0) flags.mode = if (op.mode & 1 != 0) .read_write else .write_only;
-            io_core.accessAbsolute(op.path, flags) catch {
+            libs_io.accessAbsolute(op.path, flags) catch {
                 var false_arg: [1]jsc.JSValueRef = .{jsc.JSValueMakeBoolean(ctx, false)};
                 _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 1, &false_arg, null);
                 return;
@@ -371,15 +377,15 @@ fn runDeferredFsOp(ctx: jsc.JSContextRef, op: *const DeferredFsOp) void {
                 _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 1, &false_arg, null);
                 return;
             }
-            var dir = io_core.openDirAbsolute(op.path, .{ .iterate = true }) catch {
+            var dir = libs_io.openDirAbsolute(op.path, .{ .iterate = true }) catch {
                 var false_arg: [1]jsc.JSValueRef = .{jsc.JSValueMakeBoolean(ctx, false)};
                 _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 1, &false_arg, null);
                 return;
             };
-            defer dir.close();
+            defer dir.close(io);
             var iter = dir.iterate();
             var has_any = false;
-            while (iter.next() catch {
+            while (iter.next(io) catch {
                 var false_arg: [1]jsc.JSValueRef = .{jsc.JSValueMakeBoolean(ctx, false)};
                 _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 1, &false_arg, null);
                 return;
@@ -395,8 +401,8 @@ fn runDeferredFsOp(ctx: jsc.JSContextRef, op: *const DeferredFsOp) void {
                 do_reject(ctx, reject_fn, allocator, "Shu.fs.size requires --allow-read");
                 return;
             }
-            const file = io_core.openFileAbsolute(op.path, .{}) catch |e| {
-                if (e == io_core.FileOpenError.IsDir) {
+            const file = libs_io.openFileAbsolute(op.path, .{}) catch |e| {
+                if (e == libs_io.FileOpenError.IsDir) {
                     var zero_arg: [1]jsc.JSValueRef = .{jsc.JSValueMakeNumber(ctx, 0)};
                     _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 1, &zero_arg, null);
                     return;
@@ -404,8 +410,8 @@ fn runDeferredFsOp(ctx: jsc.JSContextRef, op: *const DeferredFsOp) void {
                 do_reject(ctx, reject_fn, allocator, "size failed");
                 return;
             };
-            defer file.close();
-            const s = file.stat() catch {
+            defer file.close(io);
+            const s = file.stat(io) catch {
                 do_reject(ctx, reject_fn, allocator, "stat failed");
                 return;
             };
@@ -418,13 +424,13 @@ fn runDeferredFsOp(ctx: jsc.JSContextRef, op: *const DeferredFsOp) void {
                 _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 1, &false_arg, null);
                 return;
             }
-            const file = io_core.openFileAbsolute(op.path, .{}) catch {
+            const file = libs_io.openFileAbsolute(op.path, .{}) catch {
                 var false_arg: [1]jsc.JSValueRef = .{jsc.JSValueMakeBoolean(ctx, false)};
                 _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 1, &false_arg, null);
                 return;
             };
-            defer file.close();
-            const s = file.stat() catch {
+            defer file.close(io);
+            const s = file.stat(io) catch {
                 var false_arg: [1]jsc.JSValueRef = .{jsc.JSValueMakeBoolean(ctx, false)};
                 _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 1, &false_arg, null);
                 return;
@@ -438,13 +444,13 @@ fn runDeferredFsOp(ctx: jsc.JSContextRef, op: *const DeferredFsOp) void {
                 _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 1, &false_arg, null);
                 return;
             }
-            var dir = io_core.openDirAbsolute(op.path, .{}) catch {
+            var dir = libs_io.openDirAbsolute(op.path, .{}) catch {
                 var false_arg: [1]jsc.JSValueRef = .{jsc.JSValueMakeBoolean(ctx, false)};
                 _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 1, &false_arg, null);
                 return;
             };
-            defer dir.close();
-            _ = dir.stat() catch {
+            defer dir.close(io);
+            _ = dir.stat(io) catch {
                 var false_arg: [1]jsc.JSValueRef = .{jsc.JSValueMakeBoolean(ctx, false)};
                 _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 1, &false_arg, null);
                 return;
@@ -457,11 +463,11 @@ fn runDeferredFsOp(ctx: jsc.JSContextRef, op: *const DeferredFsOp) void {
                 do_reject(ctx, reject_fn, allocator, "Shu.fs.readdirWithStats requires --allow-read");
                 return;
             }
-            var dir = io_core.openDirAbsolute(op.path, .{ .iterate = true }) catch {
+            var dir = libs_io.openDirAbsolute(op.path, .{ .iterate = true }) catch {
                 do_reject(ctx, reject_fn, allocator, "readdir failed");
                 return;
             };
-            defer dir.close();
+            defer dir.close(io);
             var buf: [512]jsc.JSValueRef = undefined;
             var count: usize = 0;
             var iter = dir.iterate();
@@ -477,16 +483,16 @@ fn runDeferredFsOp(ctx: jsc.JSContextRef, op: *const DeferredFsOp) void {
             defer jsc.JSStringRelease(k_size);
             const k_mtimeMs = jsc.JSStringCreateWithUTF8CString("mtimeMs");
             defer jsc.JSStringRelease(k_mtimeMs);
-            while (iter.next() catch {
+            while (iter.next(io) catch {
                 do_reject(ctx, reject_fn, allocator, "readdir iterate failed");
                 return;
             }) |entry| {
                 if (count >= buf.len) break;
-                const s = dir.statFile(entry.name) catch continue;
+                const s = dir.statFile(io, entry.name, .{}) catch continue;
                 const is_file = (s.kind == .file);
                 const is_dir = (s.kind == .directory);
                 const is_sym = (s.kind == .sym_link);
-                const mtime_ns: i64 = @intCast(@min(s.mtime, std.math.maxInt(i64)));
+                const mtime_ns: i64 = @intCast(@min(s.mtime.nanoseconds, std.math.maxInt(i64)));
                 const item = jsc.JSObjectMake(ctx, null, null);
                 const name_z = allocator.dupeZ(u8, entry.name) catch continue;
                 defer allocator.free(name_z);
@@ -511,82 +517,84 @@ fn runDeferredFsOp(ctx: jsc.JSContextRef, op: *const DeferredFsOp) void {
                 do_reject(ctx, reject_fn, allocator, "Shu.fs.ensureFile requires --allow-read and --allow-write");
                 return;
             }
-            const file = io_core.openFileAbsolute(op.path, .{}) catch |e| {
-                if (e == io_core.FileOpenError.FileNotFound) {
-                    const parent = io_core.pathDirname(op.path) orelse return;
+            const file = libs_io.openFileAbsolute(op.path, .{}) catch |e| {
+                if (e == libs_io.FileOpenError.FileNotFound) {
+                    const parent = libs_io.pathDirname(op.path) orelse return;
                     if (parent.len > 0 and parent.len < op.path.len) makeDirRecursiveAbsolute(allocator, parent);
-                    var f = io_core.createFileAbsolute(op.path, .{}) catch {
+                    var f = libs_io.createFileAbsolute(op.path, .{}) catch {
                         do_reject(ctx, reject_fn, allocator, "ensureFile create failed");
                         return;
                     };
-                    f.close();
+                    f.close(io);
                     const empty: [0]jsc.JSValueRef = .{};
                     _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 0, &empty, null);
                     return;
                 }
-                if (e == io_core.FileOpenError.IsDir) {
+                if (e == libs_io.FileOpenError.IsDir) {
                     do_reject(ctx, reject_fn, allocator, "Shu.fs.ensureFile: path is a directory");
                     return;
                 }
                 do_reject(ctx, reject_fn, allocator, "ensureFile failed");
                 return;
             };
-            file.close();
+            file.close(io);
             const empty: [0]jsc.JSValueRef = .{};
             _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 0, &empty, null);
         },
-        .stat => runDeferredFsOpStat(ctx, op, resolve_fn, reject_fn, do_reject),
-        .readdir => runDeferredFsOpReaddir(ctx, op, resolve_fn, reject_fn, do_reject),
-        .mkdir => runDeferredFsOpMkdir(ctx, op, resolve_fn, reject_fn, do_reject),
-        .exists => runDeferredFsOpExists(ctx, op, resolve_fn, reject_fn),
-        .unlink => runDeferredFsOpUnlink(ctx, op, resolve_fn, reject_fn, do_reject),
-        .rmdir => runDeferredFsOpRmdir(ctx, op, resolve_fn, reject_fn, do_reject),
-        .rename => runDeferredFsOpRename(ctx, op, resolve_fn, reject_fn, do_reject),
-        .copy => runDeferredFsOpCopy(ctx, op, resolve_fn, reject_fn, do_reject),
-        .append => runDeferredFsOpAppend(ctx, op, resolve_fn, reject_fn, do_reject),
-        .write => runDeferredFsOpWrite(ctx, op, resolve_fn, reject_fn, do_reject),
-        .readlink => runDeferredFsOpReadlink(ctx, op, resolve_fn, reject_fn, do_reject),
-        .symlink => runDeferredFsOpSymlink(ctx, op, resolve_fn, reject_fn, do_reject),
-        .readFile => runDeferredFsOpReadFile(ctx, op, resolve_fn, reject_fn, do_reject),
-        .mkdirRecursive => runDeferredFsOpMkdirRecursive(ctx, op, resolve_fn, reject_fn, do_reject),
-        .rmdirRecursive => runDeferredFsOpRmdirRecursive(ctx, op, resolve_fn, reject_fn, do_reject),
+        .stat => runDeferredFsOpStat(ctx, op, resolve_fn, reject_fn, do_reject, io),
+        .readdir => runDeferredFsOpReaddir(ctx, op, resolve_fn, reject_fn, do_reject, io),
+        .mkdir => runDeferredFsOpMkdir(ctx, op, resolve_fn, reject_fn, do_reject, io),
+        .exists => runDeferredFsOpExists(ctx, op, resolve_fn, reject_fn, io),
+        .unlink => runDeferredFsOpUnlink(ctx, op, resolve_fn, reject_fn, do_reject, io),
+        .rmdir => runDeferredFsOpRmdir(ctx, op, resolve_fn, reject_fn, do_reject, io),
+        .rename => runDeferredFsOpRename(ctx, op, resolve_fn, reject_fn, do_reject, io),
+        .copy => runDeferredFsOpCopy(ctx, op, resolve_fn, reject_fn, do_reject, io),
+        .append => runDeferredFsOpAppend(ctx, op, resolve_fn, reject_fn, do_reject, io),
+        .write => runDeferredFsOpWrite(ctx, op, resolve_fn, reject_fn, do_reject, io),
+        .readlink => runDeferredFsOpReadlink(ctx, op, resolve_fn, reject_fn, do_reject, io),
+        .symlink => runDeferredFsOpSymlink(ctx, op, resolve_fn, reject_fn, do_reject, io),
+        .readFile => runDeferredFsOpReadFile(ctx, op, resolve_fn, reject_fn, do_reject, io),
+        .mkdirRecursive => runDeferredFsOpMkdirRecursive(ctx, op, resolve_fn, reject_fn, do_reject, io),
+        .rmdirRecursive => runDeferredFsOpRmdirRecursive(ctx, op, resolve_fn, reject_fn, do_reject, io),
     }
 }
 
-fn runDeferredFsOpReadFile(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_fn: jsc.JSObjectRef, reject_fn: jsc.JSObjectRef, do_reject: *const fn (jsc.JSContextRef, jsc.JSObjectRef, std.mem.Allocator, []const u8) void) void {
+fn runDeferredFsOpReadFile(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_fn: jsc.JSObjectRef, reject_fn: jsc.JSObjectRef, do_reject: *const fn (jsc.JSContextRef, jsc.JSObjectRef, std.mem.Allocator, []const u8) void, io: std.Io) void {
     const opts = globals.current_run_options orelse return;
     const allocator = op.allocator;
     if (!opts.permissions.allow_read) {
         do_reject(ctx, reject_fn, allocator, "Shu.fs.read requires --allow-read");
         return;
     }
-    const file = io_core.openFileAbsolute(op.path, .{}) catch |e| {
-        if (e == io_core.FileOpenError.FileNotFound) {
+    const file = libs_io.openFileAbsolute(op.path, .{}) catch |e| {
+        if (e == libs_io.FileOpenError.FileNotFound) {
             do_reject(ctx, reject_fn, allocator, "File not found");
             return;
         }
         do_reject(ctx, reject_fn, allocator, "read failed");
         return;
     };
-    const stat = file.stat() catch {
-        file.close();
+    const stat = file.stat(io) catch {
+        file.close(io);
         do_reject(ctx, reject_fn, allocator, "stat failed");
         return;
     };
     if (op.return_buffer and stat.size >= FS_MAP_THRESHOLD and stat.kind == .file) {
-        file.close();
-        var mapped = io_core.mapFileReadOnly(op.path) catch {
+        file.close(io);
+        var mapped = libs_io.mapFileReadOnly(op.path) catch {
             const content = allocator.alloc(u8, stat.size) catch {
                 do_reject(ctx, reject_fn, allocator, "out of memory");
                 return;
             };
             defer allocator.free(content);
-            var f = io_core.openFileAbsolute(op.path, .{}) catch {
+            var f = libs_io.openFileAbsolute(op.path, .{}) catch {
                 do_reject(ctx, reject_fn, allocator, "read failed");
                 return;
             };
-            defer f.close();
-            _ = f.readAll(content) catch {
+            defer f.close(io);
+            var f_reader = f.reader(io, &.{});
+            var read_vec = [_][]u8{content};
+            _ = f_reader.interface.readVecAll(&read_vec) catch {
                 do_reject(ctx, reject_fn, allocator, "read failed");
                 return;
             };
@@ -629,18 +637,20 @@ fn runDeferredFsOpReadFile(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resol
         }
         return;
     }
-    file.close();
+    file.close(io);
     const content = allocator.alloc(u8, stat.size + 1) catch {
         do_reject(ctx, reject_fn, allocator, "out of memory");
         return;
     };
     defer allocator.free(content);
-    var f = io_core.openFileAbsolute(op.path, .{}) catch {
+    var f = libs_io.openFileAbsolute(op.path, .{}) catch {
         do_reject(ctx, reject_fn, allocator, "read failed");
         return;
     };
-    defer f.close();
-    _ = f.readAll(content[0..stat.size]) catch {
+    defer f.close(io);
+    var f_reader = f.reader(io, &.{});
+    var read_vec = [_][]u8{content[0..stat.size]};
+    _ = f_reader.interface.readVecAll(&read_vec) catch {
         do_reject(ctx, reject_fn, allocator, "read failed");
         return;
     };
@@ -669,7 +679,8 @@ fn runDeferredFsOpReadFile(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resol
     _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 1, &res_arg, null);
 }
 
-fn runDeferredFsOpSymlink(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_fn: jsc.JSObjectRef, reject_fn: jsc.JSObjectRef, do_reject: *const fn (jsc.JSContextRef, jsc.JSObjectRef, std.mem.Allocator, []const u8) void) void {
+fn runDeferredFsOpSymlink(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_fn: jsc.JSObjectRef, reject_fn: jsc.JSObjectRef, do_reject: *const fn (jsc.JSContextRef, jsc.JSObjectRef, std.mem.Allocator, []const u8) void, io: std.Io) void {
+    _ = io;
     const opts = globals.current_run_options orelse return;
     const allocator = op.allocator;
     const path2 = op.path2 orelse return;
@@ -677,7 +688,7 @@ fn runDeferredFsOpSymlink(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolv
         do_reject(ctx, reject_fn, allocator, "Shu.fs.symlink requires --allow-write");
         return;
     }
-    io_core.symLinkAbsolute(op.path, path2, .{}) catch {
+    libs_io.symLinkAbsolute(op.path, path2, .{}) catch {
         do_reject(ctx, reject_fn, allocator, "symlink failed");
         return;
     };
@@ -685,19 +696,19 @@ fn runDeferredFsOpSymlink(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolv
     _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 0, &empty, null);
 }
 
-fn runDeferredFsOpStat(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_fn: jsc.JSObjectRef, reject_fn: jsc.JSObjectRef, do_reject: *const fn (jsc.JSContextRef, jsc.JSObjectRef, std.mem.Allocator, []const u8) void) void {
+fn runDeferredFsOpStat(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_fn: jsc.JSObjectRef, reject_fn: jsc.JSObjectRef, do_reject: *const fn (jsc.JSContextRef, jsc.JSObjectRef, std.mem.Allocator, []const u8) void, io: std.Io) void {
     const opts = globals.current_run_options orelse return;
     const allocator = op.allocator;
     if (!opts.permissions.allow_read) {
         do_reject(ctx, reject_fn, allocator, "Shu.fs.stat requires --allow-read");
         return;
     }
-    const file = io_core.openFileAbsolute(op.path, .{}) catch |e| {
-        if (e == io_core.FileOpenError.IsDir) {
-            var dir = io_core.openDirAbsolute(op.path, .{}) catch return;
-            defer dir.close();
-            const s = dir.stat() catch return;
-            const mtime_ns: i64 = @intCast(@min(s.mtime, std.math.maxInt(i64)));
+    const file = libs_io.openFileAbsolute(op.path, .{}) catch |e| {
+        if (e == libs_io.FileOpenError.IsDir) {
+            var dir = libs_io.openDirAbsolute(op.path, .{}) catch return;
+            defer dir.close(io);
+            const s = dir.stat(io) catch return;
+            const mtime_ns: i64 = @intCast(@min(s.mtime.nanoseconds, std.math.maxInt(i64)));
             const obj = makeStatObject(ctx, false, s.size, mtime_ns);
             var res_arg: [1]jsc.JSValueRef = .{obj};
             _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 1, &res_arg, null);
@@ -706,33 +717,33 @@ fn runDeferredFsOpStat(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_f
         do_reject(ctx, reject_fn, allocator, "stat failed");
         return;
     };
-    defer file.close();
-    const s = file.stat() catch {
+    defer file.close(io);
+    const s = file.stat(io) catch {
         do_reject(ctx, reject_fn, allocator, "stat failed");
         return;
     };
-    const mtime_ns: i64 = @intCast(@min(s.mtime, std.math.maxInt(i64)));
+    const mtime_ns: i64 = @intCast(@min(s.mtime.nanoseconds, std.math.maxInt(i64)));
     const obj = makeStatObject(ctx, true, s.size, mtime_ns);
     var res_arg: [1]jsc.JSValueRef = .{obj};
     _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 1, &res_arg, null);
 }
 
-fn runDeferredFsOpReaddir(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_fn: jsc.JSObjectRef, reject_fn: jsc.JSObjectRef, do_reject: *const fn (jsc.JSContextRef, jsc.JSObjectRef, std.mem.Allocator, []const u8) void) void {
+fn runDeferredFsOpReaddir(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_fn: jsc.JSObjectRef, reject_fn: jsc.JSObjectRef, do_reject: *const fn (jsc.JSContextRef, jsc.JSObjectRef, std.mem.Allocator, []const u8) void, io: std.Io) void {
     const opts = globals.current_run_options orelse return;
     const allocator = op.allocator;
     if (!opts.permissions.allow_read) {
         do_reject(ctx, reject_fn, allocator, "Shu.fs.readdir requires --allow-read");
         return;
     }
-    var dir = io_core.openDirAbsolute(op.path, .{ .iterate = true }) catch {
+    var dir = libs_io.openDirAbsolute(op.path, .{ .iterate = true }) catch {
         do_reject(ctx, reject_fn, allocator, "readdir failed");
         return;
     };
-    defer dir.close();
+    defer dir.close(io);
     var buf: [512]jsc.JSValueRef = undefined;
     var count: usize = 0;
     var iter = dir.iterate();
-    while (iter.next() catch {
+    while (iter.next(io) catch {
         do_reject(ctx, reject_fn, allocator, "readdir iterate failed");
         return;
     }) |entry| {
@@ -749,14 +760,15 @@ fn runDeferredFsOpReaddir(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolv
     _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 1, &res_arg, null);
 }
 
-fn runDeferredFsOpMkdir(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_fn: jsc.JSObjectRef, reject_fn: jsc.JSObjectRef, do_reject: *const fn (jsc.JSContextRef, jsc.JSObjectRef, std.mem.Allocator, []const u8) void) void {
+fn runDeferredFsOpMkdir(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_fn: jsc.JSObjectRef, reject_fn: jsc.JSObjectRef, do_reject: *const fn (jsc.JSContextRef, jsc.JSObjectRef, std.mem.Allocator, []const u8) void, io: std.Io) void {
+    _ = io;
     const opts = globals.current_run_options orelse return;
     const allocator = op.allocator;
     if (!opts.permissions.allow_write) {
         do_reject(ctx, reject_fn, allocator, "Shu.fs.mkdir requires --allow-write");
         return;
     }
-    io_core.makeDirAbsolute(op.path) catch {
+    libs_io.makeDirAbsolute(op.path) catch {
         do_reject(ctx, reject_fn, allocator, "mkdir failed");
         return;
     };
@@ -764,15 +776,15 @@ fn runDeferredFsOpMkdir(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_
     _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 0, &empty, null);
 }
 
-fn runDeferredFsOpExists(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_fn: jsc.JSObjectRef, reject_fn: jsc.JSObjectRef) void {
-    _ = reject_fn;
+fn runDeferredFsOpExists(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_fn: jsc.JSObjectRef, reject_fn: jsc.JSObjectRef, io: std.Io) void {
+    _ = .{ reject_fn, io };
     const opts = globals.current_run_options orelse return;
     if (!opts.permissions.allow_read) {
         var false_arg: [1]jsc.JSValueRef = .{jsc.JSValueMakeBoolean(ctx, false)};
         _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 1, &false_arg, null);
         return;
     }
-    io_core.accessAbsolute(op.path, .{}) catch {
+    libs_io.accessAbsolute(op.path, .{}) catch {
         var false_arg: [1]jsc.JSValueRef = .{jsc.JSValueMakeBoolean(ctx, false)};
         _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 1, &false_arg, null);
         return;
@@ -781,14 +793,15 @@ fn runDeferredFsOpExists(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve
     _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 1, &true_arg, null);
 }
 
-fn runDeferredFsOpUnlink(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_fn: jsc.JSObjectRef, reject_fn: jsc.JSObjectRef, do_reject: *const fn (jsc.JSContextRef, jsc.JSObjectRef, std.mem.Allocator, []const u8) void) void {
+fn runDeferredFsOpUnlink(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_fn: jsc.JSObjectRef, reject_fn: jsc.JSObjectRef, do_reject: *const fn (jsc.JSContextRef, jsc.JSObjectRef, std.mem.Allocator, []const u8) void, io: std.Io) void {
+    _ = io;
     const opts = globals.current_run_options orelse return;
     const allocator = op.allocator;
     if (!opts.permissions.allow_write) {
         do_reject(ctx, reject_fn, allocator, "Shu.fs.unlink requires --allow-write");
         return;
     }
-    io_core.deleteFileAbsolute(op.path) catch {
+    libs_io.deleteFileAbsolute(op.path) catch {
         do_reject(ctx, reject_fn, allocator, "unlink failed");
         return;
     };
@@ -796,14 +809,15 @@ fn runDeferredFsOpUnlink(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve
     _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 0, &empty, null);
 }
 
-fn runDeferredFsOpRmdir(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_fn: jsc.JSObjectRef, reject_fn: jsc.JSObjectRef, do_reject: *const fn (jsc.JSContextRef, jsc.JSObjectRef, std.mem.Allocator, []const u8) void) void {
+fn runDeferredFsOpRmdir(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_fn: jsc.JSObjectRef, reject_fn: jsc.JSObjectRef, do_reject: *const fn (jsc.JSContextRef, jsc.JSObjectRef, std.mem.Allocator, []const u8) void, io: std.Io) void {
+    _ = io;
     const opts = globals.current_run_options orelse return;
     const allocator = op.allocator;
     if (!opts.permissions.allow_write) {
         do_reject(ctx, reject_fn, allocator, "Shu.fs.rmdir requires --allow-write");
         return;
     }
-    io_core.deleteDirAbsolute(op.path) catch {
+    libs_io.deleteDirAbsolute(op.path) catch {
         do_reject(ctx, reject_fn, allocator, "rmdir failed");
         return;
     };
@@ -811,7 +825,8 @@ fn runDeferredFsOpRmdir(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_
     _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 0, &empty, null);
 }
 
-fn runDeferredFsOpRename(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_fn: jsc.JSObjectRef, reject_fn: jsc.JSObjectRef, do_reject: *const fn (jsc.JSContextRef, jsc.JSObjectRef, std.mem.Allocator, []const u8) void) void {
+fn runDeferredFsOpRename(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_fn: jsc.JSObjectRef, reject_fn: jsc.JSObjectRef, do_reject: *const fn (jsc.JSContextRef, jsc.JSObjectRef, std.mem.Allocator, []const u8) void, io: std.Io) void {
+    _ = io;
     const opts = globals.current_run_options orelse return;
     const allocator = op.allocator;
     const path2 = op.path2 orelse return;
@@ -819,7 +834,7 @@ fn runDeferredFsOpRename(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve
         do_reject(ctx, reject_fn, allocator, "Shu.fs.rename requires --allow-read and --allow-write");
         return;
     }
-    io_core.renameAbsolute(op.path, path2) catch {
+    libs_io.renameAbsolute(op.path, path2) catch {
         do_reject(ctx, reject_fn, allocator, "rename failed");
         return;
     };
@@ -827,7 +842,7 @@ fn runDeferredFsOpRename(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve
     _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 0, &empty, null);
 }
 
-fn runDeferredFsOpCopy(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_fn: jsc.JSObjectRef, reject_fn: jsc.JSObjectRef, do_reject: *const fn (jsc.JSContextRef, jsc.JSObjectRef, std.mem.Allocator, []const u8) void) void {
+fn runDeferredFsOpCopy(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_fn: jsc.JSObjectRef, reject_fn: jsc.JSObjectRef, do_reject: *const fn (jsc.JSContextRef, jsc.JSObjectRef, std.mem.Allocator, []const u8) void, io: std.Io) void {
     const opts = globals.current_run_options orelse return;
     const allocator = op.allocator;
     const dest = op.path2 orelse return;
@@ -835,41 +850,47 @@ fn runDeferredFsOpCopy(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_f
         do_reject(ctx, reject_fn, allocator, "Shu.fs.copy requires --allow-read and --allow-write");
         return;
     }
-    const src_file = io_core.openFileAbsolute(op.path, .{}) catch |e| {
-        if (e == io_core.FileOpenError.FileNotFound) {
+    const src_file = libs_io.openFileAbsolute(op.path, .{}) catch |e| {
+        if (e == libs_io.FileOpenError.FileNotFound) {
             do_reject(ctx, reject_fn, allocator, "File not found");
             return;
         }
         do_reject(ctx, reject_fn, allocator, "copy open src failed");
         return;
     };
-    defer src_file.close();
-    const src_stat = src_file.stat() catch {
+    defer src_file.close(io);
+    const src_stat = src_file.stat(io) catch {
         do_reject(ctx, reject_fn, allocator, "copy stat failed");
         return;
     };
-    const dest_file = io_core.createFileAbsolute(dest, .{}) catch {
+    const dest_file = libs_io.createFileAbsolute(dest, .{}) catch {
         do_reject(ctx, reject_fn, allocator, "copy create dest failed");
         return;
     };
-    defer dest_file.close();
+    defer dest_file.close(io);
     if (src_stat.size >= FS_MAP_THRESHOLD and src_stat.kind == .file) {
-        var mapped = io_core.mapFileReadOnly(op.path) catch {
+        var mapped = libs_io.mapFileReadOnly(op.path) catch {
             do_reject(ctx, reject_fn, allocator, "copy mmap failed");
             return;
         };
         defer mapped.deinit();
-        dest_file.writeAll(mapped.slice()) catch {
+        dest_file.writeStreamingAll(io, mapped.slice()) catch {
             do_reject(ctx, reject_fn, allocator, "copy write failed");
             return;
         };
     } else {
-        const content = src_file.readToEndAlloc(op.allocator, std.math.maxInt(usize)) catch {
+        const content = op.allocator.alloc(u8, src_stat.size) catch {
             do_reject(ctx, reject_fn, allocator, "copy read failed");
             return;
         };
         defer op.allocator.free(content);
-        dest_file.writeAll(content) catch {
+        var src_reader = src_file.reader(io, &.{});
+        var read_vec = [_][]u8{content};
+        _ = src_reader.interface.readVecAll(&read_vec) catch {
+            do_reject(ctx, reject_fn, allocator, "copy read failed");
+            return;
+        };
+        dest_file.writeStreamingAll(io, content) catch {
             do_reject(ctx, reject_fn, allocator, "copy write failed");
             return;
         };
@@ -878,7 +899,7 @@ fn runDeferredFsOpCopy(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_f
     _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 0, &empty, null);
 }
 
-fn runDeferredFsOpAppend(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_fn: jsc.JSObjectRef, reject_fn: jsc.JSObjectRef, do_reject: *const fn (jsc.JSContextRef, jsc.JSObjectRef, std.mem.Allocator, []const u8) void) void {
+fn runDeferredFsOpAppend(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_fn: jsc.JSObjectRef, reject_fn: jsc.JSObjectRef, do_reject: *const fn (jsc.JSContextRef, jsc.JSObjectRef, std.mem.Allocator, []const u8) void, io: std.Io) void {
     const opts = globals.current_run_options orelse return;
     const allocator = op.allocator;
     const content = op.content orelse return;
@@ -886,16 +907,16 @@ fn runDeferredFsOpAppend(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve
         do_reject(ctx, reject_fn, allocator, "Shu.fs.append requires --allow-write");
         return;
     }
-    const file = io_core.openFileAbsolute(op.path, .{ .mode = .read_write }) catch {
+    const file = libs_io.openFileAbsolute(op.path, .{ .mode = .read_write }) catch {
         do_reject(ctx, reject_fn, allocator, "append open failed");
         return;
     };
-    defer file.close();
-    file.seekFromEnd(0) catch {
-        do_reject(ctx, reject_fn, allocator, "append seek failed");
+    defer file.close(io);
+    const end_pos = file.length(io) catch {
+        do_reject(ctx, reject_fn, allocator, "append length failed");
         return;
     };
-    file.writeAll(content) catch {
+    file.writePositionalAll(io, content, end_pos) catch {
         do_reject(ctx, reject_fn, allocator, "append write failed");
         return;
     };
@@ -903,7 +924,7 @@ fn runDeferredFsOpAppend(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve
     _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 0, &empty, null);
 }
 
-fn runDeferredFsOpWrite(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_fn: jsc.JSObjectRef, reject_fn: jsc.JSObjectRef, do_reject: *const fn (jsc.JSContextRef, jsc.JSObjectRef, std.mem.Allocator, []const u8) void) void {
+fn runDeferredFsOpWrite(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_fn: jsc.JSObjectRef, reject_fn: jsc.JSObjectRef, do_reject: *const fn (jsc.JSContextRef, jsc.JSObjectRef, std.mem.Allocator, []const u8) void, io: std.Io) void {
     const opts = globals.current_run_options orelse return;
     const allocator = op.allocator;
     const content = op.content orelse return;
@@ -911,12 +932,12 @@ fn runDeferredFsOpWrite(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_
         do_reject(ctx, reject_fn, allocator, "Shu.fs.write requires --allow-write");
         return;
     }
-    const file = io_core.createFileAbsolute(op.path, .{}) catch {
+    const file = libs_io.createFileAbsolute(op.path, .{}) catch {
         do_reject(ctx, reject_fn, allocator, "write create failed");
         return;
     };
-    defer file.close();
-    file.writeAll(content) catch {
+    defer file.close(io);
+    file.writeStreamingAll(io, content) catch {
         do_reject(ctx, reject_fn, allocator, "write failed");
         return;
     };
@@ -924,15 +945,16 @@ fn runDeferredFsOpWrite(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_
     _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 0, &empty, null);
 }
 
-fn runDeferredFsOpReadlink(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_fn: jsc.JSObjectRef, reject_fn: jsc.JSObjectRef, do_reject: *const fn (jsc.JSContextRef, jsc.JSObjectRef, std.mem.Allocator, []const u8) void) void {
+fn runDeferredFsOpReadlink(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_fn: jsc.JSObjectRef, reject_fn: jsc.JSObjectRef, do_reject: *const fn (jsc.JSContextRef, jsc.JSObjectRef, std.mem.Allocator, []const u8) void, io: std.Io) void {
+    _ = io;
     const opts = globals.current_run_options orelse return;
     const allocator = op.allocator;
     if (!opts.permissions.allow_read) {
         do_reject(ctx, reject_fn, allocator, "Shu.fs.readlink requires --allow-read");
         return;
     }
-    var buf: [io_core.max_path_bytes]u8 = undefined;
-    const target = io_core.readLinkAbsolute(op.path, &buf) catch {
+    var buf: [libs_io.max_path_bytes]u8 = undefined;
+    const target = libs_io.readLinkAbsolute(op.path, &buf) catch {
         do_reject(ctx, reject_fn, allocator, "readlink failed");
         return;
     };
@@ -949,7 +971,8 @@ fn runDeferredFsOpReadlink(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resol
     _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 1, &res_arg, null);
 }
 
-fn runDeferredFsOpMkdirRecursive(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_fn: jsc.JSObjectRef, reject_fn: jsc.JSObjectRef, do_reject: *const fn (jsc.JSContextRef, jsc.JSObjectRef, std.mem.Allocator, []const u8) void) void {
+fn runDeferredFsOpMkdirRecursive(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_fn: jsc.JSObjectRef, reject_fn: jsc.JSObjectRef, do_reject: *const fn (jsc.JSContextRef, jsc.JSObjectRef, std.mem.Allocator, []const u8) void, io: std.Io) void {
+    _ = io;
     const opts = globals.current_run_options orelse return;
     const allocator = op.allocator;
     if (!opts.permissions.allow_write) {
@@ -961,32 +984,32 @@ fn runDeferredFsOpMkdirRecursive(ctx: jsc.JSContextRef, op: *const DeferredFsOp,
     _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 0, &empty, null);
 }
 
-/// 递归删除目录（仅 Zig 内部使用）；失败时返回 error，由调用方 reject
-fn deleteDirRecursiveAbsolute(allocator: std.mem.Allocator, path: []const u8) !void {
-    var dir = io_core.openDirAbsolute(path, .{ .iterate = true }) catch return error.OpenFailed;
-    defer dir.close();
+/// 递归删除目录（仅 Zig 内部使用）；失败时返回 error，由调用方 reject。io 用于 dir.close/iter.next（0.16）。
+fn deleteDirRecursiveAbsolute(allocator: std.mem.Allocator, path: []const u8, io: std.Io) !void {
+    var dir = libs_io.openDirAbsolute(path, .{ .iterate = true }) catch return error.OpenFailed;
+    defer dir.close(io);
     var iter = dir.iterate();
-    while (iter.next() catch return error.IterateFailed) |entry| {
-        const full = io_core.pathJoin(allocator, &.{ path, entry.name }) catch return error.OutOfMemory;
+    while (iter.next(io) catch return error.IterateFailed) |entry| {
+        const full = libs_io.pathJoin(allocator, &.{ path, entry.name }) catch return error.OutOfMemory;
         defer allocator.free(full);
-        var d = io_core.openDirAbsolute(full, .{ .iterate = true }) catch {
-            io_core.deleteFileAbsolute(full) catch {};
+        var d = libs_io.openDirAbsolute(full, .{ .iterate = true }) catch {
+            libs_io.deleteFileAbsolute(full) catch {};
             continue;
         };
-        d.close();
-        try deleteDirRecursiveAbsolute(allocator, full);
+        d.close(io);
+        try deleteDirRecursiveAbsolute(allocator, full, io);
     }
-    io_core.deleteDirAbsolute(path) catch return error.DeleteFailed;
+    libs_io.deleteDirAbsolute(path) catch return error.DeleteFailed;
 }
 
-fn runDeferredFsOpRmdirRecursive(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_fn: jsc.JSObjectRef, reject_fn: jsc.JSObjectRef, do_reject: *const fn (jsc.JSContextRef, jsc.JSObjectRef, std.mem.Allocator, []const u8) void) void {
+fn runDeferredFsOpRmdirRecursive(ctx: jsc.JSContextRef, op: *const DeferredFsOp, resolve_fn: jsc.JSObjectRef, reject_fn: jsc.JSObjectRef, do_reject: *const fn (jsc.JSContextRef, jsc.JSObjectRef, std.mem.Allocator, []const u8) void, io: std.Io) void {
     const opts = globals.current_run_options orelse return;
     const allocator = op.allocator;
     if (!opts.permissions.allow_write) {
         do_reject(ctx, reject_fn, allocator, "Shu.fs.rmdirRecursive requires --allow-write");
         return;
     }
-    deleteDirRecursiveAbsolute(op.allocator, op.path) catch {
+    deleteDirRecursiveAbsolute(op.allocator, op.path, io) catch {
         do_reject(ctx, reject_fn, allocator, "rmdirRecursive failed");
         return;
     };
@@ -994,11 +1017,12 @@ fn runDeferredFsOpRmdirRecursive(ctx: jsc.JSContextRef, op: *const DeferredFsOp,
     _ = jsc.JSObjectCallAsFunction(ctx, resolve_fn, null, 0, &empty, null);
 }
 
-/// 每轮事件循环调用：收割 AsyncFileIO 完成项并处理延迟 fs 队列（纯 Zig，无内联 JS）
+/// 每轮事件循环调用：收割 AsyncFileIO 完成项并处理延迟 fs 队列（纯 Zig，无内联 JS）。Zig 0.16：pollCompletions/close 需传入 io。
 pub fn drainFileIOCompletions(ctx: jsc.JSContextRef) void {
     const fio = globals.current_async_file_io orelse return;
     const state = fs_async_state orelse return;
-    const comps = fio.pollCompletions(0);
+    const io = libs_process.getProcessIo() orelse return;
+    const comps = fio.pollCompletions(io, 0);
     for (comps) |*c| {
         if (c.tag != .file_read and c.tag != .file_write) continue;
         const entry = state.pending.fetchRemove(c.user_data) orelse continue;
@@ -1006,7 +1030,7 @@ pub fn drainFileIOCompletions(ctx: jsc.JSContextRef) void {
         const file_err = c.file_err;
         jsc.JSValueUnprotect(ctx, e.resolve);
         jsc.JSValueUnprotect(ctx, e.reject);
-        defer e.file.close();
+        defer e.file.close(io);
         if (e.kind == .read) {
             if (file_err) |err| {
                 if (e.read_buffer) |buf| e.allocator.free(buf);
@@ -1080,21 +1104,22 @@ fn doSubmitRead(
     reject_fn: jsc.JSValueRef,
 ) void {
     const allocator = globals.current_allocator orelse return;
-    var file = io_core.openFileAbsolute(resolved, .{}) catch |e| {
-        if (e == io_core.FileOpenError.FileNotFound) {
+    const io = libs_process.getProcessIo() orelse return;
+    var file = libs_io.openFileAbsolute(resolved, .{}) catch |e| {
+        if (e == libs_io.FileOpenError.FileNotFound) {
             const msg = std.fmt.allocPrint(allocator, "File not found: {s}", .{resolved}) catch resolved;
             errors.reportToStderr(.{ .code = .file_not_found, .message = msg }) catch {};
             if (msg.ptr != resolved.ptr) allocator.free(msg);
         }
         return;
     };
-    const stat = file.stat() catch {
-        file.close();
+    const stat = file.stat(io) catch {
+        file.close(io);
         return;
     };
     const size = @min(stat.size, ASYNC_READ_MAX_BYTES);
     if (size == 0) {
-        file.close();
+        file.close(io);
         if (return_buffer) {
             var dc = allocator.create(FileBufferDeallocContext) catch return;
             dc.allocator = allocator;
@@ -1118,18 +1143,18 @@ fn doSubmitRead(
         return;
     }
     var state = ensureAsyncFileIO() catch {
-        file.close();
+        file.close(io);
         return;
     };
     const buffer = state.allocator.alloc(u8, size) catch {
-        file.close();
+        file.close(io);
         return;
     };
     const user_data = state.next_id;
     state.next_id +%= 1;
-    state.async_file_io.submitReadFile(file.handle, buffer.ptr, buffer.len, 0, user_data) catch |e| {
+    state.async_file_io.submitReadFile(io, file.handle, buffer.ptr, buffer.len, 0, user_data) catch |e| {
         state.allocator.free(buffer);
-        file.close();
+        file.close(io);
         const err_ref = jsc.JSStringCreateWithUTF8CString(@errorName(e).ptr);
         defer jsc.JSStringRelease(err_ref);
         var err_arg: [1]jsc.JSValueRef = .{jsc.JSValueMakeString(ctx, err_ref)};
@@ -1150,7 +1175,7 @@ fn doSubmitRead(
         jsc.JSValueUnprotect(ctx, resolve_fn);
         jsc.JSValueUnprotect(ctx, reject_fn);
         state.allocator.free(buffer);
-        file.close();
+        file.close(io);
     };
 }
 
@@ -1163,19 +1188,20 @@ fn doSubmitWrite(
     reject_fn: jsc.JSValueRef,
 ) void {
     const allocator = globals.current_allocator orelse return;
-    var file = io_core.createFileAbsolute(resolved, .{}) catch {
+    const io = libs_process.getProcessIo() orelse return;
+    var file = libs_io.createFileAbsolute(resolved, .{}) catch {
         allocator.free(content);
         return;
     };
     var state = ensureAsyncFileIO() catch {
-        file.close();
+        file.close(io);
         allocator.free(content);
         return;
     };
     const user_data = state.next_id;
     state.next_id +%= 1;
-    state.async_file_io.submitWriteFile(file.handle, content.ptr, content.len, 0, user_data) catch |e| {
-        file.close();
+    state.async_file_io.submitWriteFile(io, file.handle, content.ptr, content.len, 0, user_data) catch |e| {
+        file.close(io);
         allocator.free(content);
         const err_ref = jsc.JSStringCreateWithUTF8CString(@errorName(e).ptr);
         defer jsc.JSStringRelease(err_ref);
@@ -1195,7 +1221,7 @@ fn doSubmitWrite(
     }) catch {
         jsc.JSValueUnprotect(ctx, resolve_fn);
         jsc.JSValueUnprotect(ctx, reject_fn);
-        file.close();
+        file.close(io);
         allocator.free(content);
     };
 }
@@ -1458,7 +1484,7 @@ fn getResolvedPath(allocator: std.mem.Allocator, cwd: []const u8, ctx: jsc.JSCon
         return null;
     }
     const path = path_buf[0 .. n - 1];
-    const resolved = io_core.pathResolve(allocator, &.{ cwd, path }) catch {
+    const resolved = libs_io.pathResolve(allocator, &.{ cwd, path }) catch {
         allocator.free(path_buf);
         return null;
     };
@@ -1547,7 +1573,7 @@ fn createDeferredFsPromise(
 
 // ---------- 同步回调 ----------
 
-/// 从 options 对象读取 encoding：'utf8' 或未传则返回 string，null/'buffer' 则返回 Buffer（零拷贝）；大文件且 encoding 为 null 时用 io_core.mapFileReadOnly
+/// 从 options 对象读取 encoding：'utf8' 或未传则返回 string，null/'buffer' 则返回 Buffer（零拷贝）；大文件且 encoding 为 null 时用 libs_io.mapFileReadOnly
 fn readFileSyncCallback(
     ctx: jsc.JSContextRef,
     _: jsc.JSObjectRef,
@@ -1564,16 +1590,17 @@ fn readFileSyncCallback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.read requires --allow-read" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    const file = io_core.openFileAbsolute(resolved, .{}) catch |e| {
-        if (e == io_core.FileOpenError.FileNotFound) {
+    const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
+    const file = libs_io.openFileAbsolute(resolved, .{}) catch |e| {
+        if (e == libs_io.FileOpenError.FileNotFound) {
             const msg = std.fmt.allocPrint(allocator, "File not found: {s}", .{resolved}) catch resolved;
             errors.reportToStderr(.{ .code = .file_not_found, .message = msg }) catch {};
             if (msg.ptr != resolved.ptr) allocator.free(msg);
         }
         return jsc.JSValueMakeUndefined(ctx);
     };
-    const stat = file.stat() catch {
-        file.close();
+    const stat = file.stat(io) catch {
+        file.close(io);
         return jsc.JSValueMakeUndefined(ctx);
     };
     const return_buffer = blk: {
@@ -1593,13 +1620,16 @@ fn readFileSyncCallback(
         if (std.mem.eql(u8, enc, "buffer") or std.mem.eql(u8, enc, "binary") or enc.len == 0) break :blk true;
         break :blk false;
     };
-    // 大文件且返回 Buffer 时走 io_core.mapFileReadOnly，减少整文件读入与 OOM
+    // 大文件且返回 Buffer 时走 libs_io.mapFileReadOnly，减少整文件读入与 OOM
     if (return_buffer and stat.size >= FS_MAP_THRESHOLD and stat.kind == .file) {
-        file.close();
-        var mapped = io_core.mapFileReadOnly(resolved) catch {
-            var fallback_file = io_core.openFileAbsolute(resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
-            defer fallback_file.close();
-            const content = fallback_file.readToEndAlloc(allocator, std.math.maxInt(usize)) catch return jsc.JSValueMakeUndefined(ctx);
+        file.close(io);
+        var mapped = libs_io.mapFileReadOnly(resolved) catch {
+            var fallback_file = libs_io.openFileAbsolute(resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
+            defer fallback_file.close(io);
+            var fallback_reader = fallback_file.reader(io, &.{});
+            const content = fallback_reader.interface.allocRemaining(allocator, std.Io.Limit.unlimited) catch {
+                return jsc.JSValueMakeUndefined(ctx);
+            };
             var dc = allocator.create(FileBufferDeallocContext) catch {
                 allocator.free(content);
                 return jsc.JSValueMakeUndefined(ctx);
@@ -1633,38 +1663,42 @@ fn readFileSyncCallback(
         }
         return out.?;
     }
-    const content = file.readToEndAlloc(allocator, std.math.maxInt(usize)) catch {
-        file.close();
+    var file_reader = file.reader(io, &.{});
+    const raw = file_reader.interface.allocRemaining(allocator, std.Io.Limit.unlimited) catch {
+        file.close(io);
         return jsc.JSValueMakeUndefined(ctx);
     };
-    defer file.close();
+    defer allocator.free(raw);
+    defer file.close(io);
     if (return_buffer) {
         var dc = allocator.create(FileBufferDeallocContext) catch {
-            allocator.free(content);
+            allocator.free(raw);
             return jsc.JSValueMakeUndefined(ctx);
         };
         dc.allocator = allocator;
-        dc.slice = content;
+        dc.slice = allocator.dupe(u8, raw) catch {
+            allocator.destroy(dc);
+            return jsc.JSValueMakeUndefined(ctx);
+        };
         var exc: ?jsc.JSValueRef = null;
         const out = jsc.JSObjectMakeTypedArrayWithBytesNoCopy(
             ctx,
             .Uint8Array,
-            content.ptr,
-            content.len,
+            dc.slice.ptr,
+            dc.slice.len,
             fileBufferDeallocator,
             dc,
             @ptrCast(&exc),
         );
         if (out == null) {
-            allocator.free(content);
+            allocator.free(dc.slice);
             allocator.destroy(dc);
             if (exc) |e| exception[0] = e;
             return jsc.JSValueMakeUndefined(ctx);
         }
         return out.?;
     }
-    defer allocator.free(content);
-    const content_z = allocator.dupeZ(u8, content) catch return jsc.JSValueMakeUndefined(ctx);
+    const content_z = allocator.dupeZ(u8, raw) catch return jsc.JSValueMakeUndefined(ctx);
     defer allocator.free(content_z);
     const content_ref = jsc.JSStringCreateWithUTF8CString(content_z.ptr);
     defer jsc.JSStringRelease(content_ref);
@@ -1696,9 +1730,10 @@ fn writeFileSyncCallback(
     defer allocator.free(content_buf);
     const n = jsc.JSStringGetUTF8CString(content_js, content_buf.ptr, max_sz);
     const content = content_buf[0..if (n > 0) n - 1 else 0];
-    const file = io_core.createFileAbsolute(resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
-    defer file.close();
-    file.writeAll(content) catch return jsc.JSValueMakeUndefined(ctx);
+    const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
+    const file = libs_io.createFileAbsolute(resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
+    defer file.close(io);
+    file.writeStreamingAll(io, content) catch return jsc.JSValueMakeUndefined(ctx);
     return jsc.JSValueMakeUndefined(ctx);
 }
 
@@ -1718,12 +1753,13 @@ fn readdirSyncCallback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.readdir requires --allow-read" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    var dir = io_core.openDirAbsolute(resolved, .{ .iterate = true }) catch return jsc.JSValueMakeUndefined(ctx);
-    defer dir.close();
+    const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
+    var dir = libs_io.openDirAbsolute(resolved, .{ .iterate = true }) catch return jsc.JSValueMakeUndefined(ctx);
+    defer dir.close(io);
     var buf: [512]jsc.JSValueRef = undefined;
     var count: usize = 0;
     var iter = dir.iterate();
-    while (iter.next() catch return jsc.JSValueMakeUndefined(ctx)) |entry| {
+    while (iter.next(io) catch return jsc.JSValueMakeUndefined(ctx)) |entry| {
         if (count >= buf.len) break;
         const name_z = allocator.dupeZ(u8, entry.name) catch return jsc.JSValueMakeUndefined(ctx);
         defer allocator.free(name_z);
@@ -1752,7 +1788,7 @@ fn mkdirSyncCallback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.mkdir requires --allow-write" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    io_core.makeDirAbsolute(resolved) catch return jsc.JSValueMakeUndefined(ctx);
+    libs_io.makeDirAbsolute(resolved) catch return jsc.JSValueMakeUndefined(ctx);
     return jsc.JSValueMakeUndefined(ctx);
 }
 
@@ -1771,7 +1807,7 @@ fn existsSyncCallback(
     if (!opts.permissions.allow_read) {
         return jsc.JSValueMakeBoolean(ctx, false);
     }
-    io_core.accessAbsolute(resolved, .{}) catch return jsc.JSValueMakeBoolean(ctx, false);
+    libs_io.accessAbsolute(resolved, .{}) catch return jsc.JSValueMakeBoolean(ctx, false);
     return jsc.JSValueMakeBoolean(ctx, true);
 }
 
@@ -1791,19 +1827,20 @@ fn statSyncCallback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.stat requires --allow-read" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    const file = io_core.openFileAbsolute(resolved, .{}) catch |e| {
-        if (e == io_core.FileOpenError.IsDir) {
-            var dir = io_core.openDirAbsolute(resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
-            defer dir.close();
-            const s = dir.stat() catch return jsc.JSValueMakeUndefined(ctx);
-            const mtime_ns: i64 = @intCast(@min(s.mtime, std.math.maxInt(i64)));
+    const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
+    const file = libs_io.openFileAbsolute(resolved, .{}) catch |e| {
+        if (e == libs_io.FileOpenError.IsDir) {
+            var dir = libs_io.openDirAbsolute(resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
+            defer dir.close(io);
+            const s = dir.stat(io) catch return jsc.JSValueMakeUndefined(ctx);
+            const mtime_ns: i64 = @intCast(@min(s.mtime.nanoseconds, std.math.maxInt(i64)));
             return makeStatObject(ctx, false, s.size, mtime_ns);
         }
         return jsc.JSValueMakeUndefined(ctx);
     };
-    defer file.close();
-    const s = file.stat() catch return jsc.JSValueMakeUndefined(ctx);
-    const mtime_ns: i64 = @intCast(@min(s.mtime, std.math.maxInt(i64)));
+    defer file.close(io);
+    const s = file.stat(io) catch return jsc.JSValueMakeUndefined(ctx);
+    const mtime_ns: i64 = @intCast(@min(s.mtime.nanoseconds, std.math.maxInt(i64)));
     return makeStatObject(ctx, true, s.size, mtime_ns);
 }
 
@@ -1824,8 +1861,8 @@ fn realpathSyncCallback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.realpath requires --allow-read" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    var buf: [io_core.max_path_bytes]u8 = undefined;
-    const canonical = io_core.realpath(resolved, &buf) catch return jsc.JSValueMakeUndefined(ctx);
+    var buf: [libs_io.max_path_bytes]u8 = undefined;
+    const canonical = libs_io.realpath(resolved, &buf) catch return jsc.JSValueMakeUndefined(ctx);
     const dup = allocator.dupe(u8, canonical) catch return jsc.JSValueMakeUndefined(ctx);
     defer allocator.free(dup);
     const z = allocator.dupeZ(u8, dup) catch return jsc.JSValueMakeUndefined(ctx);
@@ -1852,18 +1889,19 @@ fn lstatSyncCallback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.lstat requires --allow-read" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    const dir_path = io_core.pathDirname(resolved) orelse ".";
-    const base = io_core.pathBasename(resolved);
-    var dir = io_core.openDirAbsolute(dir_path, .{}) catch return jsc.JSValueMakeUndefined(ctx);
-    defer dir.close();
+    const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
+    const dir_path = libs_io.pathDirname(resolved) orelse ".";
+    const base = libs_io.pathBasename(resolved);
+    var dir = libs_io.openDirAbsolute(dir_path, .{}) catch return jsc.JSValueMakeUndefined(ctx);
+    defer dir.close(io);
     const s = if (base.len == 0)
-        dir.stat() catch return jsc.JSValueMakeUndefined(ctx)
+        dir.stat(io) catch return jsc.JSValueMakeUndefined(ctx)
     else
-        dir.statFile(base) catch return jsc.JSValueMakeUndefined(ctx);
+        dir.statFile(io, base, .{}) catch return jsc.JSValueMakeUndefined(ctx);
     const is_file = (s.kind == .file);
     const is_dir = (s.kind == .directory);
     const is_sym = (s.kind == .sym_link);
-    const mtime_ns: i64 = @intCast(@min(s.mtime, std.math.maxInt(i64)));
+    const mtime_ns: i64 = @intCast(@min(s.mtime.nanoseconds, std.math.maxInt(i64)));
     return makeStatObjectWithSymlink(ctx, is_file, is_dir, is_sym, s.size, mtime_ns);
 }
 
@@ -1889,9 +1927,13 @@ fn truncateSyncCallback(
         const n = jsc.JSValueToNumber(ctx, arguments[1], null);
         if (n == n and n >= 0) len = @min(@as(u64, @intFromFloat(n)), std.math.maxInt(u64));
     }
-    const file = io_core.openFileAbsolute(resolved, .{ .mode = .read_write }) catch return jsc.JSValueMakeUndefined(ctx);
-    defer file.close();
-    std.posix.ftruncate(file.handle, len) catch return jsc.JSValueMakeUndefined(ctx);
+    const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
+    const file = libs_io.openFileAbsolute(resolved, .{ .mode = .read_write }) catch return jsc.JSValueMakeUndefined(ctx);
+    defer file.close(io);
+    if (std.c.ftruncate(file.handle, @as(std.c.off_t, @intCast(len))) < 0) {
+        std.posix.unexpectedErrno(std.c.errno(-1)) catch {};
+        return jsc.JSValueMakeUndefined(ctx);
+    }
     return jsc.JSValueMakeUndefined(ctx);
 }
 
@@ -1911,7 +1953,7 @@ fn accessSyncCallback(
     if (!opts.permissions.allow_read) {
         return jsc.JSValueMakeBoolean(ctx, false);
     }
-    var flags: io_core.FileOpenFlags = .{};
+    var flags: libs_io.FileOpenFlags = .{};
     if (argumentCount >= 2) {
         const m = jsc.JSValueToNumber(ctx, arguments[1], null);
         if (m == m) {
@@ -1923,7 +1965,7 @@ fn accessSyncCallback(
             // mode & 4 (X_OK) 无对应 Zig OpenMode，保留默认 .read_only 做存在性检查
         }
     }
-    io_core.accessAbsolute(resolved, flags) catch return jsc.JSValueMakeBoolean(ctx, false);
+    libs_io.accessAbsolute(resolved, flags) catch return jsc.JSValueMakeBoolean(ctx, false);
     return jsc.JSValueMakeBoolean(ctx, true);
 }
 
@@ -1943,11 +1985,12 @@ fn isEmptyDirSyncCallback(
     if (!opts.permissions.allow_read) {
         return jsc.JSValueMakeBoolean(ctx, false);
     }
-    var dir = io_core.openDirAbsolute(resolved, .{ .iterate = true }) catch return jsc.JSValueMakeBoolean(ctx, false);
-    defer dir.close();
+    const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeBoolean(ctx, false);
+    var dir = libs_io.openDirAbsolute(resolved, .{ .iterate = true }) catch return jsc.JSValueMakeBoolean(ctx, false);
+    defer dir.close(io);
     var iter = dir.iterate();
     var has_any = false;
-    while (iter.next() catch return jsc.JSValueMakeBoolean(ctx, false)) |_| {
+    while (iter.next(io) catch return jsc.JSValueMakeBoolean(ctx, false)) |_| {
         has_any = true;
         break;
     }
@@ -1971,14 +2014,15 @@ fn sizeSyncCallback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.size requires --allow-read" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    const file = io_core.openFileAbsolute(resolved, .{}) catch |e| {
-        if (e == io_core.FileOpenError.IsDir) {
+    const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
+    const file = libs_io.openFileAbsolute(resolved, .{}) catch |e| {
+        if (e == libs_io.FileOpenError.IsDir) {
             return jsc.JSValueMakeNumber(ctx, 0);
         }
         return jsc.JSValueMakeUndefined(ctx);
     };
-    defer file.close();
-    const s = file.stat() catch return jsc.JSValueMakeUndefined(ctx);
+    defer file.close(io);
+    const s = file.stat(io) catch return jsc.JSValueMakeUndefined(ctx);
     return jsc.JSValueMakeNumber(ctx, @floatFromInt(s.size));
 }
 
@@ -1996,9 +2040,10 @@ fn isFileSyncCallback(
     const resolved = getResolvedPath(allocator, opts.cwd, ctx, arguments, argumentCount, 0) orelse return jsc.JSValueMakeBoolean(ctx, false);
     defer allocator.free(resolved);
     if (!opts.permissions.allow_read) return jsc.JSValueMakeBoolean(ctx, false);
-    const file = io_core.openFileAbsolute(resolved, .{}) catch return jsc.JSValueMakeBoolean(ctx, false);
-    defer file.close();
-    const s = file.stat() catch return jsc.JSValueMakeBoolean(ctx, false);
+    const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeBoolean(ctx, false);
+    const file = libs_io.openFileAbsolute(resolved, .{}) catch return jsc.JSValueMakeBoolean(ctx, false);
+    defer file.close(io);
+    const s = file.stat(io) catch return jsc.JSValueMakeBoolean(ctx, false);
     return jsc.JSValueMakeBoolean(ctx, s.kind == .file);
 }
 
@@ -2016,9 +2061,10 @@ fn isDirectorySyncCallback(
     const resolved = getResolvedPath(allocator, opts.cwd, ctx, arguments, argumentCount, 0) orelse return jsc.JSValueMakeBoolean(ctx, false);
     defer allocator.free(resolved);
     if (!opts.permissions.allow_read) return jsc.JSValueMakeBoolean(ctx, false);
-    var dir = io_core.openDirAbsolute(resolved, .{}) catch return jsc.JSValueMakeBoolean(ctx, false);
-    defer dir.close();
-    _ = dir.stat() catch return jsc.JSValueMakeBoolean(ctx, false);
+    const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeBoolean(ctx, false);
+    var dir = libs_io.openDirAbsolute(resolved, .{}) catch return jsc.JSValueMakeBoolean(ctx, false);
+    defer dir.close(io);
+    _ = dir.stat(io) catch return jsc.JSValueMakeBoolean(ctx, false);
     return jsc.JSValueMakeBoolean(ctx, true);
 }
 
@@ -2039,8 +2085,9 @@ fn readdirWithStatsSyncCallback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.readdirWithStats requires --allow-read" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    var dir = io_core.openDirAbsolute(resolved, .{ .iterate = true }) catch return jsc.JSValueMakeUndefined(ctx);
-    defer dir.close();
+    const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
+    var dir = libs_io.openDirAbsolute(resolved, .{ .iterate = true }) catch return jsc.JSValueMakeUndefined(ctx);
+    defer dir.close(io);
     var buf: [512]jsc.JSValueRef = undefined;
     var count: usize = 0;
     var iter = dir.iterate();
@@ -2056,13 +2103,13 @@ fn readdirWithStatsSyncCallback(
     defer jsc.JSStringRelease(k_size);
     const k_mtimeMs = jsc.JSStringCreateWithUTF8CString("mtimeMs");
     defer jsc.JSStringRelease(k_mtimeMs);
-    while (iter.next() catch return jsc.JSValueMakeUndefined(ctx)) |entry| {
+    while (iter.next(io) catch return jsc.JSValueMakeUndefined(ctx)) |entry| {
         if (count >= buf.len) break;
-        const s = dir.statFile(entry.name) catch continue;
+        const s = dir.statFile(io, entry.name, .{}) catch continue;
         const is_file = (s.kind == .file);
         const is_dir = (s.kind == .directory);
         const is_sym = (s.kind == .sym_link);
-        const mtime_ns: i64 = @intCast(@min(s.mtime, std.math.maxInt(i64)));
+        const mtime_ns: i64 = @intCast(@min(s.mtime.nanoseconds, std.math.maxInt(i64)));
         const item = jsc.JSObjectMake(ctx, null, null);
         const name_z = allocator.dupeZ(u8, entry.name) catch continue;
         defer allocator.free(name_z);
@@ -2099,22 +2146,23 @@ fn ensureFileSyncCallback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.ensureFile requires --allow-read and --allow-write" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    const file = io_core.openFileAbsolute(resolved, .{}) catch |e| {
-        if (e == io_core.FileOpenError.FileNotFound) {
-            const parent = io_core.pathDirname(resolved) orelse return jsc.JSValueMakeUndefined(ctx);
+    const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
+    const file = libs_io.openFileAbsolute(resolved, .{}) catch |e| {
+        if (e == libs_io.FileOpenError.FileNotFound) {
+            const parent = libs_io.pathDirname(resolved) orelse return jsc.JSValueMakeUndefined(ctx);
             if (parent.len > 0 and parent.len < resolved.len) {
                 makeDirRecursiveAbsolute(allocator, parent);
             }
-            var f = io_core.createFileAbsolute(resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
-            f.close();
+            var f = libs_io.createFileAbsolute(resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
+            f.close(io);
             return jsc.JSValueMakeUndefined(ctx);
         }
-        if (e == io_core.FileOpenError.IsDir) {
+        if (e == libs_io.FileOpenError.IsDir) {
             errors.reportToStderr(.{ .code = .file_not_found, .message = "Shu.fs.ensureFile: path is a directory" }) catch {};
         }
         return jsc.JSValueMakeUndefined(ctx);
     };
-    file.close();
+    file.close(io);
     return jsc.JSValueMakeUndefined(ctx);
 }
 
@@ -2134,7 +2182,7 @@ fn unlinkSyncCallback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.unlink requires --allow-write" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    io_core.deleteFileAbsolute(resolved) catch return jsc.JSValueMakeUndefined(ctx);
+    libs_io.deleteFileAbsolute(resolved) catch return jsc.JSValueMakeUndefined(ctx);
     return jsc.JSValueMakeUndefined(ctx);
 }
 
@@ -2154,7 +2202,7 @@ fn rmdirSyncCallback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.rmdir requires --allow-write" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    io_core.deleteDirAbsolute(resolved) catch return jsc.JSValueMakeUndefined(ctx);
+    libs_io.deleteDirAbsolute(resolved) catch return jsc.JSValueMakeUndefined(ctx);
     return jsc.JSValueMakeUndefined(ctx);
 }
 
@@ -2177,11 +2225,11 @@ fn renameSyncCallback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.rename requires --allow-read and --allow-write" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    io_core.renameAbsolute(old_resolved, new_resolved) catch return jsc.JSValueMakeUndefined(ctx);
+    libs_io.renameAbsolute(old_resolved, new_resolved) catch return jsc.JSValueMakeUndefined(ctx);
     return jsc.JSValueMakeUndefined(ctx);
 }
 
-/// 同步复制文件：copySync(srcPath, destPath)，需要源可读、目标可写；大文件走 io_core.mapFileReadOnly 减少拷贝与 OOM
+/// 同步复制文件：copySync(srcPath, destPath)，需要源可读、目标可写；大文件走 libs_io.mapFileReadOnly 减少拷贝与 OOM
 fn copySyncCallback(
     ctx: jsc.JSContextRef,
     _: jsc.JSObjectRef,
@@ -2201,39 +2249,43 @@ fn copySyncCallback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.copy requires --allow-read and --allow-write" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    const src_file = io_core.openFileAbsolute(src_resolved, .{}) catch |e| {
-        if (e == io_core.FileOpenError.FileNotFound) {
+    const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
+    const src_file = libs_io.openFileAbsolute(src_resolved, .{}) catch |e| {
+        if (e == libs_io.FileOpenError.FileNotFound) {
             const msg = std.fmt.allocPrint(allocator, "File not found: {s}", .{src_resolved}) catch src_resolved;
             errors.reportToStderr(.{ .code = .file_not_found, .message = msg }) catch {};
             if (msg.ptr != src_resolved.ptr) allocator.free(msg);
         }
         return jsc.JSValueMakeUndefined(ctx);
     };
-    const src_stat = src_file.stat() catch {
-        src_file.close();
+    const src_stat = src_file.stat(io) catch {
+        src_file.close(io);
         return jsc.JSValueMakeUndefined(ctx);
     };
     if (src_stat.size >= FS_MAP_THRESHOLD and src_stat.kind == .file) {
-        src_file.close();
-        var mapped = io_core.mapFileReadOnly(src_resolved) catch {
-            var fallback_src = io_core.openFileAbsolute(src_resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
-            defer fallback_src.close();
-            const content = fallback_src.readToEndAlloc(allocator, std.math.maxInt(usize)) catch return jsc.JSValueMakeUndefined(ctx);
+        src_file.close(io);
+        var mapped = libs_io.mapFileReadOnly(src_resolved) catch {
+            var fallback_src = libs_io.openFileAbsolute(src_resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
+            defer fallback_src.close(io);
+            const content = allocator.alloc(u8, src_stat.size) catch return jsc.JSValueMakeUndefined(ctx);
             defer allocator.free(content);
-            const dest_file = io_core.createFileAbsolute(dest_resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
-            defer dest_file.close();
-            dest_file.writeAll(content) catch return jsc.JSValueMakeUndefined(ctx);
+            var fallback_src_reader = fallback_src.reader(io, &.{});
+            var read_vec = [_][]u8{content};
+            _ = fallback_src_reader.interface.readVecAll(&read_vec) catch return jsc.JSValueMakeUndefined(ctx);
+            const dest_file = libs_io.createFileAbsolute(dest_resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
+            defer dest_file.close(io);
+            dest_file.writeStreamingAll(io, content) catch return jsc.JSValueMakeUndefined(ctx);
             return jsc.JSValueMakeUndefined(ctx);
         };
         defer mapped.deinit();
-        const dest_file = io_core.createFileAbsolute(dest_resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
-        defer dest_file.close();
-        dest_file.writeAll(mapped.slice()) catch return jsc.JSValueMakeUndefined(ctx);
+        const dest_file = libs_io.createFileAbsolute(dest_resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
+        defer dest_file.close(io);
+        dest_file.writeStreamingAll(io, mapped.slice()) catch return jsc.JSValueMakeUndefined(ctx);
         return jsc.JSValueMakeUndefined(ctx);
     }
-    src_file.close();
-    // §3.1/§5 小文件用 io_core.copyFileAbsolute，由内核 copy_file_range/sendfile 等实现，避免 readToEndAlloc+writeAll 用户态拷贝
-    io_core.copyFileAbsolute(src_resolved, dest_resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
+    src_file.close(io);
+    // §3.1/§5 小文件用 libs_io.copyFileAbsolute，由内核 copy_file_range/sendfile 等实现，避免 readToEndAlloc+writeAll 用户态拷贝
+    libs_io.copyFileAbsolute(src_resolved, dest_resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
     return jsc.JSValueMakeUndefined(ctx);
 }
 
@@ -2263,32 +2315,32 @@ fn appendSyncCallback(
     defer allocator.free(content_buf);
     const n = jsc.JSStringGetUTF8CString(content_js, content_buf.ptr, max_sz);
     const content = content_buf[0..if (n > 0) n - 1 else 0];
-    var file = io_core.openFileAbsolute(resolved, .{ .mode = .write_only }) catch |e| {
-        if (e == io_core.FileOpenError.FileNotFound) {
-            var new_file = io_core.createFileAbsolute(resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
-            defer new_file.close();
-            new_file.writeAll(content) catch return jsc.JSValueMakeUndefined(ctx);
+    const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
+    var file = libs_io.openFileAbsolute(resolved, .{ .mode = .write_only }) catch |e| {
+        if (e == libs_io.FileOpenError.FileNotFound) {
+            var new_file = libs_io.createFileAbsolute(resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
+            defer new_file.close(io);
+            new_file.writeStreamingAll(io, content) catch return jsc.JSValueMakeUndefined(ctx);
             return jsc.JSValueMakeUndefined(ctx);
         }
         return jsc.JSValueMakeUndefined(ctx);
     };
-    defer file.close();
-    const end_pos = file.getEndPos() catch return jsc.JSValueMakeUndefined(ctx);
-    file.seekTo(end_pos) catch return jsc.JSValueMakeUndefined(ctx);
-    file.writeAll(content) catch return jsc.JSValueMakeUndefined(ctx);
+    defer file.close(io);
+    const end_pos = file.length(io) catch return jsc.JSValueMakeUndefined(ctx);
+    file.writePositionalAll(io, content, end_pos) catch return jsc.JSValueMakeUndefined(ctx);
     return jsc.JSValueMakeUndefined(ctx);
 }
 
 /// 递归创建目录（mkdir -p）：先创建父目录再创建当前路径
 fn makeDirRecursiveAbsolute(allocator: std.mem.Allocator, absolute_path: []const u8) void {
-    io_core.makeDirAbsolute(absolute_path) catch |e| {
+    libs_io.makeDirAbsolute(absolute_path) catch |e| {
         switch (e) {
             error.PathAlreadyExists => return,
             else => {
-                const parent = io_core.pathDirname(absolute_path) orelse return;
+                const parent = libs_io.pathDirname(absolute_path) orelse return;
                 if (parent.len == 0 or parent.len >= absolute_path.len) return;
                 makeDirRecursiveAbsolute(allocator, parent);
-                io_core.makeDirAbsolute(absolute_path) catch return;
+                libs_io.makeDirAbsolute(absolute_path) catch return;
             },
         }
     };
@@ -2314,7 +2366,7 @@ fn symlinkSyncCallback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.symlink requires --allow-write" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    io_core.symLinkAbsolute(target_resolved, link_resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
+    libs_io.symLinkAbsolute(target_resolved, link_resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
     return jsc.JSValueMakeUndefined(ctx);
 }
 
@@ -2335,8 +2387,8 @@ fn readlinkSyncCallback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.readlink requires --allow-read" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    var buf: [io_core.max_path_bytes]u8 = undefined;
-    const target = io_core.readLinkAbsolute(resolved, &buf) catch return jsc.JSValueMakeUndefined(ctx);
+    var buf: [libs_io.max_path_bytes]u8 = undefined;
+    const target = libs_io.readLinkAbsolute(resolved, &buf) catch return jsc.JSValueMakeUndefined(ctx);
     const target_dup = allocator.dupe(u8, target) catch return jsc.JSValueMakeUndefined(ctx);
     defer allocator.free(target_dup);
     const target_z = allocator.dupeZ(u8, target_dup) catch return jsc.JSValueMakeUndefined(ctx);
@@ -2384,13 +2436,13 @@ fn rmdirRecursiveSyncCallback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.rmdir requires --allow-write" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    io_core.deleteTreeAbsolute(resolved) catch return jsc.JSValueMakeUndefined(ctx);
+    libs_io.deleteTreeAbsolute(allocator, resolved) catch return jsc.JSValueMakeUndefined(ctx);
     return jsc.JSValueMakeUndefined(ctx);
 }
 
 // ---------- 异步回调 ----------
 
-/// Shu.fs.read(path [, options])：异步读文件，走 io_core.AsyncFileIO；Zig 侧直接 new Promise(executor) 无脚本解析；options.encoding 为 null/'buffer' 时返回 Buffer，否则 UTF-8 字符串；失败时回退 setTimeout+readSync
+/// Shu.fs.read(path [, options])：异步读文件，走 libs_io.AsyncFileIO；Zig 侧直接 new Promise(executor) 无脚本解析；options.encoding 为 null/'buffer' 时返回 Buffer，否则 UTF-8 字符串；失败时回退 setTimeout+readSync
 fn readFileAsyncCallback(
     ctx: jsc.JSContextRef,
     _: jsc.JSObjectRef,
@@ -2450,7 +2502,7 @@ fn readFileAsyncCallback(
     return jsc.JSObjectCallAsConstructor(ctx, promise_ctor, 1, &executor_arg, null);
 }
 
-/// Shu.fs.write(path, content)：异步写文件，走 io_core.AsyncFileIO；Zig 侧直接 new Promise(executor) 无脚本解析；init 失败或 content 超 512KB 时回退 setTimeout+writeSync
+/// Shu.fs.write(path, content)：异步写文件，走 libs_io.AsyncFileIO；Zig 侧直接 new Promise(executor) 无脚本解析；init 失败或 content 超 512KB 时回退 setTimeout+writeSync
 fn writeFileAsyncCallback(
     ctx: jsc.JSContextRef,
     _: jsc.JSObjectRef,
