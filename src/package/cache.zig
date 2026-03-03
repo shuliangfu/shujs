@@ -1,6 +1,6 @@
-// 依赖缓存：npm/JSR 等 tarball 按 (registry, name, version) 存本地；HTTPS URL 单文件按 URL 哈希缓存
+// 依赖缓存：npm 包按 (registry, name, version) 存已解压目录（不压缩，与 Deno/Bun 一致）；HTTPS URL 单文件按 URL 哈希缓存
 // 参考：docs/PACKAGE_DESIGN.md §7
-// 约定：调用方负责 free 返回的路径字符串（getCacheRoot、getCachedTarball、getCachedUrlPath、urlCachePath 的返回值）
+// 约定：调用方负责 free 返回的路径字符串（getCacheRoot、getCachedPackageDirPath/getCachedPackageDir、getCachedUrlPath、urlCachePath 的返回值）
 // 文件/目录与路径经 io_core（§3.0）
 
 const std = @import("std");
@@ -112,42 +112,26 @@ pub fn putCachedMetadata(allocator: std.mem.Allocator, cache_root: []const u8, r
     try f.writeAll(body);
 }
 
-/// 若缓存中已有该 key 的 tarball，返回其绝对路径；否则返回 null。返回的路径由调用方 free。
-pub fn getCachedTarball(allocator: std.mem.Allocator, cache_root: []const u8, key: []const u8) ?[]const u8 {
-    const filename = std.mem.concat(allocator, u8, &.{ key, ".tgz" }) catch return null;
-    defer allocator.free(filename);
-    const full = io_core.pathJoin(allocator, &.{ cache_root, CONTENT_DIR, filename }) catch return null;
-    var f = io_core.openFileAbsolute(full, .{}) catch {
-        allocator.free(full);
-        return null;
-    };
-    f.close();
-    return full;
+// -----------------------------------------------------------------------------
+// npm 包缓存：与 Deno/Bun 一致，存已解压目录（不存 .tgz 压缩），路径为 content/<key>/（含 package.json 等）
+// -----------------------------------------------------------------------------
+
+/// 返回缓存包目录的绝对路径（用于解压或复制）；key 如 npm/registry.npmjs.org/name/version。调用方 free。
+pub fn getCachedPackageDirPath(allocator: std.mem.Allocator, cache_root: []const u8, key: []const u8) ![]const u8 {
+    return io_core.pathJoin(allocator, &.{ cache_root, CONTENT_DIR, key });
 }
 
-/// 将 tarball_path 指向的文件复制到缓存目录下 key.tgz；必要时递归创建父目录。key 中可含子路径（如 npm/registry.npmjs.org/pkg/1.0.0），会创建对应子目录。
-pub fn putCachedTarball(allocator: std.mem.Allocator, cache_root: []const u8, key: []const u8, tarball_path: []const u8) !void {
-    io_core.makePathAbsolute(cache_root) catch {};
-    var cache_dir = try io_core.openDirAbsolute(cache_root, .{});
-    defer cache_dir.close();
-    if (io_core.pathDirname(key)) |dir| {
-        const content_and_dir = try io_core.pathJoin(allocator, &.{ CONTENT_DIR, dir });
-        defer allocator.free(content_and_dir);
-        const dest_dir_abs = try io_core.pathJoin(allocator, &.{ cache_root, content_and_dir });
-        defer allocator.free(dest_dir_abs);
-        io_core.makePathAbsolute(dest_dir_abs) catch {}; // 已存在则忽略
-    } else {
-        const content_dir_abs = try io_core.pathJoin(allocator, &.{ cache_root, CONTENT_DIR });
-        defer allocator.free(content_dir_abs);
-        io_core.makePathAbsolute(content_dir_abs) catch {};
-    }
-    const filename = try std.mem.concat(allocator, u8, &.{ key, ".tgz" });
-    defer allocator.free(filename);
-    const content_filename = try io_core.pathJoin(allocator, &.{ CONTENT_DIR, filename });
-    defer allocator.free(content_filename);
-    const dest_abs = try io_core.pathJoin(allocator, &.{ cache_root, content_filename });
-    defer allocator.free(dest_abs);
-    try io_core.copyFileAbsolute(tarball_path, dest_abs, .{});
+/// 若缓存中已有该 key 的已解压包目录（且含 package.json），返回其绝对路径；否则返回 null。返回的路径由调用方 free。
+pub fn getCachedPackageDir(allocator: std.mem.Allocator, cache_root: []const u8, key: []const u8) ?[]const u8 {
+    const dir_path = io_core.pathJoin(allocator, &.{ cache_root, CONTENT_DIR, key }) catch return null;
+    defer allocator.free(dir_path);
+    var d = io_core.openDirAbsolute(dir_path, .{}) catch return null;
+    defer d.close();
+    const pkg_json = io_core.pathJoin(allocator, &.{ dir_path, "package.json" }) catch return null;
+    defer allocator.free(pkg_json);
+    var f = io_core.openFileAbsolute(pkg_json, .{}) catch return null;
+    f.close();
+    return allocator.dupe(u8, dir_path) catch return null;
 }
 
 /// 从 URL 中截取路径部分（首个 / 至 ? 或 # 或结尾），再取扩展名（如 .ts、.js）

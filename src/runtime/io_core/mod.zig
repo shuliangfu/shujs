@@ -79,6 +79,9 @@ pub const readReaderUpTo = file.readReaderUpTo;
 /// 异步文件 I/O：submitReadFile/submitWriteFile + pollCompletions 返回 tag=file_read/file_write；三平台实现均在 file.zig 内
 pub const AsyncFileIO = file.AsyncFileIO;
 
+/// 统一 HTTP 客户端：request(任意方法)/get(GET 便捷)，供 package/registry、shu:fetch 使用；支持超时与 Zig/curl 双路径
+pub const http = @import("http.zig");
+
 // 按 OS 选择实现，编译时只包含当前平台
 const backend = switch (builtin.os.tag) {
     .linux => @import("linux.zig"),

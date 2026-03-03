@@ -184,7 +184,7 @@ pub fn readReaderUpTo(allocator: std.mem.Allocator, reader: *std.io.Reader, max_
         var vec: [1][]u8 = .{buf[0..to_read]};
         const n = std.io.Reader.readVec(reader, &vec) catch |e| switch (e) {
             error.EndOfStream => break,
-            else => return error.ReadFailed,
+            else => return e, // 传播底层错误（连接断开、解压失败等），便于排查
         };
         if (n == 0) break;
         list.appendSlice(allocator, buf[0..n]) catch return error.OutOfMemory;
@@ -543,7 +543,7 @@ const AsyncFileIODarwin = struct {
             .fd = fd,
             .caller_user_data = caller_user_data,
             .op = .write,
-            .buffer_ptr = @constCast(@ptrCast(&[_]u8{})),
+            .buffer_ptr = @ptrCast(@constCast(&[_]u8{})),
             .data_ptr = data_ptr,
             .len = len,
             .offset = offset,

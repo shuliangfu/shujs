@@ -146,7 +146,7 @@ pub const TarballGetOptions = struct {
 };
 
 const tarball_default_accept = "*/*";
-/// 仅请求 gzip，避免服务端返回 br；extractTarballToDir 仅支持 gzip 解压，写回 .tgz 的必须是 gzip 流。
+/// 请求 gzip 以减小下载体积、加快下载；body 在 HTTP 层解压后返回 tar 写入 .tgz，解压结果为 0 字节时不替换 body、原样写入由 extract 处理。
 const tarball_default_accept_encoding = "gzip";
 
 // -----------------------------------------------------------------------------
@@ -248,7 +248,7 @@ fn handleZigPathBrResponse(
     url: []const u8,
     options: RequestOptions,
 ) !Response {
-    var transfer_buf: [64]u8 = undefined;
+    var transfer_buf: [64 * 1024]u8 = undefined;
     const raw_reader = req.reader.bodyReader(&transfer_buf, br_info.transfer_encoding, br_info.content_length);
     const raw_body = file.readReaderUpTo(allocator, raw_reader, options.max_response_bytes) catch |e| {
         if (e == error.ResponseTooLarge) debugLogResponseTooLarge(url, options.max_response_bytes);
@@ -429,13 +429,13 @@ pub fn getWithCurlClient(curl_client: *CurlClient, allocator: std.mem.Allocator,
     return resp.body;
 }
 
-/// tarball 下载专用：默认 accept "*/*"、accept_encoding "br, gzip, deflate"、raw_body true、keep_compressed true，返回服务端原始压缩字节（gzip/br 等）以便写入 .tgz 文件，由 extractTarballToDir 解压；options 里传了则覆盖。调用方 free 返回的切片。
+/// tarball 下载专用：默认 raw_body true、keep_compressed false，在 HTTP 层解压 gzip 后返回 tar 字节，写入 .tgz 文件后由 extractRawTarFromSlice 解析，避免镜像 gzip 与本地流式解压不兼容。调用方 free 返回的切片。
 pub fn getTarballWithCurlClient(curl_client: *CurlClient, allocator: std.mem.Allocator, url: []const u8, options: TarballGetOptions) ![]const u8 {
     return getWithCurlClient(curl_client, allocator, url, .{
         .accept = options.accept orelse tarball_default_accept,
         .accept_encoding = options.accept_encoding orelse tarball_default_accept_encoding,
         .raw_body = options.raw_body orelse true,
-        .keep_compressed = true,
+        .keep_compressed = false,
         .max_bytes = options.max_bytes,
         .timeout_sec = options.timeout_sec,
         .user_agent = options.user_agent,
@@ -555,7 +555,8 @@ fn requestViaZigWithClient(client: *std.http.Client, allocator: std.mem.Allocato
     // 先取 content_encoding / content_length，再调 reader()（reader 会 invalidate response.head 的字符串）
     const content_encoding = response.head.content_encoding;
     const content_length = response.head.content_length;
-    var transfer_buf: [64]u8 = undefined;
+    // 大缓冲（64KB）减少读次数，避免大 body（如 registry 元数据数 MB）时因小缓冲导致读取过慢、连接被服务端或中间层关闭而 body_truncated
+    var transfer_buf: [64 * 1024]u8 = undefined;
     const raw_reader = response.reader(&transfer_buf);
     const raw_body = file.readReaderUpTo(allocator, raw_reader, options.max_response_bytes) catch |e| {
         if (e == error.ResponseTooLarge) debugLogResponseTooLarge(url, options.max_response_bytes);
@@ -694,36 +695,61 @@ fn firstContentEncoding(enc: []const u8) []const u8 {
     return trimmed;
 }
 
-/// 当 resp.content_encoding 为 br/gzip/deflate 时，用 shu_zlib 解压 resp.body 并替换为解压结果，
+/// Gzip 魔术字节：1f 8b，用于无 Content-Encoding 时按 body 内容判断是否 gzip。
+const gzip_magic: [2]u8 = .{ 0x1f, 0x8b };
+
+/// 当 resp.content_encoding 为 br/gzip/deflate 时，用 shu_zlib 解压 resp.body 并替换为解压结果；
+/// 若 content_encoding 为空但 body 以 gzip magic (1f 8b) 开头，也按 gzip 解压（兼容不返回 Content-Encoding 的镜像）。
 /// 释放原 body 与 content_encoding。支持 "gzip, deflate" 等只取第一项。供 raw_body 请求返回前自动解压，调用方拿到的即为解压后 body。
 /// 解压失败则返回错误，不写错误数据。SHU_DEBUG_HTTP 非空时打印 content_encoding 与 body 大小便于调试。
 fn decompressResponseBodyIfNeeded(allocator: std.mem.Allocator, resp: *Response) !void {
-    const enc_raw = resp.content_encoding orelse return;
-    defer allocator.free(enc_raw);
-    resp.content_encoding = null;
-    const enc = firstContentEncoding(enc_raw);
-    if (enc.len == 0) return;
     const body_before = resp.body.len;
-    if (std.ascii.eqlIgnoreCase(enc, "br")) {
-        const out = try shu_zlib.decompressBrotli(allocator, resp.body);
-        allocator.free(resp.body);
-        resp.body = out;
-        debugLogDecompress("br", body_before, resp.body.len);
+    const enc_raw = resp.content_encoding;
+    resp.content_encoding = null;
+    const enc = if (enc_raw) |raw| blk: {
+        const e = firstContentEncoding(raw);
+        allocator.free(raw);
+        break :blk e;
+    } else "";
+    // 有 Content-Encoding 时按头解压
+    if (enc.len > 0) {
+        if (std.ascii.eqlIgnoreCase(enc, "br")) {
+            const out = try shu_zlib.decompressBrotli(allocator, resp.body);
+            allocator.free(resp.body);
+            resp.body = out;
+            debugLogDecompress("br", body_before, resp.body.len);
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(enc, "gzip")) {
+            const out = try shu_zlib.decompressGzip(allocator, resp.body);
+            if (out.len == 0) {
+                allocator.free(out);
+                return;
+            }
+            allocator.free(resp.body);
+            resp.body = out;
+            debugLogDecompress("gzip", body_before, resp.body.len);
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(enc, "deflate")) {
+            const out = try shu_zlib.decompressDeflate(allocator, resp.body);
+            allocator.free(resp.body);
+            resp.body = out;
+            debugLogDecompress("deflate", body_before, resp.body.len);
+            return;
+        }
         return;
     }
-    if (std.ascii.eqlIgnoreCase(enc, "gzip")) {
+    // 无 Content-Encoding：若 body 以 gzip magic 开头则按 gzip 解压（常见于 npm 镜像 tarball）；解压结果为 0 字节时不替换，原样写回 .tgz 由 extract 流式解压
+    if (resp.body.len >= gzip_magic.len and std.mem.eql(u8, resp.body[0..gzip_magic.len], &gzip_magic)) {
         const out = try shu_zlib.decompressGzip(allocator, resp.body);
-        allocator.free(resp.body);
-        resp.body = out;
-        debugLogDecompress("gzip", body_before, resp.body.len);
-        return;
-    }
-    if (std.ascii.eqlIgnoreCase(enc, "deflate")) {
-        const out = try shu_zlib.decompressDeflate(allocator, resp.body);
-        allocator.free(resp.body);
-        resp.body = out;
-        debugLogDecompress("deflate", body_before, resp.body.len);
-        return;
+        if (out.len > 0) {
+            allocator.free(resp.body);
+            resp.body = out;
+            debugLogDecompress("gzip (magic)", body_before, resp.body.len);
+        } else {
+            allocator.free(out);
+        }
     }
 }
 

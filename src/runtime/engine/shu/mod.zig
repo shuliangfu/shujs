@@ -7,6 +7,7 @@ const shu_fs = @import("../../modules/shu/fs/mod.zig");
 const shu_path = @import("../../modules/shu/path/mod.zig");
 const shu_system = @import("../../modules/shu/system/mod.zig");
 const shu_zlib = @import("../../modules/shu/zlib/mod.zig");
+const shu_archive = @import("../../modules/shu/archive/mod.zig");
 const shu_crypto = @import("../../modules/shu/crypto/mod.zig");
 const shu_server = @import("../../modules/shu/server/mod.zig");
 const shu_threads = @import("../../modules/shu/threads/mod.zig");
@@ -23,6 +24,7 @@ pub fn register(ctx: jsc.JSGlobalContextRef, allocator: ?std.mem.Allocator) void
     shu_path.register(ctx, shu_obj);
     shu_system.register(ctx, shu_obj, allocator);
     shu_zlib.register(ctx, shu_obj);
+    shu_archive.register(ctx, shu_obj);
     shu_crypto.attachToShu(ctx, shu_obj);
     shu_server.register(ctx, shu_obj);
     shu_threads.register(ctx, shu_obj);
