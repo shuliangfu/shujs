@@ -13,14 +13,12 @@ fn debugGzipEnabled() bool {
     return v[0] != 0 and v[0] != '0';
 }
 
-/// 向 stderr 打印一行调试信息，仅当 SHU_DEBUG_GZIP 开启时调用；msg 与 fmt 需包含换行。
+/// 向 stderr 打印一行调试信息，仅当 SHU_DEBUG_GZIP 开启时调用；msg 与 fmt 需包含换行。0.16：无 std.io，用 std.fmt.bufPrint
 fn debugGzipLog(comptime fmt: []const u8, args: anytype) void {
     if (!debugGzipEnabled()) return;
     var buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    fbs.writer().print("[shu_zlib gzip] " ++ fmt, args) catch return;
-    const slice = fbs.getWritten();
-    _ = std.posix.write(2, slice) catch {};
+    const slice = std.fmt.bufPrint(&buf, "[shu_zlib gzip] " ++ fmt, args) catch return;
+    _ = std.c.write(2, slice.ptr, slice.len);
 }
 
 /// 带位置的 std.Io.Reader 包装：从 slice[pos..] 读并推进 pos，用于多 member gzip 时统计本 member 消费字节数。
