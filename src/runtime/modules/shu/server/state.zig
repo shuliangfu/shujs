@@ -10,7 +10,7 @@ const tls = @import("tls");
 const types = @import("types.zig");
 const conn_state = @import("conn_state.zig");
 const iocp = @import("iocp.zig");
-const io_core = @import("io_core");
+const libs_io = @import("libs_io");
 const constants = @import("constants.zig");
 
 const ServerConfig = types.ServerConfig;
@@ -133,7 +133,7 @@ pub const PlainMuxState = struct {
     /// 释放 poller、所有连接与堆缓冲；调用后不可再使用
     pub fn deinit(self: *PlainMuxState) void {
         if (self.poller_fd >= 0) {
-            std.posix.close(self.poller_fd);
+            _ = std.c.close(self.poller_fd);
             self.poller_fd = -1;
         }
         var it = self.conns.iterator();
@@ -160,7 +160,7 @@ pub const PlainMuxState = struct {
 /// cluster 主进程时 server == null，cluster_worker_pids 为 worker 的 pid 列表
 pub const ServerState = struct {
     allocator: std.mem.Allocator,
-    server: ?std.net.Server = null,
+    server: ?std.Io.net.Server = null,
     cluster_worker_pids: ?[]std.posix.pid_t = null,
     cluster_workers: usize = 0,
     cluster_argv: ?[]const []const u8 = null,
@@ -194,8 +194,8 @@ pub const ServerState = struct {
     tls_poll_client_fds: if (build_options.have_tls) ?[]usize else void = if (build_options.have_tls) null else {},
     tls_conns: if (build_options.have_tls) ?std.AutoHashMap(usize, TlsConnState) else void = if (build_options.have_tls) null else {},
     iocp: if (build_options.use_iocp) ?iocp.IocpState else void = if (build_options.use_iocp) null else {},
-    high_perf_io: ?*io_core.HighPerfIO = null,
-    buffer_pool: ?io_core.api.BufferPool = null,
+    high_perf_io: ?*libs_io.HighPerfIO = null,
+    buffer_pool: ?libs_io.api.BufferPool = null,
     // 自适应 poll 超时：当前有效值（0～config.io_core_poll_idle_ms），高负载时自动降为 0，空闲时逐步回升至上限
     poll_idle_effective_ms: i64 = 100,
     /// 连续有事件的 tick 数（≥1 个 completion 视为有负载）；达到阈值后 effective 置 0
