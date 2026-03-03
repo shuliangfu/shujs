@@ -106,12 +106,13 @@ const CATEGORIES = [_]Category{
     .{ .title = "Info & config", .commands = &Info },
 };
 
-/// 打印全局用法（deno 风格：分组 Commands）；在 TTY 下输出 ANSI 颜色
-pub fn printGlobalUsage() !void {
+/// 打印全局用法（deno 风格：分组 Commands）；在 TTY 下输出 ANSI 颜色。Zig 0.16：使用 std.Io 写 stdout。
+pub fn printGlobalUsage(io: std.Io) !void {
     var buf: [1024]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf);
+    var w = std.Io.File.Writer.init(std.Io.File.stdout(), io, &buf);
     const out = &w.interface;
-    const use_color = std.posix.isatty(1); // stdout
+    // Zig 0.16：posix.isatty 已移/变更，用 C 库 isatty(stdout) 判断 TTY
+    const use_color = std.c.isatty(1) != 0; // stdout
     const sgr = SGR.withColor(use_color);
 
     // 标题：粗体 + 青色
@@ -142,7 +143,7 @@ pub fn printGlobalUsage() !void {
     }
     try out.print("{s}Tip{s}: Run 'shu help <command>' for command-specific help.\n", .{ sgr.dim, sgr.reset });
     try out.print("{s}Version{s}: {s}\n", .{ sgr.dim, sgr.reset, version.VERSION });
-    try out.flush();
+    w.flush() catch {};
 }
 
 /// 返回子命令简短说明（用于 shu help <cmd>）；匹配主名或 "name, -x" 形式（逗号前/后均匹配）
@@ -162,23 +163,23 @@ fn getSubcommandDescription(cmd: []const u8) ?[]const u8 {
     return null;
 }
 
-/// 执行 shu help [subcommand]：无参数时打印全局用法，有参数时打印该子命令简要说明
-pub fn help(allocator: std.mem.Allocator, positional: []const []const u8) !void {
+/// 执行 shu help [subcommand]：无参数时打印全局用法，有参数时打印该子命令简要说明。Zig 0.16：需传入 io。
+pub fn help(allocator: std.mem.Allocator, positional: []const []const u8, io: std.Io) !void {
     _ = allocator;
     if (positional.len == 0) {
-        try printGlobalUsage();
+        try printGlobalUsage(io);
         return;
     }
     const cmd = positional[0];
     if (getSubcommandDescription(cmd)) |desc| {
         var buf: [256]u8 = undefined;
-        var w = std.fs.File.stdout().writer(&buf);
+        var w = std.Io.File.Writer.init(std.Io.File.stdout(), io, &buf);
         try w.interface.print("shu {s}: {s}\n", .{ cmd, desc });
-        try w.interface.flush();
+        w.flush() catch {};
     } else {
         var buf: [128]u8 = undefined;
-        var w = std.fs.File.stdout().writer(&buf);
+        var w = std.Io.File.Writer.init(std.Io.File.stdout(), io, &buf);
         try w.interface.print("Unknown subcommand: {s}. Run 'shu help' for usage.\n", .{cmd});
-        try w.interface.flush();
+        w.flush() catch {};
     }
 }
