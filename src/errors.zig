@@ -24,7 +24,7 @@ pub const Diagnostic = struct {
     pub fn format(self: Diagnostic, writer: anytype) !void {
         try writer.print("[{s}] {s}", .{ @tagName(self.code), self.message });
         if (self.doc_url) |url| {
-            try writer.print(" 文档: {s}", .{url});
+            try writer.print(" Docs: {s}", .{url});
         }
         try writer.writeAll("\n");
     }
