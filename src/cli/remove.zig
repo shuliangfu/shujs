@@ -4,6 +4,8 @@
 
 const std = @import("std");
 const args = @import("args.zig");
+const errors = @import("errors");
+const libs_process = @import("libs_process");
 const version = @import("version.zig");
 const manifest = @import("../package/manifest.zig");
 const pkg_install = @import("../package/install.zig");
@@ -17,9 +19,11 @@ pub fn remove(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional:
         try printToStdout("shu remove: no package name given. Usage: shu remove <name> [name...]  e.g. shu remove <name>  shu remove jsr:@scope/name\n", .{});
         return;
     }
-    try version.printCommandHeader("remove");
-    var cwd_buf: [1024]u8 = undefined;
-    const cwd = std.posix.getcwd(&cwd_buf) catch return error.CwdFailed;
+    const io = libs_process.getProcessIo() orelse return error.NoProcessIo;
+    try version.printCommandHeader(io, "remove");
+    const libs_io = @import("libs_io");
+    var cwd_buf: [libs_io.max_path_bytes]u8 = undefined;
+    const cwd = libs_io.realpath(".", &cwd_buf) catch return error.CwdFailed;
     const cwd_owned = allocator.dupe(u8, cwd) catch return error.OutOfMemory;
     defer allocator.free(cwd_owned);
 
@@ -61,8 +65,9 @@ pub fn remove(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional:
 }
 
 fn printToStdout(comptime fmt: []const u8, fargs: anytype) !void {
+    const io_out = libs_process.getProcessIo() orelse return error.NoProcessIo;
     var buf: [256]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf);
+    var w = std.Io.File.Writer.init(std.Io.File.stdout(), io_out, &buf);
     try w.interface.print(fmt, fargs);
     try w.interface.flush();
 }
