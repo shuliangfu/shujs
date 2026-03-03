@@ -1,8 +1,10 @@
 // 全局 fetch(url) 注册与 C 回调；需 --allow-net，同步 GET 返回 { ok, status, statusText, body }
 // 由 bindings 在具备 RunOptions 时调用注册到 globalThis；本模块不依赖 engine。
+// HTTP 请求统一经 io_core.http（Content-Length 固定长度 / chunked 流式解压），与 registry、JSR 一致。
 
 const std = @import("std");
 const jsc = @import("jsc");
+const io_core = @import("io_core");
 const errors = @import("../../../../errors.zig");
 const globals = @import("../../../globals.zig");
 
@@ -45,45 +47,22 @@ fn callback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "fetch requires --allow-net" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    const uri = std.Uri.parse(url) catch {
-        errors.reportToStderr(.{ .code = .unknown, .message = "fetch URL parse failed" }) catch {};
-        return jsc.JSValueMakeUndefined(ctx);
-    };
-    var client = std.http.Client{ .allocator = allocator };
-    defer client.deinit();
-    var req = client.request(.GET, uri, .{}) catch {
-        errors.reportToStderr(.{ .code = .unknown, .message = "fetch request failed" }) catch {};
-        return jsc.JSValueMakeUndefined(ctx);
-    };
-    defer req.deinit();
-    req.sendBodiless() catch {
-        errors.reportToStderr(.{ .code = .unknown, .message = "fetch send failed" }) catch {};
-        return jsc.JSValueMakeUndefined(ctx);
-    };
-    var redirect_buf: [8 * 1024]u8 = undefined;
-    var response = req.receiveHead(&redirect_buf) catch {
-        errors.reportToStderr(.{ .code = .unknown, .message = "fetch receive head failed" }) catch {};
-        return jsc.JSValueMakeUndefined(ctx);
-    };
-    const status: u16 = @intFromEnum(response.head.status);
-    const ok = status >= 200 and status < 300;
-    const status_text = response.head.status.phrase() orelse "";
-    var transfer_buf: [64]u8 = undefined;
-    var decompress: std.http.Decompress = undefined;
-    const decompress_buf = allocator.alloc(u8, std.compress.flate.max_window_len) catch {
-        _ = response.reader(&transfer_buf).discardRemaining() catch {};
-        return jsc.JSValueMakeUndefined(ctx);
-    };
-    defer allocator.free(decompress_buf);
-    const reader = response.readerDecompressing(&transfer_buf, &decompress, decompress_buf);
-    const body_slice = reader.allocRemaining(allocator, std.io.Limit.limited(2 * 1024 * 1024)) catch |e| {
-        _ = reader.discardRemaining() catch {};
-        if (e == error.StreamTooLong) {
+    // 统一经 io_core.http 发 GET：有 Content-Length 读固定长度，chunked 时流式解压，与 registry/JSR 一致；用 freeResponse 统一释放 body 与可分配的 status_text
+    const resp = io_core.http.request(allocator, url, .{
+        .method = .GET,
+        .max_response_bytes = 2 * 1024 * 1024,
+    }) catch |e| {
+        if (e == error.ResponseTooLarge) {
             errors.reportToStderr(.{ .code = .unknown, .message = "fetch response body too large" }) catch {};
+        } else {
+            errors.reportToStderr(.{ .code = .unknown, .message = "fetch request failed" }) catch {};
         }
         return jsc.JSValueMakeUndefined(ctx);
     };
-    defer allocator.free(body_slice);
+    defer io_core.http.freeResponse(allocator, &resp);
+    const status: u16 = resp.status;
+    const ok = status >= 200 and status < 300;
+    const body_slice = resp.body;
     const resp_obj = jsc.JSObjectMake(ctx, null, null);
     const name_ok = jsc.JSStringCreateWithUTF8CString("ok");
     defer jsc.JSStringRelease(name_ok);
@@ -95,12 +74,15 @@ fn callback(
     defer jsc.JSStringRelease(name_body);
     _ = jsc.JSObjectSetProperty(ctx, resp_obj, name_ok, jsc.JSValueMakeBoolean(ctx, ok), jsc.kJSPropertyAttributeNone, null);
     _ = jsc.JSObjectSetProperty(ctx, resp_obj, name_status, jsc.JSValueMakeNumber(ctx, @floatFromInt(status)), jsc.kJSPropertyAttributeNone, null);
-    const statusText_z = allocator.dupeZ(u8, status_text) catch "";
+    const statusText_z = allocator.dupeZ(u8, resp.status_text) catch "";
     defer if (statusText_z.len > 0) allocator.free(statusText_z);
     const statusText_js = if (statusText_z.len > 0) jsc.JSStringCreateWithUTF8CString(statusText_z.ptr) else jsc.JSStringCreateWithUTF8CString("");
     defer jsc.JSStringRelease(statusText_js);
     _ = jsc.JSObjectSetProperty(ctx, resp_obj, name_statusText, jsc.JSValueMakeString(ctx, statusText_js), jsc.kJSPropertyAttributeNone, null);
-    const body_js = jsc.JSStringCreateWithUTF8CString(if (body_slice.len > 0) body_slice.ptr else "");
+    // JSC 需要以 null 结尾的 C 串；body 切片未必带尾 0，用 dupeZ 保证安全
+    const body_z = if (body_slice.len > 0) allocator.dupeZ(u8, body_slice) catch "" else "";
+    defer if (body_z.len > 0) allocator.free(body_z);
+    const body_js = jsc.JSStringCreateWithUTF8CString(if (body_z.len > 0) body_z.ptr else "");
     defer jsc.JSStringRelease(body_js);
     _ = jsc.JSObjectSetProperty(ctx, resp_obj, name_body, jsc.JSValueMakeString(ctx, body_js), jsc.kJSPropertyAttributeNone, null);
     return resp_obj;
