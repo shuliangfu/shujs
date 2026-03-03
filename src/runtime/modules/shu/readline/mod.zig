@@ -4,6 +4,8 @@
 
 const std = @import("std");
 const jsc = @import("jsc");
+const errors = @import("errors");
+const libs_process = @import("libs_process");
 const common = @import("../../../common.zig");
 const globals = @import("../../../globals.zig");
 
@@ -53,13 +55,14 @@ const InterfaceState = struct {
 var g_stream_interfaces: std.AutoHashMap(usize, std.ArrayList(jsc.JSObjectRef)) = undefined;
 /// 每个 Interface 对象对应的状态
 var g_interface_state: std.AutoHashMap(usize, InterfaceState) = undefined;
-var g_readline_mutex: std.Thread.Mutex = .{};
+var g_readline_mutex: std.Io.Mutex = .{ .state = std.atomic.Value(std.Io.Mutex.State).init(.unlocked) };
 var g_readline_init: bool = false;
 
-/// 使用指定 allocator 初始化 readline 全局表；由 getExports 或 ensureReadlineGlobals 首次调用时注入（§1.1 显式 allocator）
+/// 使用指定 allocator 初始化 readline 全局表；由 getExports 或 ensureReadlineGlobals 首次调用时注入（§1.1 显式 allocator）。0.16：Io.Mutex 需传 io。
 fn initReadlineGlobals(allocator: std.mem.Allocator) void {
-    g_readline_mutex.lock();
-    defer g_readline_mutex.unlock();
+    const io = libs_process.getProcessIo() orelse return;
+    g_readline_mutex.lock(io) catch return;
+    defer g_readline_mutex.unlock(io);
     if (g_readline_init) return;
     g_stream_interfaces = std.AutoHashMap(usize, std.ArrayList(jsc.JSObjectRef)).init(allocator);
     g_interface_state = std.AutoHashMap(usize, InterfaceState).init(allocator);
@@ -99,29 +102,30 @@ fn interfaceEmit(
 /// 将 input 收到的 chunk 喂给所有绑定在该 stream 上的 Interface；§4 缩短持锁：≤32 个 interface 时栈拷贝，避免锁内 clone
 fn feedChunkToInterfaces(ctx: jsc.JSContextRef, input_stream_ref: jsc.JSObjectRef, chunk_val: jsc.JSValueRef) void {
     const allocator = globals.current_allocator orelse return;
+    const io = libs_process.getProcessIo() orelse return;
     const key = @intFromPtr(input_stream_ref);
     var stack_refs: [32]jsc.JSObjectRef = undefined;
     var heap_copy: ?std.ArrayList(jsc.JSObjectRef) = null;
     defer if (heap_copy) |*h| h.deinit(allocator);
 
-    g_readline_mutex.lock();
+    g_readline_mutex.lock(io) catch return;
     const list_opt = g_stream_interfaces.getPtr(key);
     if (list_opt == null) {
-        g_readline_mutex.unlock();
+        g_readline_mutex.unlock(io);
         return;
     }
     const list = list_opt.?;
     const n = list.items.len;
     const slice: []const jsc.JSObjectRef = if (n <= 32) blk: {
         @memcpy(stack_refs[0..n], list.items);
-        g_readline_mutex.unlock();
+        g_readline_mutex.unlock(io);
         break :blk stack_refs[0..n];
     } else blk: {
         heap_copy = list.clone(allocator) catch {
-            g_readline_mutex.unlock();
+            g_readline_mutex.unlock(io);
             return;
         };
-        g_readline_mutex.unlock();
+        g_readline_mutex.unlock(io);
         break :blk heap_copy.?.items;
     };
 
@@ -144,20 +148,21 @@ fn feedChunkToInterfaces(ctx: jsc.JSContextRef, input_stream_ref: jsc.JSObjectRe
 
 /// 给单个 Interface 追加数据并按行拆分，触发 'line' 与 question 回调
 fn feedChunk(ctx: jsc.JSContextRef, interface_ref: jsc.JSObjectRef, chunk_utf8: []const u8, allocator: std.mem.Allocator) void {
+    const io = libs_process.getProcessIo() orelse return;
     const key = @intFromPtr(interface_ref);
-    g_readline_mutex.lock();
+    g_readline_mutex.lock(io) catch return;
     const state_ptr = g_interface_state.getPtr(key);
     if (state_ptr == null or state_ptr.?.closed) {
-        g_readline_mutex.unlock();
+        g_readline_mutex.unlock(io);
         return;
     }
     var state = state_ptr.?;
     state.line_buffer.appendSlice(allocator, chunk_utf8) catch {
-        g_readline_mutex.unlock();
+        g_readline_mutex.unlock(io);
         return;
     };
     const buf = state.line_buffer.items;
-    g_readline_mutex.unlock();
+    g_readline_mutex.unlock(io);
 
     var start: usize = 0;
     var i: usize = 0;
@@ -174,13 +179,13 @@ fn feedChunk(ctx: jsc.JSContextRef, interface_ref: jsc.JSObjectRef, chunk_utf8: 
             defer jsc.JSStringRelease(line_js);
             const line_val = jsc.JSValueMakeString(ctx, line_js);
 
-            g_readline_mutex.lock();
+            g_readline_mutex.lock(io) catch return;
             const st = g_interface_state.getPtr(key) orelse {
-                g_readline_mutex.unlock();
+                g_readline_mutex.unlock(io);
                 return;
             };
             if (st.closed) {
-                g_readline_mutex.unlock();
+                g_readline_mutex.unlock(io);
                 return;
             }
             st.current_line.clearRetainingCapacity();
@@ -189,7 +194,7 @@ fn feedChunk(ctx: jsc.JSContextRef, interface_ref: jsc.JSObjectRef, chunk_utf8: 
             if (qcb != null) {
                 st.question_callback = null;
             }
-            g_readline_mutex.unlock();
+            g_readline_mutex.unlock(io);
 
             var one: [1]jsc.JSValueRef = .{line_val};
             interfaceEmit(ctx, interface_ref, "line", 1, &one);
@@ -205,13 +210,13 @@ fn feedChunk(ctx: jsc.JSContextRef, interface_ref: jsc.JSObjectRef, chunk_utf8: 
         i += 1;
     }
 
-    g_readline_mutex.lock();
+    g_readline_mutex.lock(io) catch return;
     if (g_interface_state.getPtr(key)) |st| {
         if (start > 0 and start <= st.line_buffer.items.len) {
             st.line_buffer.replaceRange(st.allocator, 0, start, "") catch {};
         }
     }
-    g_readline_mutex.unlock();
+    g_readline_mutex.unlock(io);
 }
 
 /// 全局 data 监听器：input 收到 data 时由 stream 调用，this = input stream，args[0] = chunk
@@ -307,11 +312,12 @@ fn interfaceQuestionCallback(
 ) callconv(.c) jsc.JSValueRef {
     if (argumentCount < 2) return jsc.JSValueMakeUndefined(ctx);
     const allocator = globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
+    const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
     const key = @intFromPtr(thisObject);
-    g_readline_mutex.lock();
+    g_readline_mutex.lock(io) catch return jsc.JSValueMakeUndefined(ctx);
     const state_ptr = g_interface_state.getPtr(key);
     if (state_ptr == null or state_ptr.?.closed) {
-        g_readline_mutex.unlock();
+        g_readline_mutex.unlock(io);
         return jsc.JSValueMakeUndefined(ctx);
     }
     var state = state_ptr.?;
@@ -320,7 +326,7 @@ fn interfaceQuestionCallback(
     jsc.JSValueProtect(ctx, callback_val);
     state.question_callback = callback_val;
     const output_ref = state.output_ref;
-    g_readline_mutex.unlock();
+    g_readline_mutex.unlock(io);
 
     if (output_ref) |out| {
         const prompt_str = jsc.JSValueToStringCopy(ctx, prompt_val, null);
@@ -355,12 +361,13 @@ fn interfaceCloseCallback(
     _: [*]const jsc.JSValueRef,
     _: [*]jsc.JSValueRef,
 ) callconv(.c) jsc.JSValueRef {
+    const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
     _ = globals.current_allocator;
     const key = @intFromPtr(thisObject);
-    g_readline_mutex.lock();
+    g_readline_mutex.lock(io) catch return jsc.JSValueMakeUndefined(ctx);
     const state_opt = g_interface_state.fetchRemove(key);
     if (state_opt == null) {
-        g_readline_mutex.unlock();
+        g_readline_mutex.unlock(io);
         return jsc.JSValueMakeUndefined(ctx);
     }
     var state = state_opt.?.value;
@@ -383,7 +390,7 @@ fn interfaceCloseCallback(
             }
         }
     }
-    g_readline_mutex.unlock();
+    g_readline_mutex.unlock(io);
 
     var no_args: [0]jsc.JSValueRef = undefined;
     interfaceEmit(ctx, thisObject, "close", 0, &no_args);
@@ -401,11 +408,12 @@ fn interfaceSetPromptCallback(
 ) callconv(.c) jsc.JSValueRef {
     if (argumentCount < 1) return jsc.JSValueMakeUndefined(ctx);
     const allocator = globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
+    const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
     const key = @intFromPtr(thisObject);
-    g_readline_mutex.lock();
+    g_readline_mutex.lock(io) catch return jsc.JSValueMakeUndefined(ctx);
     const state_ptr = g_interface_state.getPtr(key);
     if (state_ptr == null) {
-        g_readline_mutex.unlock();
+        g_readline_mutex.unlock(io);
         return jsc.JSValueMakeUndefined(ctx);
     }
     var st = state_ptr.?;
@@ -413,15 +421,15 @@ fn interfaceSetPromptCallback(
     const prompt_str = jsc.JSValueToStringCopy(ctx, arguments[0], null);
     defer jsc.JSStringRelease(prompt_str);
     const max_len = jsc.JSStringGetMaximumUTF8CStringSize(prompt_str);
-    g_readline_mutex.unlock();
+    g_readline_mutex.unlock(io);
     if (max_len > 0 and max_len <= 1024) {
         const buf = allocator.alloc(u8, max_len) catch return jsc.JSValueMakeUndefined(ctx);
         defer allocator.free(buf);
         const n = jsc.JSStringGetUTF8CString(prompt_str, buf.ptr, max_len);
         if (n > 0) {
-            g_readline_mutex.lock();
+            g_readline_mutex.lock(io) catch return jsc.JSValueMakeUndefined(ctx);
             st.prompt_str.appendSlice(st.allocator, buf[0 .. n - 1]) catch {};
-            g_readline_mutex.unlock();
+            g_readline_mutex.unlock(io);
         }
     }
     return jsc.JSValueMakeUndefined(ctx);
@@ -437,16 +445,17 @@ fn interfacePromptCallback(
     _: [*]jsc.JSValueRef,
 ) callconv(.c) jsc.JSValueRef {
     const allocator = globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
+    const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
     const key = @intFromPtr(thisObject);
-    g_readline_mutex.lock();
+    g_readline_mutex.lock(io) catch return jsc.JSValueMakeUndefined(ctx);
     const state_ptr = g_interface_state.getPtr(key);
     if (state_ptr == null or state_ptr.?.closed) {
-        g_readline_mutex.unlock();
+        g_readline_mutex.unlock(io);
         return jsc.JSValueMakeUndefined(ctx);
     }
     const output_ref = state_ptr.?.output_ref;
     const prompt_slice = state_ptr.?.prompt_str.items;
-    g_readline_mutex.unlock();
+    g_readline_mutex.unlock(io);
     if (output_ref != null and prompt_slice.len > 0) {
         const out = output_ref.?;
         const str_z = allocator.dupeZ(u8, prompt_slice) catch return jsc.JSValueMakeUndefined(ctx);
@@ -474,11 +483,12 @@ fn interfaceWriteCallback(
     _: [*]jsc.JSValueRef,
 ) callconv(.c) jsc.JSValueRef {
     if (argumentCount < 1) return jsc.JSValueMakeUndefined(ctx);
+    const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
     const key = @intFromPtr(thisObject);
-    g_readline_mutex.lock();
+    g_readline_mutex.lock(io) catch return jsc.JSValueMakeUndefined(ctx);
     const state_ptr = g_interface_state.getPtr(key);
     const out = if (state_ptr != null) state_ptr.?.output_ref else null;
-    g_readline_mutex.unlock();
+    g_readline_mutex.unlock(io);
     if (out) |out_obj| {
         const write_val = jsc.JSObjectGetProperty(ctx, out_obj, k_write, null);
         const write_fn = jsc.JSValueToObject(ctx, write_val, null);
@@ -506,6 +516,7 @@ fn createInterfaceCallback(
     const output_obj = if (jsc.JSValueIsUndefined(ctx, output_val) or jsc.JSValueIsNull(ctx, output_val)) null else jsc.JSValueToObject(ctx, output_val, null);
 
     const allocator = globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
+    const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
     ensureStrings();
     ensureReadlineGlobals();
 
@@ -533,16 +544,16 @@ fn createInterfaceCallback(
 
     const iface_key = @intFromPtr(iface);
     const stream_key = @intFromPtr(input_obj);
-    g_readline_mutex.lock();
+    g_readline_mutex.lock(io) catch return jsc.JSValueMakeUndefined(ctx);
     g_interface_state.put(iface_key, state) catch {
-        g_readline_mutex.unlock();
+        g_readline_mutex.unlock(io);
         line_buf.deinit(allocator);
         current_line.deinit(allocator);
         prompt_str.deinit(allocator);
         return jsc.JSValueMakeUndefined(ctx);
     };
     const entry = g_stream_interfaces.getOrPut(stream_key) catch {
-        g_readline_mutex.unlock();
+        g_readline_mutex.unlock(io);
         _ = g_interface_state.remove(iface_key);
         line_buf.deinit(allocator);
         current_line.deinit(allocator);
@@ -551,7 +562,7 @@ fn createInterfaceCallback(
     };
     if (!entry.found_existing) {
         entry.value_ptr.* = std.ArrayList(jsc.JSObjectRef).initCapacity(allocator, 4) catch {
-            g_readline_mutex.unlock();
+            g_readline_mutex.unlock(io);
             _ = g_interface_state.remove(iface_key);
             line_buf.deinit(allocator);
             current_line.deinit(allocator);
@@ -560,7 +571,7 @@ fn createInterfaceCallback(
         };
     }
     entry.value_ptr.*.append(allocator, iface) catch {
-        g_readline_mutex.unlock();
+        g_readline_mutex.unlock(io);
         _ = g_interface_state.remove(iface_key);
         line_buf.deinit(allocator);
         current_line.deinit(allocator);
@@ -568,7 +579,7 @@ fn createInterfaceCallback(
         return jsc.JSValueMakeUndefined(ctx);
     };
     const need_register = entry.found_existing == false;
-    g_readline_mutex.unlock();
+    g_readline_mutex.unlock(io);
 
     if (need_register) {
         const on_val = jsc.JSObjectGetProperty(ctx, input_obj, k_on, null);
@@ -675,7 +686,8 @@ fn cursorToCallback(
     const write_fn = jsc.JSValueToObject(ctx, write_val, null);
     if (write_fn) |wfn| {
         var buf: [32]u8 = undefined;
-        const n = (std.fmt.bufPrint(&buf, "\x1b[{d};{d}H", .{ y + 1, x + 1 }) catch buf[0..0]).len;
+        const empty: []u8 = buf[0..0];
+        const n = (std.fmt.bufPrint(&buf, "\x1b[{d};{d}H", .{ y + 1, x + 1 }) catch empty).len;
         if (n > 0 and n < buf.len) {
             buf[n] = 0;
             const seq_ref = jsc.JSStringCreateWithUTF8CString(&buf);
@@ -713,8 +725,9 @@ fn moveCursorCallback(
     if (write_fn) |wfn| {
         var buf: [64]u8 = undefined;
         var n: usize = 0;
-        if (dx > 0) n += (std.fmt.bufPrint(buf[n..], "\x1b[{d}C", .{dx}) catch buf[n..][0..0]).len else if (dx < 0) n += (std.fmt.bufPrint(buf[n..], "\x1b[{d}D", .{-dx}) catch buf[n..][0..0]).len;
-        if (dy > 0) n += (std.fmt.bufPrint(buf[n..], "\x1b[{d}B", .{dy}) catch buf[n..][0..0]).len else if (dy < 0) n += (std.fmt.bufPrint(buf[n..], "\x1b[{d}A", .{-dy}) catch buf[n..][0..0]).len;
+        const empty: []u8 = buf[0..0];
+        if (dx > 0) n += (std.fmt.bufPrint(buf[n..], "\x1b[{d}C", .{dx}) catch empty).len else if (dx < 0) n += (std.fmt.bufPrint(buf[n..], "\x1b[{d}D", .{-dx}) catch empty).len;
+        if (dy > 0) n += (std.fmt.bufPrint(buf[n..], "\x1b[{d}B", .{dy}) catch empty).len else if (dy < 0) n += (std.fmt.bufPrint(buf[n..], "\x1b[{d}A", .{-dy}) catch empty).len;
         if (n > 0 and n < buf.len) {
             buf[n] = 0;
             const seq_ref = jsc.JSStringCreateWithUTF8CString(&buf);
