@@ -22,6 +22,7 @@ build/
 out/
 
 # 锁文件（若需纳入版本控制可删除此行）
+shu.lock
 # bun.lock
 # package-lock.json
 
