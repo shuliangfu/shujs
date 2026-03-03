@@ -4,6 +4,8 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const jsc = @import("jsc");
+const errors = @import("errors");
+const libs_process = @import("libs_process");
 const common = @import("../../../common.zig");
 const globals = @import("../../../globals.zig");
 const shu_http = @import("../http/mod.zig");
@@ -225,8 +227,13 @@ fn tlsConnectWrapperCallback(
         _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(user_cb), null, 2, &args, null);
         return jsc.JSValueMakeUndefined(ctx);
     };
+    const io = libs_process.getProcessIo() orelse {
+        var args_err = [_]jsc.JSValueRef{ err_val, socket_val };
+        _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(user_cb), null, 2, &args_err, null);
+        return jsc.JSValueMakeUndefined(ctx);
+    };
     const box = allocator.create(tls_native.TlsStream) catch {
-        @constCast(&tls_stream).close();
+        @constCast(&tls_stream).close(io);
         var args = [_]jsc.JSValueRef{ err_val, socket_val };
         _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(user_cb), null, 2, &args, null);
         return jsc.JSValueMakeUndefined(ctx);
