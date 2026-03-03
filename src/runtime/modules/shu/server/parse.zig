@@ -1,9 +1,9 @@
 // HTTP 请求解析：getHeader、parseHttpRequest、chunked、tryParseHeadersFromBuffer 等
-// 供 mod.zig / conn / h2 等调用；与 io_core.simd_scan 统一：头部边界查找使用 simd_scan.indexOfCrLfCrLf
+// 供 mod.zig / conn / h2 等调用；与 libs_io.simd_scan 统一：头部边界查找使用 simd_scan.indexOfCrLfCrLf
 
 const std = @import("std");
 const types = @import("types.zig");
-const io_core = @import("io_core");
+const libs_io = @import("libs_io");
 
 // ------------------------------------------------------------------------------
 // 热路径头值匹配用 comptime 常量（§2.1 固定串比较）
@@ -264,9 +264,9 @@ pub fn readChunkedBody(
     return result.toOwnedSlice(allocator);
 }
 
-/// 在 buf 中查找 "\r\n\r\n" 的偏移；统一使用 io_core.simd_scan 的向量化实现，与路线图「协议解析 SIMD 统一」一致
+/// 在 buf 中查找 "\r\n\r\n" 的偏移；统一使用 libs_io.simd_scan 的向量化实现，与路线图「协议解析 SIMD 统一」一致
 pub fn indexOfCrLfCrLf(buf: []const u8) ?usize {
-    return io_core.simd_scan.indexOfCrLfCrLf(buf);
+    return libs_io.simd_scan.indexOfCrLfCrLf(buf);
 }
 
 /// 仅从已有 buffer 解析请求头（不读 body）；用于 I/O 多路复用：若尚未出现 \r\n\r\n 则返回 NeedMore；会 dupe 头部到 request_allocator
