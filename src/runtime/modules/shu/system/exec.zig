@@ -3,7 +3,8 @@
 
 const std = @import("std");
 const jsc = @import("jsc");
-const errors = @import("../../../../errors.zig");
+const errors = @import("errors");
+const libs_process = @import("libs_process");
 const globals = @import("../../../globals.zig");
 const common = @import("../../../common.zig");
 const child_run = @import("child_run.zig");
@@ -119,7 +120,8 @@ fn execSyncCallback(
     const cmd = getArgString(allocator, ctx, arguments, argumentCount, 0) orelse return jsc.JSValueMakeUndefined(ctx);
     defer allocator.free(cmd);
     const argv = [_][]const u8{ "sh", "-c", cmd };
-    const result = child_run.runProcess(allocator, &argv, opts.cwd) catch {
+    const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
+    const result = child_run.runProcess(allocator, &argv, opts.cwd, io) catch {
         return jsc.JSValueMakeUndefined(ctx);
     };
     defer allocator.free(result.stdout);
