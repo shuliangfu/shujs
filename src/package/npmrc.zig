@@ -3,7 +3,9 @@
 // 文件 I/O 经 io_core（§3.0）
 
 const std = @import("std");
-const io_core = @import("io_core");
+const errors = @import("errors");
+const libs_io = @import("libs_io");
+const libs_process = @import("libs_process");
 
 /// 默认 registry URL（无 .npmrc 或未配置 registry 时使用）
 pub const DEFAULT_REGISTRY_URL = "https://registry.npmjs.org";
@@ -12,26 +14,28 @@ pub const JSR_NPM_REGISTRY = "https://npm.jsr.io";
 
 /// 从 ~/.npmrc 读入并合并进 map（存在则解析，不存在则跳过）
 fn loadUserNpmrc(allocator: std.mem.Allocator, map: *std.StringArrayHashMap([]const u8)) void {
-    const home = std.posix.getenv("HOME") orelse return;
-    const path = io_core.pathJoin(allocator, &.{ home, ".npmrc" }) catch return;
+    const home_z = std.c.getenv("HOME") orelse return;
+    const home = std.mem.span(home_z);
+    const path = libs_io.pathJoin(allocator, &.{ home, ".npmrc" }) catch return;
     defer allocator.free(path);
-    const f = io_core.openFileAbsolute(path, .{}) catch return;
-    defer f.close();
-    const raw = f.readToEndAlloc(allocator, 64 * 1024) catch return;
+    const io = libs_process.getProcessIo() orelse return;
+    const f = libs_io.openFileAbsolute(path, .{}) catch return;
+    defer f.close(io);
+    var file_reader = f.reader(io, &.{});
+    const raw = file_reader.interface.allocRemaining(allocator, std.Io.Limit.limited(64 * 1024)) catch return;
     defer allocator.free(raw);
     parseInto(allocator, map, raw) catch return;
 }
 
 /// 从 dir 下 .npmrc 读入并合并进 map（存在则解析，不存在则跳过）；项目配置覆盖用户配置
 fn loadProjectNpmrc(allocator: std.mem.Allocator, map: *std.StringArrayHashMap([]const u8), dir: []const u8) void {
-    var dir_handle = if (io_core.pathIsAbsolute(dir))
-        io_core.openDirAbsolute(dir, .{}) catch return
+    const io = libs_process.getProcessIo() orelse return;
+    var dir_handle = if (libs_io.pathIsAbsolute(dir))
+        libs_io.openDirAbsolute(dir, .{}) catch return
     else
-        io_core.openDirCwd(dir, .{}) catch return;
-    defer dir_handle.close();
-    const content = dir_handle.openFile(".npmrc", .{}) catch return;
-    defer content.close();
-    const raw = content.readToEndAlloc(allocator, 64 * 1024) catch return;
+        libs_io.openDirCwd(dir, .{}) catch return;
+    defer dir_handle.close(io);
+    const raw = dir_handle.readFileAlloc(io, ".npmrc", allocator, std.Io.Limit.limited(64 * 1024)) catch return;
     defer allocator.free(raw);
     parseInto(allocator, map, raw) catch return;
 }
