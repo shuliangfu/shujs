@@ -17,10 +17,7 @@ const common = @import("../../../common.zig");
 /// 根据 fd (0/1/2) 检测是否 TTY；非 POSIX 或非 0/1/2 返回 false
 fn isFdTty(fd: i32) bool {
     if (fd != 0 and fd != 1 and fd != 2) return false;
-    return switch (std.posix.isatty(@intCast(fd))) {
-        true => true,
-        false => false,
-    };
+    return std.c.isatty(@intCast(fd)) != 0;
 }
 
 /// isTTY(fd?)：缺省 fd=1；返回 boolean
