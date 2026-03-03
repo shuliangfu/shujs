@@ -43,8 +43,8 @@ pub fn isExcludedDir(name: []const u8) bool {
     return false;
 }
 
-/// 判断文件路径是否以任一给定后缀结尾（用于扩展名匹配）。
-fn hasExtension(path: []const u8, extensions: []const []const u8) bool {
+/// 判断文件路径是否以任一给定后缀结尾（用于扩展名匹配）；供 fmt 等根据扩展名过滤指定文件。
+pub fn hasExtension(path: []const u8, extensions: []const []const u8) bool {
     for (extensions) |ext| {
         if (std.mem.endsWith(u8, path, ext)) return true;
     }
@@ -110,8 +110,11 @@ pub fn collectFilesRecursive(
 /// 默认 test 使用的扩展名：*.test.ts, *.test.js, *.spec.ts, *.spec.js
 pub const test_extensions = [_][]const u8{ ".test.ts", ".test.js", ".spec.ts", ".spec.js" };
 
-/// 默认 fmt 使用的扩展名：.ts, .tsx, .js, .jsx, .mjs, .cjs
-pub const fmt_extensions = [_][]const u8{ ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs" };
+/// 默认 fmt 使用的扩展名：.ts, .tsx, .js, .jsx, .mjs, .cjs, .json, .jsonc, .md, .mdc, .zig（暂不含 .c/.h）
+pub const fmt_extensions = [_][]const u8{ ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".jsonc", ".md", ".mdc", ".zig" };
 
-/// 默认 lint 使用的扩展名：与 fmt 一致
-pub const lint_extensions = [_][]const u8{ ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs" };
+/// 默认 lint 使用的扩展名：JS/TS/JSON（暂不含 .zig/.c/.h）；.md/.mdc 需传 --md 时再检查
+pub const lint_extensions = [_][]const u8{ ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".jsonc" };
+
+/// 启用 --md 时额外收集的扩展名，用于 markdown 语法检查
+pub const lint_md_extensions = [_][]const u8{ ".md", ".mdc" };
