@@ -21,10 +21,13 @@ const std = @import("std");
 const jsc = @import("jsc");
 const common = @import("../../../common.zig");
 const globals = @import("../../../globals.zig");
+const libs_process = @import("libs_process");
 const shu_builtin = @import("../builtin.zig");
 const node_builtin = @import("../../node/builtin.zig");
 const require_mod = @import("../require/mod.zig");
 const strip_types = @import("../../../../transpiler/strip_types.zig");
+const libs_io = @import("libs_io");
+const errors = @import("errors");
 
 /// 从 filename 或 file: URL 字符串中取出文件路径（去掉 file:// 前缀）
 fn pathFromFilenameOrUrl(s: []const u8) []const u8 {
@@ -97,15 +100,16 @@ fn findPackageJSONCallback(
     const path_slice = getPathStringFromValue(ctx, base_val, &path_buf) orelse return jsc.JSValueMakeUndefined(ctx);
     const base_path = pathFromFilenameOrUrl(path_slice);
     // 用 specifier 解析得到起始路径（相对路径或 node_modules 裸说明符）；未解析到时从 base 所在目录开始
+    const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
     const resolved = require_mod.resolveSpecifierForPackageJson(allocator, base_path, specifier);
     const start_dir = if (resolved) |path| blk: {
         defer allocator.free(path);
-        var d = std.fs.openDirAbsolute(path, .{}) catch {
-            const f = std.fs.openFileAbsolute(path, .{}) catch break :blk allocator.dupe(u8, std.fs.path.dirname(base_path) orelse ".") catch return jsc.JSValueMakeUndefined(ctx);
-            f.close();
+        var d = libs_io.openDirAbsolute(path, .{}) catch {
+            const f = libs_io.openFileAbsolute(path, .{}) catch break :blk allocator.dupe(u8, std.fs.path.dirname(base_path) orelse ".") catch return jsc.JSValueMakeUndefined(ctx);
+            f.close(io);
             break :blk allocator.dupe(u8, std.fs.path.dirname(path) orelse ".") catch return jsc.JSValueMakeUndefined(ctx);
         };
-        d.close();
+        d.close(io);
         break :blk allocator.dupe(u8, path) catch return jsc.JSValueMakeUndefined(ctx);
     } else allocator.dupe(u8, std.fs.path.dirname(base_path) orelse ".") catch return jsc.JSValueMakeUndefined(ctx);
     defer allocator.free(start_dir);
@@ -113,7 +117,7 @@ fn findPackageJSONCallback(
     while (true) {
         const pkg_path = std.fs.path.join(allocator, &.{ dir, "package.json" }) catch return jsc.JSValueMakeUndefined(ctx);
         defer allocator.free(pkg_path);
-        const file = std.fs.openFileAbsolute(pkg_path, .{}) catch {
+        const file = libs_io.openFileAbsolute(pkg_path, .{}) catch {
             const parent = std.fs.path.dirname(dir) orelse break;
             if (std.mem.eql(u8, parent, dir)) break;
             const new_dir = allocator.dupe(u8, parent) catch break;
@@ -121,7 +125,7 @@ fn findPackageJSONCallback(
             dir = new_dir;
             continue;
         };
-        file.close();
+        file.close(io);
         const pkg_z = allocator.dupeZ(u8, pkg_path) catch return jsc.JSValueMakeUndefined(ctx);
         defer allocator.free(pkg_z);
         const js_str = jsc.JSStringCreateWithUTF8CString(pkg_z.ptr);
