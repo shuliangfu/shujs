@@ -552,11 +552,10 @@ fn onPackageAddedPrint(ctx: ?*anyopaque, name: []const u8, ver: []const u8) void
 }
 
 /// InstallReporter.onDone：换行结束进度条，打 "N new, M total packages" 或 "M packages installed"（无新装时）。
+/// elapsed_ms 由 package/install 从 install() 入口计时到 onDone 调用前，含 Resolving + Installing，不做虚假时间。
 /// 输出逻辑：进度条后 \n 接总结行（1 空行）；总结行末尾 \n\n 再 1 空行回到 shell。
-fn onInstallDone(ctx: ?*anyopaque, total_count: usize, new_count: usize) void {
+fn onInstallDone(ctx: ?*anyopaque, total_count: usize, new_count: usize, elapsed_ms: i64) void {
     const use_color = if (ctx) |c| @as(*ProgressState, @ptrCast(@alignCast(c))).use_color else false;
-    const start_time = if (ctx) |c| @as(*ProgressState, @ptrCast(@alignCast(c))).start_time else std.time.milliTimestamp();
-    const elapsed_ms: i64 = std.time.milliTimestamp() - start_time;
     if (new_count == 0) {
         if (use_color) {
             printToStdout("\n{s}Already up to date ({d} packages){s}\n\n", .{ c_green, total_count, c_reset }) catch {};
