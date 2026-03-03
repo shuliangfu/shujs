@@ -4,6 +4,7 @@
 const std = @import("std");
 const jsc = @import("jsc");
 const globals = @import("../../../globals.zig");
+const libs_io = @import("libs_io");
 
 const ChaCha = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
 const AesGcm = std.crypto.aead.aes_gcm.Aes256Gcm;
@@ -94,7 +95,8 @@ fn randomUUIDCallback(
     _: [*]jsc.JSValueRef,
 ) callconv(.c) jsc.JSValueRef {
     var bytes: [16]u8 = undefined;
-    std.crypto.random.bytes(&bytes);
+    const io = libs_io.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
+    io.randomSecure(&bytes) catch return jsc.JSValueMakeUndefined(ctx);
     bytes[6] = (bytes[6] & 0x0F) | 0x40;
     bytes[8] = (bytes[8] & 0x3F) | 0x80;
     var buf: [37]u8 = undefined;
@@ -242,7 +244,8 @@ fn encryptCallback(
         }
     }
     var nonce: [12]u8 = undefined;
-    std.crypto.random.bytes(&nonce);
+    const io = libs_io.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
+    io.randomSecure(&nonce) catch return jsc.JSValueMakeUndefined(ctx);
     const cipher = allocator.alloc(u8, plain.len) catch return jsc.JSValueMakeUndefined(ctx);
     var tag: [16]u8 = undefined;
     if (alg_byte == alg_aes_gcm) {
@@ -368,7 +371,8 @@ fn generateKeyPairCallback(
     const alg_opt = jsValueToUtf8Bytes(ctx, arguments[0], allocator);
     const alg = alg_opt orelse return throwCryptoError(ctx, "crypto.generateKeyPair: algorithm must be a string");
     if (!std.mem.eql(u8, alg, "X25519")) return throwCryptoError(ctx, "crypto.generateKeyPair: only X25519 is supported");
-    var kp = X25519.KeyPair.generate();
+    const io = libs_io.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
+    var kp = X25519.KeyPair.generate(io);
     const pub_b64 = base64EncodeAlloc(allocator, &kp.public_key) catch return jsc.JSValueMakeUndefined(ctx);
     const sec_b64 = base64EncodeAlloc(allocator, &kp.secret_key) catch return jsc.JSValueMakeUndefined(ctx);
     const result = jsc.JSObjectMake(ctx, null, null);
@@ -407,10 +411,11 @@ fn encryptWithPublicKeyCallback(
     const decoded_pub = base64DecodeAlloc(allocator, pub_b64) catch return throwCryptoError(ctx, "crypto.encryptWithPublicKey: invalid publicKey base64");
     if (decoded_pub.len != X25519.public_length) return throwCryptoError(ctx, "crypto.encryptWithPublicKey: publicKey must be 32 bytes (base64 decoded)");
     @memcpy(&recipient_pub, decoded_pub[0..X25519.public_length]);
-    var ephemeral = X25519.KeyPair.generate();
+    const io = libs_io.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
+    var ephemeral = X25519.KeyPair.generate(io);
     var shared = X25519.scalarmult(ephemeral.secret_key, recipient_pub) catch return throwCryptoError(ctx, "crypto.encryptWithPublicKey: invalid recipient public key");
     var nonce: [nonce_len]u8 = undefined;
-    std.crypto.random.bytes(&nonce);
+    io.randomSecure(&nonce) catch return jsc.JSValueMakeUndefined(ctx);
     const cipher = allocator.alloc(u8, plain.len) catch return jsc.JSValueMakeUndefined(ctx);
     var tag: [tag_len]u8 = undefined;
     ChaCha.encrypt(cipher, &tag, plain, "", nonce, shared);
