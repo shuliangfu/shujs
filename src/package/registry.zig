@@ -1,6 +1,6 @@
 // npm/JSR registry：解析版本、获取 tarball URL、下载 tarball 到缓存
 // 参考：docs/PACKAGE_DESIGN.md §7；与 cache.zig、install.zig 配合
-// 文件 I/O 经 io_core（§3.0）；网络请求统一经 io_core.http（Zig + libcurl 双路径，支持超时）
+// 文件 I/O 经 io_core（§3.0）；网络请求统一经 io_core.http（Zig 路径）
 
 const std = @import("std");
 const io_core = @import("io_core");
@@ -10,7 +10,7 @@ const npmrc = @import("npmrc.zig");
 /// 默认 npm registry 根 URL（无末尾斜杠），与 REGISTRY_LIST[0] 一致
 pub const DEFAULT_REGISTRY = "https://registry.npmjs.org";
 
-/// 判断是否为默认 registry（含 .npmrc 中带尾斜杠的写法），以便走多镜像探测与 libcurl 回退
+/// 判断是否为默认 registry（含 .npmrc 中带尾斜杠的写法），以便走多镜像探测与回退
 fn isDefaultRegistry(registry_base: []const u8) bool {
     if (std.mem.eql(u8, registry_base, DEFAULT_REGISTRY)) return true;
     if (std.mem.eql(u8, registry_base, "https://registry.npmjs.org/")) return true;
@@ -25,7 +25,7 @@ pub const REGISTRY_LIST = [_][]const u8{
 };
 /// 全量探测时每个镜像的最大等待时间（秒），避免不可达镜像一直卡住
 const PROBE_TIMEOUT_SEC = 5;
-/// 无 client 时 registryGet 使用的超时（秒）；>0 使 request() 走 libcurl，避免 Zig 路径 ReadFailed 无重试
+/// 无 client 时 registryGet 使用的超时（秒）；保留 API 兼容，当前 Zig 路径未实现请求超时
 const REGISTRY_GET_FALLBACK_TIMEOUT_SEC: u32 = 30;
 /// 单包 registry 元数据最大响应体字节数：默认 2GB，实际包元数据不会接近此值，相当于不限制。可通过环境变量 SHU_REGISTRY_META_MAX_BYTES 调低（如省内存）。
 const REGISTRY_META_MAX_BYTES_DEFAULT = 2 * 1024 * 1024 * 1024;
@@ -385,7 +385,7 @@ pub fn resolveVersionTarballAndDeps(
     version_spec: []const u8,
     client: ?*std.http.Client,
 ) !TarballAndDepsResult {
-    // 有 client 时走 Zig 路径（registryGetWithClient），无则走 libcurl（registryGet）。用于验证 Zig Client 请求是否可用。
+    // 有 client 时走 registryGetWithClient（复用连接），无则走 registryGet（单次 Client）。
     // 优先读元数据缓存，避免重复请求 registry
     const cache_root = cache.getCacheRoot(allocator) catch null;
     var registry_host: ?[]const u8 = null;
@@ -833,7 +833,7 @@ fn debugLogRegistryResponse(url: []const u8, body_trimmed: []const u8) void {
     w.interface.flush() catch return;
 }
 
-/// 使用 io_core.http 发 GET，带 npm registry 的 Accept 与 User-Agent。timeout_sec > 0 时走带超时的 request（libcurl），避免 probe/fallback 在慢或挂死镜像上无限等待；timeout_sec == 0 时走 Zig 路径（一次性 std.http.Client）。accept_encoding = "identity" 避免服务端返回 br/gzip 导致解压失败。调用方 free 返回的切片。
+/// 使用 io_core.http 发 GET，带 npm registry 的 Accept 与 User-Agent。accept_encoding = "identity" 避免服务端返回 br/gzip 导致解压失败。调用方 free 返回的切片。
 fn registryGet(allocator: std.mem.Allocator, url: []const u8, max_bytes: usize, timeout_sec: u32) ![]const u8 {
     if (timeout_sec > 0) {
         return io_core.http.get(allocator, url, .{
@@ -885,10 +885,13 @@ pub fn fetchUrlForJsrMeta(allocator: std.mem.Allocator, url: []const u8, max_byt
 }
 
 /// 与 fetchUrlForJsrMeta 相同，但使用已有 std.http.Client 以复用连接（Keep-Alive）；走 Zig 路径、无超时。供 JSR 下载 worker 多请求复用同一连接。
-/// 不设 accept_encoding（曾用 identity 避免 ReadFailed，但部分环境仍回 gzip 且未带正确 Content-Encoding，导致 JsrMetaParseError；改回默认 gzip，依赖既有 ReadFailed 重试）。
+/// JSR (jsr.io) 返回 Transfer-Encoding: chunked + Content-Encoding: gzip，npm 镜像多返回 Content-Length，故 JSR 易触发 Zig chunked 读 0 字节、npm 不报错。
+/// 使用 accept_encoding = "identity" 时 CDN 常回 Content-Length，走 content-length 路径可避免 chunked 导致的 ReadFailed；用 gzip 则需接受偶发 ReadFailed。
 pub fn fetchUrlForJsrMetaWithClient(client: *std.http.Client, allocator: std.mem.Allocator, url: []const u8, max_bytes: usize) ![]const u8 {
     return io_core.http.getWithClient(client, allocator, url, .{
         .accept = "application/json",
+        // .accept_encoding = "identity",
+        .accept_encoding = "gzip, deflate",
         .max_bytes = max_bytes,
         .user_agent = REGISTRY_USER_AGENT,
         .timeout_sec = 0,
