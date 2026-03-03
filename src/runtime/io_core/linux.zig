@@ -31,7 +31,7 @@
 // 4) 槽位 SoA：已实现，slot_data 为 MultiArrayList(SlotFields)，热路径按字段访问。
 //
 // --- 微米级压榨（已做）---
-// 5) 冷路径提示：错误与早期 return 分支使用 @branchHint(.cold)（Zig 0.15 官方 builtin），利于 CPU 流水线与分支预测。
+// 5) 冷路径提示：错误与早期 return 分支使用 @branchHint(.cold)（Zig 0.16 官方 builtin），利于 CPU 流水线与分支预测。
 // 6) 批量提交：提供 submitAcceptWithBufferDeferred + flushSubmits()；降级模式（无 SQPOLL）下可先循环 Deferred 再一次 flushSubmits，将多次 submit 合并为一次系统调用。
 //
 // --- 物理极限级（指令集/硬件拓扑）---
@@ -440,7 +440,7 @@ pub const HighPerfIO = struct {
         const res = cqe.res;
         const buffer_id = cqe.flags >> 16;
         if (tag == .recv) {
-            const client_stream: std.net.Stream = .{ .handle = client_fd };
+            const client_stream: std.Io.net.Stream = .{ .handle = client_fd };
             if (res < 0) {
                 @branchHint(.cold);
                 self.pushCompletion(caller_ud, null, 0, error.FileRead, client_stream);
@@ -491,7 +491,7 @@ pub const HighPerfIO = struct {
         self.pushCompletionSend(caller_ud, len);
     }
 
-    inline fn pushCompletion(self: *HighPerfIO, user_data: usize, buffer_ptr: ?[*]const u8, len: usize, err: ?api.SendFileError, client_stream: ?std.net.Stream) void {
+    inline fn pushCompletion(self: *HighPerfIO, user_data: usize, buffer_ptr: ?[*]const u8, len: usize, err: ?api.SendFileError, client_stream: ?std.Io.net.Stream) void {
         if (self.completion_count >= self.completion_buffer.len) return;
         self.completion_buffer[self.completion_count] = .{
             .user_data = user_data,
@@ -534,7 +534,7 @@ pub const HighPerfIO = struct {
     }
 
     /// 在连接上提交一次 recv；数据由内核写入 provide_buffers 池，完成时 tag=recv、chunk_index 为 buffer_id（releaseChunk 在 Linux 为 no-op）
-    pub fn submitRecv(self: *HighPerfIO, stream: std.net.Stream, user_data: usize) void {
+    pub fn submitRecv(self: *HighPerfIO, stream: std.Io.net.Stream, user_data: usize) void {
         const idx = self.slot_cache.take() orelse return;
         const gid = BUFFER_GROUP_ID_DEFAULT;
         const grp = &self.groups[gid];
@@ -564,7 +564,7 @@ pub const HighPerfIO = struct {
     }
 
     /// 在连接上提交 send；data 在完成前须保持有效
-    pub fn submitSend(self: *HighPerfIO, stream: std.net.Stream, data: []const u8, user_data: usize) void {
+    pub fn submitSend(self: *HighPerfIO, stream: std.Io.net.Stream, data: []const u8, user_data: usize) void {
         if (data.len == 0) return;
         const idx = self.slot_cache.take() orelse return;
         self.slot_data.set(idx, .{ .tag = .conn_send, .listen_fd = 0, .client_fd = @intCast(stream.handle), .caller_user_data = user_data, .accept_group_id = 0, .recv_group_id = 0 });
@@ -583,7 +583,7 @@ pub const HighPerfIO = struct {
 };
 
 /// 零拷贝：文件 → 网络（Linux sendfile）；循环发送直至 count 或错误，EAGAIN 时重试
-pub fn sendFile(stream: std.net.Stream, file: std.fs.File, offset: u64, count: u64) api.SendFileError!void {
+pub fn sendFile(stream: std.Io.net.Stream, file: std.fs.File, offset: u64, count: u64) api.SendFileError!void {
     const socket_fd = stream.handle;
     const file_fd = file.handle;
     var off: i64 = @intCast(offset);
