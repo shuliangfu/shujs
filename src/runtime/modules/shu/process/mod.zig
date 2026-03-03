@@ -4,6 +4,8 @@
 
 const std = @import("std");
 const jsc = @import("jsc");
+const errors = @import("errors");
+const libs_process = @import("libs_process");
 const run_options_mod = @import("../../../run_options.zig");
 const fork_child = @import("../system/fork_child.zig");
 const thread_worker = @import("../threads/worker.zig");
@@ -47,13 +49,15 @@ pub fn register(allocator: std.mem.Allocator, ctx: jsc.JSGlobalContextRef, optio
     defer jsc.JSStringRelease(name_env);
     const env_obj = jsc.JSObjectMake(ctx, null, null);
     if (options.permissions.allow_env) {
-        var env_map = std.process.getEnvMap(allocator) catch return;
+        const env_block = libs_process.getProcessEnviron() orelse return;
+        var env_map = std.process.Environ.createMap(env_block, allocator) catch return;
         defer env_map.deinit();
-        var it = env_map.iterator();
-        while (it.next()) |entry| {
-            const k_z = allocator.dupeZ(u8, entry.key_ptr.*) catch continue;
+        const keys = env_map.keys();
+        const vals = env_map.values();
+        for (keys, vals) |k, v| {
+            const k_z = allocator.dupeZ(u8, k) catch continue;
             defer allocator.free(k_z);
-            const v_z = allocator.dupeZ(u8, entry.value_ptr.*) catch continue;
+            const v_z = allocator.dupeZ(u8, v) catch continue;
             defer allocator.free(v_z);
             const k_ref = jsc.JSStringCreateWithUTF8CString(k_z.ptr);
             defer jsc.JSStringRelease(k_ref);
