@@ -83,23 +83,22 @@ fn findNodeModulesPackage(allocator: std.mem.Allocator, parent_dir: []const u8, 
             continue;
         };
         sub.close();
-        return io_core.pathResolve(allocator, &.{ nm_path }) catch return null;
+        return io_core.pathResolve(allocator, &.{nm_path}) catch return null;
     }
     return null;
 }
 
-/// jsr:@scope/name 转为 npm 兼容名 @jsr/scope__name；供 install 与 resolver 使用，返回的切片由调用方 free。
-pub fn jsrToNpmSpecifier(allocator: std.mem.Allocator, jsr_spec: []const u8) ![]const u8 {
+/// 从 jsr:@scope/name 或 jsr:@scope/name@version 提取 @scope/name（不含 jsr: 与版本），与 Deno 写法一致；供 install 与 resolver 查找 node_modules/@scope/name。返回的切片由调用方 free。
+pub fn jsrSpecToScopeName(allocator: std.mem.Allocator, jsr_spec: []const u8) ![]const u8 {
     if (!std.mem.startsWith(u8, jsr_spec, prefix_jsr)) return error.InvalidJsrSpecifier;
-    const rest = jsr_spec[prefix_jsr.len..];
-    if (rest.len == 0) return error.InvalidJsrSpecifier;
-    if (rest[0] != '@') return error.InvalidJsrSpecifier;
-    var out = std.ArrayList(u8).initCapacity(allocator, rest.len + 8) catch return error.OutOfMemory;
-    try out.appendSlice(allocator, "@jsr/");
-    for (rest["@".len..]) |c| {
-        if (c == '/') try out.appendSlice(allocator, "__") else try out.append(allocator, c);
+    var rest = jsr_spec[prefix_jsr.len..];
+    if (rest.len == 0 or rest[0] != '@') return error.InvalidJsrSpecifier;
+    if (std.mem.indexOf(u8, rest, "/") == null) return error.InvalidJsrSpecifier;
+    // 去掉末尾 @version，只保留 @scope/name
+    if (std.mem.lastIndexOf(u8, rest, "@")) |last_at| {
+        if (last_at > 0 and std.mem.indexOf(u8, rest[0..last_at], "/") != null) rest = rest[0..last_at];
     }
-    return out.toOwnedSlice(allocator);
+    return allocator.dupe(u8, rest);
 }
 
 /// 在包目录 pkg_dir 内根据 main/exports 与 subpath 解析出入口文件绝对路径。allocator 用于路径拼接与可能的 export 模式展开；返回路径调用方负责 free（或来自 arena）。
@@ -170,9 +169,9 @@ pub fn resolve(
     if (std.mem.startsWith(u8, path_part, prefix_http)) return error.HttpNotSupported;
 
     if (std.mem.startsWith(u8, path_part, prefix_jsr)) {
-        const npm_spec = jsrToNpmSpecifier(allocator, path_part) catch return error.InvalidJsrSpecifier;
-        defer allocator.free(npm_spec);
-        const pkg_dir = findNodeModulesPackage(allocator, parent_dir, npm_spec) orelse return error.ModuleNotFound;
+        const scope_name = jsrSpecToScopeName(allocator, path_part) catch return error.InvalidJsrSpecifier;
+        defer allocator.free(scope_name);
+        const pkg_dir = findNodeModulesPackage(allocator, parent_dir, scope_name) orelse return error.ModuleNotFound;
         defer allocator.free(pkg_dir);
         const file_path = try resolvePackageEntry(allocator, pkg_dir, "", condition);
         errdefer allocator.free(file_path);
