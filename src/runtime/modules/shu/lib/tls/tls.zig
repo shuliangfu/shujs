@@ -133,26 +133,26 @@ pub const TlsPending = if (build_options.have_tls) struct {
 /// 当 have_tls 时的 TLS 流：包装底层 TCP stream，读写经 TLS 加解密
 pub const TlsStream = if (build_options.have_tls) struct {
     /// 底层 TCP 连接（close 时由本结构负责关闭）
-    underlying: std.net.Stream,
+    underlying: std.Io.net.Stream,
     /// C 层 TLS 连接句柄
     conn: *opaque {},
 
     /// 从非阻塞握手得到的 C conn 与底层 stream 构造 TlsStream（用于握手完成后；含 BIO 模式 conn）
-    pub fn fromConn(underlying: std.net.Stream, conn: *anyopaque) @This() {
+    pub fn fromConn(underlying: std.Io.net.Stream, conn: *anyopaque) @This() {
         return .{ .underlying = underlying, .conn = @ptrCast(conn) };
     }
 
     /// 在已 accept 的 stream 上做服务端 TLS 握手（阻塞）；失败返回错误，调用方需 close(stream)
-    pub fn accept(underlying: std.net.Stream, ctx: *const TlsContext) !@This() {
-        const fd = underlying.handle;
+    pub fn accept(underlying: std.Io.net.Stream, ctx: *const TlsContext) !@This() {
+        const fd = underlying.socket.handle;
         const conn = c.tls_accept(@ptrCast(ctx.ptr), fd);
         if (conn == null) return error.TlsHandshakeFailed;
         return .{ .underlying = underlying, .conn = @ptrCast(conn) };
     }
 
     /// 在已连接的 TCP stream 上做客户端 TLS 握手（阻塞）；servername 用于 SNI，可为 null；allocator 用于复制 servername 为 C 字符串
-    pub fn connect(underlying: std.net.Stream, client_ctx: *const TlsClientContext, servername: ?[]const u8, allocator: std.mem.Allocator) !@This() {
-        const fd = underlying.handle;
+    pub fn connect(underlying: std.Io.net.Stream, client_ctx: *const TlsClientContext, servername: ?[]const u8, allocator: std.mem.Allocator) !@This() {
+        const fd = underlying.socket.handle;
         const name_z = if (servername) |s| allocator.dupeZ(u8, s) catch return error.TlsHandshakeFailed else null;
         defer if (name_z) |z| allocator.free(z);
         const name_ptr: [*]const u8 = if (name_z) |z| z.ptr else @ptrCast("");
@@ -260,19 +260,19 @@ pub const TlsStream = if (build_options.have_tls) struct {
         }
     }
 
-    /// 关闭 TLS 并关闭底层 stream
-    pub fn close(self: *@This()) void {
+    /// 关闭 TLS 并关闭底层 stream。0.16：underlying.close(io)
+    pub fn close(self: *@This(), io: std.Io) void {
         c.tls_close(@ptrCast(self.conn));
         self.conn = undefined;
-        self.underlying.close();
+        self.underlying.close(io);
     }
 
     const c = @cImport({
         @cInclude("tls.h");
     });
 } else struct {
-    underlying: std.net.Stream,
-    pub fn accept(_: std.net.Stream, _: *const TlsContext) !@This() {
+    underlying: std.Io.net.Stream,
+    pub fn accept(_: std.Io.net.Stream, _: *const TlsContext) !@This() {
         return error.TlsNotCompiled;
     }
     pub fn read(_: *@This(), _: []u8) !usize {
@@ -281,5 +281,5 @@ pub const TlsStream = if (build_options.have_tls) struct {
     pub fn writeAll(_: *@This(), _: []const u8) !void {
         return error.TlsNotCompiled;
     }
-    pub fn close(_: *@This()) void {}
+    pub fn close(_: *@This(), _: std.Io) void {}
 };
