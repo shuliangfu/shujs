@@ -3,17 +3,10 @@
   "version": "0.0.1",
   "type": "module",
   "dependencies": {
-    "express": "^5.2.1"
+    "preact": "^10.28.4"
   },
   "imports": {
     "@dreamer/view": "jsr:@dreamer/view@^1.1.2",
-    "@dreamer/dweb": "jsr:@dreamer/dweb@^3.0.95",
-    "@dreamer/console": "jsr:@dreamer/console@^1.0.12"
-  },
-  "devDependencies": {
-    "globals": "^16.0.0",
-    "vite": "^7.3.1",
-    "eslint": "^10.0.2",
-    "@eslint/js": "^10.0.1"
+    "@dreamer/dweb": "jsr:@dreamer/dweb@^3.0.95"
   }
 }
