@@ -367,7 +367,7 @@ fn pathRelativeCallback(
     defer allocator.free(from);
     const to = getPathArg(allocator, ctx, arguments, argumentCount, 1) orelse return jsc.JSValueMakeUndefined(ctx);
     defer allocator.free(to);
-    const rel = std.fs.path.relative(allocator, from, to) catch return jsc.JSValueMakeUndefined(ctx);
+    const rel = std.fs.path.relative(allocator, "", null, from, to) catch return jsc.JSValueMakeUndefined(ctx);
     defer allocator.free(rel);
     return stringToJS(ctx, allocator, rel);
 }
@@ -665,7 +665,9 @@ fn percentEncodePath(allocator: std.mem.Allocator, path: []const u8) ![]const u8
             '\\' => try list.append(allocator, '/'), // 在 URL 中统一用 /
             else => {
                 try list.append(allocator, '%');
-                try std.fmt.format(list.writer(allocator), "{X:0>2}", .{c});
+                var hex_buf: [2]u8 = undefined;
+                _ = std.fmt.bufPrint(&hex_buf, "{X:0>2}", .{c}) catch break;
+                try list.appendSlice(allocator, &hex_buf);
             },
         }
     }
