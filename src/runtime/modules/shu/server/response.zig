@@ -1,5 +1,5 @@
 // HTTP 响应构建与写出：statusPhrase、getResponse*、writeHttpResponse、sendfile 等
-// 供 mod.zig / conn / h2 等调用；文件→网络零拷贝统一走 io_core.sendFile，避免与 io_core 重复实现
+// 供 mod.zig / conn / h2 等调用；文件→网络零拷贝统一走 libs_io.sendFile，避免与 io_core 重复实现
 //
 // 响应头优化：Date 按秒缓存，避免每请求格式化；Server 头支持 config.server_header 或默认 "Shu" 预编码写入。
 
@@ -7,10 +7,12 @@ const std = @import("std");
 const jsc = @import("jsc");
 const types = @import("types.zig");
 const builtin = @import("builtin");
-const io_core = @import("io_core");
+const libs_io = @import("libs_io");
+const errors = @import("errors");
+const libs_process = @import("libs_process");
 const epoch = std.time.epoch;
 
-/// 当前平台是否支持 io_core.sendFile（Linux/Darwin/BSD/Windows）；comptime 分派
+/// 当前平台是否支持 libs_io.sendFile（Linux/Darwin/BSD/Windows）；comptime 分派
 const sendfile_platform_ok = builtin.os.tag == .linux or builtin.os.tag == .macos or builtin.os.tag == .freebsd or builtin.os.tag == .netbsd or builtin.os.tag == .openbsd or builtin.os.tag == .windows;
 /// 是否用 writev 合并头+体（POSIX 有 writev，Windows 无）；comptime 分派
 const use_writev_for_body = builtin.os.tag != .windows;
@@ -55,10 +57,11 @@ var date_cache_len: usize = 0;
 
 /// 返回当前时间的 HTTP Date 头值（带秒级缓存）；用于响应头 "Date: {slice}\r\n"
 fn getCachedDateHeader() []const u8 {
-    const sec = std.time.timestamp();
+    const io = libs_process.getProcessIo() orelse return date_cache_buf[0..date_cache_len];
+    const sec = @divTrunc(std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds, std.time.ns_per_s);
     if (sec != date_cache_sec) {
-        date_cache_sec = sec;
-        const slice = formatHttpDate(sec, &date_cache_buf);
+        date_cache_sec = @as(i64, @intCast(sec));
+        const slice = formatHttpDate(@as(i64, @intCast(sec)), &date_cache_buf);
         date_cache_len = slice.len;
         return slice;
     }
@@ -194,21 +197,61 @@ pub fn statusPhrase(status: u16) []const u8 {
     };
 }
 
-/// 零拷贝发送文件到 socket：stream 为 *std.net.Stream 且平台在 io_core 支持范围内时调用 io_core.sendFile（含 Windows TransmitFile），否则回退为分块 read+write
+/// 零拷贝发送文件到 socket：stream 为 *std.Io.net.Stream 且平台支持时调用 libs_io.sendFile，否则回退为分块 read+write。0.16：支持 std.Io.File，需传入 io。
 /// 回退路径 buffer 大小（无 sendfile 时 read+write 循环；规范 §1.2 禁止栈上 64KB）
 const SENDFILE_FALLBACK_BUF_SIZE = 64 * 1024;
 
-/// 将文件内容写入 stream；支持 sendfile 的平台零拷贝，否则按块 read+write。allocator 用于回退路径的块 buffer，调用方负责传入。
-pub fn sendfileToStream(allocator: std.mem.Allocator, stream: anytype, file: std.fs.File, file_size: u64) !void {
+/// 将文件内容写入 stream；支持 sendfile 时零拷贝，否则按块 read+write。file 可为 std.Io.File（0.16）或 std.fs.File；传 io 供 Io.File 与 stream.writer 使用。
+pub fn sendfileToStream(allocator: std.mem.Allocator, stream: anytype, file: anytype, file_size: u64, io: std.Io) !void {
     if (file_size == 0) return;
-    if (@TypeOf(stream) == *std.net.Stream and sendfile_platform_ok) {
-        io_core.sendFile(stream.*, file, 0, file_size) catch |e| {
+    if (@TypeOf(stream) == *std.Io.net.Stream and sendfile_platform_ok) {
+        if (@TypeOf(file) == std.Io.File) {
+            const fs_file = std.fs.File{ .handle = file.handle };
+            libs_io.sendFile(stream.*, fs_file, 0, file_size) catch |e| {
+                return switch (e) {
+                    libs_io.SendFileError.FileRead => error.FileRead,
+                    libs_io.SendFileError.SocketWrite => error.SocketWrite,
+                    else => error.SendfileFailed,
+                };
+            };
+            return;
+        }
+        libs_io.sendFile(stream.*, file, 0, file_size) catch |e| {
             return switch (e) {
-                io_core.SendFileError.FileRead => error.FileRead,
-                io_core.SendFileError.SocketWrite => error.SocketWrite,
+                libs_io.SendFileError.FileRead => error.FileRead,
+                libs_io.SendFileError.SocketWrite => error.SocketWrite,
                 else => error.SendfileFailed,
             };
         };
+        return;
+    }
+    if (@TypeOf(file) == std.Io.File) {
+        var rbuf: [SENDFILE_FALLBACK_BUF_SIZE]u8 = undefined;
+        var r = file.reader(io, &rbuf);
+        if (@TypeOf(stream) == *std.Io.net.Stream) {
+            var wbuf: [8192]u8 = undefined;
+            var w = stream.writer(io, &wbuf);
+            var remaining = file_size;
+            while (remaining > 0) {
+                const to_read = @min(rbuf.len, remaining);
+                var dest = [1][]u8{rbuf[0..to_read]};
+                const n = std.Io.Reader.readVec(&r.interface, &dest) catch return error.FileRead;
+                if (n == 0) break;
+                _ = std.Io.Writer.writeVec(&w.interface, &.{rbuf[0..n]}) catch return error.SocketWrite;
+                try w.interface.flush();
+                remaining -= n;
+            }
+        } else {
+            var remaining = file_size;
+            while (remaining > 0) {
+                const to_read = @min(rbuf.len, remaining);
+                var dest = [1][]u8{rbuf[0..to_read]};
+                const n = std.Io.Reader.readVec(&r.interface, &dest) catch return error.FileRead;
+                if (n == 0) break;
+                try stream.writeAll(rbuf[0..n]);
+                remaining -= n;
+            }
+        }
         return;
     }
     const buf = allocator.alloc(u8, SENDFILE_FALLBACK_BUF_SIZE) catch return error.OutOfMemory;
@@ -218,12 +261,15 @@ pub fn sendfileToStream(allocator: std.mem.Allocator, stream: anytype, file: std
         const to_read = @min(buf.len, remaining);
         const n = file.read(buf[0..to_read]) catch return error.FileRead;
         if (n == 0) break;
-        try stream.writeAll(buf[0..n]);
+        var wbuf: [8192]u8 = undefined;
+        var w = stream.writer(io, &wbuf);
+        _ = std.Io.Writer.writeVec(&w.interface, &.{buf[0..n]}) catch return error.SocketWrite;
+        try w.interface.flush();
         remaining -= n;
     }
 }
 
-/// 从文件路径写 HTTP 响应（零拷贝 body：POSIX 下用 sendfile）。不压缩；Content-Length 为文件大小。
+/// 从文件路径写 HTTP 响应（零拷贝 body：POSIX 下用 sendfile）。不压缩；Content-Length 为文件大小。0.16：经 io_core 打开文件，file.close(io)。
 pub fn writeHttpResponseFromFile(
     allocator: std.mem.Allocator,
     stream: anytype,
@@ -235,14 +281,20 @@ pub fn writeHttpResponseFromFile(
     use_keep_alive: bool,
     header_buf: ?*std.ArrayList(u8),
 ) !void {
-    const file = std.fs.openFileAbsolute(path, .{}) catch blk: {
-        break :blk std.fs.cwd().openFile(path, .{}) catch {
+    const io = libs_process.getProcessIo() orelse return error.NoProcessIo;
+    const file = libs_io.openFileAbsolute(path, .{ .mode = .read_only }) catch blk: {
+        var cwd_dir = libs_io.openDirCwd(".", .{}) catch {
+            try writeHttpResponse(allocator, stream, config, 404, "Not Found", null, null, "Not Found", false, header_buf);
+            return error.FileNotFound;
+        };
+        defer cwd_dir.close(io);
+        break :blk cwd_dir.openFile(io, path, .{}) catch {
             try writeHttpResponse(allocator, stream, config, 404, "Not Found", null, null, "Not Found", false, header_buf);
             return error.FileNotFound;
         };
     };
-    defer file.close();
-    const stat = file.stat() catch return error.BadPath;
+    defer file.close(io);
+    const stat = file.stat(io) catch return error.BadPath;
     if (stat.kind != .file) {
         try writeHttpResponse(allocator, stream, config, 400, "Bad Request", null, null, "Not a file", false, header_buf);
         return;
@@ -256,19 +308,41 @@ pub fn writeHttpResponseFromFile(
         break :blk &new_list;
     };
     defer if (header_buf == null) list.deinit(allocator);
-    const w = list.writer(allocator);
-    try w.print("HTTP/1.1 {d} {s}\r\n", .{ status, phrase });
-    if (content_type) |ct| try w.print("Content-Type: {s}\r\n", .{ct});
-    try w.print("Content-Length: {d}\r\n", .{file_size});
-    if (use_keep_alive and config.keep_alive_timeout_sec > 0) {
-        try w.print("Connection: keep-alive\r\nKeep-Alive: timeout={d}\r\n\r\n", .{config.keep_alive_timeout_sec});
-    } else if (use_keep_alive) {
-        try w.writeAll("Connection: keep-alive\r\n\r\n");
-    } else {
-        try w.writeAll("Connection: close\r\n\r\n");
+    // 0.16：与 writeHttpResponse 一致，用 bufPrint + ensureUnusedCapacity 拼装头
+    var line_buf: [256]u8 = undefined;
+    var part = std.fmt.bufPrint(&line_buf, "HTTP/1.1 {d} {s}\r\n", .{ status, phrase }) catch return error.BufferTooSmall;
+    try list.ensureUnusedCapacity(allocator, part.len);
+    list.appendSliceAssumeCapacity(part);
+    if (content_type) |ct| {
+        part = std.fmt.bufPrint(&line_buf, "Content-Type: {s}\r\n", .{ct}) catch return error.BufferTooSmall;
+        try list.ensureUnusedCapacity(allocator, part.len);
+        list.appendSliceAssumeCapacity(part);
     }
-    try stream.writeAll(list.items);
-    try sendfileToStream(allocator, stream, file, file_size);
+    part = std.fmt.bufPrint(&line_buf, "Content-Length: {d}\r\n", .{file_size}) catch return error.BufferTooSmall;
+    try list.ensureUnusedCapacity(allocator, part.len);
+    list.appendSliceAssumeCapacity(part);
+    if (use_keep_alive and config.keep_alive_timeout_sec > 0) {
+        part = std.fmt.bufPrint(&line_buf, "Connection: keep-alive\r\nKeep-Alive: timeout={d}\r\n\r\n", .{config.keep_alive_timeout_sec}) catch return error.BufferTooSmall;
+        try list.ensureUnusedCapacity(allocator, part.len);
+        list.appendSliceAssumeCapacity(part);
+    } else if (use_keep_alive) {
+        const ka = "Connection: keep-alive\r\n\r\n";
+        try list.ensureUnusedCapacity(allocator, ka.len);
+        list.appendSliceAssumeCapacity(ka);
+    } else {
+        const close_hdr = "Connection: close\r\n\r\n";
+        try list.ensureUnusedCapacity(allocator, close_hdr.len);
+        list.appendSliceAssumeCapacity(close_hdr);
+    }
+    if (@TypeOf(stream) == *std.Io.net.Stream) {
+        var wbuf: [8192]u8 = undefined;
+        var w = stream.writer(io, &wbuf);
+        _ = std.Io.Writer.writeVec(&w.interface, &.{list.items}) catch return;
+        try w.interface.flush();
+    } else {
+        try stream.writeAll(list.items);
+    }
+    try sendfileToStream(allocator, stream, file, file_size, io);
 }
 
 /// 写 HTTP 响应：状态行 + 可选 Content-Type / Content-Encoding + Connection + body
@@ -293,60 +367,131 @@ pub fn writeHttpResponse(
         break :blk &new_list;
     };
     defer if (header_buf == null) list.deinit(allocator);
-    const w = list.writer(allocator);
-    try w.print("HTTP/1.1 {d} {s}\r\n", .{ status, phrase });
-    try w.print("Date: {s}\r\n", .{getCachedDateHeader()});
-    if (config.server_header) |v| try w.print("Server: {s}\r\n", .{v}) else try w.writeAll(DEFAULT_SERVER_HEADER);
+    // 0.16：ArrayList 无 list.writer(allocator)，用 bufPrint + ensureUnusedCapacity + appendSliceAssumeCapacity 拼装头；part 为 []u8，传 part.len 给 ensureUnusedCapacity
+    var line_buf: [512]u8 = undefined;
+    var part = std.fmt.bufPrint(&line_buf, "HTTP/1.1 {d} {s}\r\n", .{ status, phrase }) catch return error.BufferTooSmall;
+    try list.ensureUnusedCapacity(allocator, part.len);
+    list.appendSliceAssumeCapacity(part);
+    part = std.fmt.bufPrint(&line_buf, "Date: {s}\r\n", .{getCachedDateHeader()}) catch return error.BufferTooSmall;
+    try list.ensureUnusedCapacity(allocator, part.len);
+    list.appendSliceAssumeCapacity(part);
+    if (config.server_header) |v| {
+        part = std.fmt.bufPrint(&line_buf, "Server: {s}\r\n", .{v}) catch return error.BufferTooSmall;
+        try list.ensureUnusedCapacity(allocator, part.len);
+        list.appendSliceAssumeCapacity(part);
+    } else {
+        try list.ensureUnusedCapacity(allocator, DEFAULT_SERVER_HEADER.len);
+        list.appendSliceAssumeCapacity(DEFAULT_SERVER_HEADER);
+    }
     if (content_type) |ct| {
-        try w.print("Content-Type: {s}\r\n", .{ct});
+        part = std.fmt.bufPrint(&line_buf, "Content-Type: {s}\r\n", .{ct}) catch return error.BufferTooSmall;
+        try list.ensureUnusedCapacity(allocator, part.len);
+        list.appendSliceAssumeCapacity(part);
     }
     if (content_encoding) |ce| {
-        try w.print("Content-Encoding: {s}\r\n", .{ce});
+        part = std.fmt.bufPrint(&line_buf, "Content-Encoding: {s}\r\n", .{ce}) catch return error.BufferTooSmall;
+        try list.ensureUnusedCapacity(allocator, part.len);
+        list.appendSliceAssumeCapacity(part);
     }
     const use_chunked = body.len > config.chunked_response_threshold;
     if (use_chunked) {
-        try w.writeAll("Transfer-Encoding: chunked\r\n");
+        const chunked_hdr = "Transfer-Encoding: chunked\r\n";
+        try list.ensureUnusedCapacity(allocator, chunked_hdr.len);
+        list.appendSliceAssumeCapacity(chunked_hdr);
     } else {
-        try w.print("Content-Length: {d}\r\n", .{body.len});
+        part = std.fmt.bufPrint(&line_buf, "Content-Length: {d}\r\n", .{body.len}) catch return error.BufferTooSmall;
+        try list.ensureUnusedCapacity(allocator, part.len);
+        list.appendSliceAssumeCapacity(part);
     }
     if (use_keep_alive and config.keep_alive_timeout_sec > 0) {
-        try w.print("Connection: keep-alive\r\nKeep-Alive: timeout={d}\r\n\r\n", .{config.keep_alive_timeout_sec});
+        part = std.fmt.bufPrint(&line_buf, "Connection: keep-alive\r\nKeep-Alive: timeout={d}\r\n\r\n", .{config.keep_alive_timeout_sec}) catch return error.BufferTooSmall;
+        try list.ensureUnusedCapacity(allocator, part.len);
+        list.appendSliceAssumeCapacity(part);
     } else if (use_keep_alive) {
-        try w.writeAll("Connection: keep-alive\r\n\r\n");
+        const ka = "Connection: keep-alive\r\n\r\n";
+        try list.ensureUnusedCapacity(allocator, ka.len);
+        list.appendSliceAssumeCapacity(ka);
     } else {
-        try w.writeAll("Connection: close\r\n\r\n");
+        const close_hdr = "Connection: close\r\n\r\n";
+        try list.ensureUnusedCapacity(allocator, close_hdr.len);
+        list.appendSliceAssumeCapacity(close_hdr);
     }
-    if (!use_chunked and use_writev_for_body and @TypeOf(stream) == *std.net.Stream) {
-        const fd = stream.handle;
+    const is_net_stream = @TypeOf(stream) == *std.Io.net.Stream;
+    if (!use_chunked and use_writev_for_body and is_net_stream) {
+        const fd = stream.socket.handle;
         var iov = [2]std.posix.iovec_const{
             .{ .base = list.items.ptr, .len = list.items.len },
             .{ .base = body.ptr, .len = body.len },
         };
-        const n = std.posix.writev(fd, iov[0..]) catch {
-            try stream.writeAll(list.items);
-            try stream.writeAll(body);
+        const n_written_raw = std.c.writev(fd, iov[0..].ptr, @as(c_int, @intCast(iov.len)));
+        if (n_written_raw < 0) {
+            const process_io = libs_process.getProcessIo() orelse return;
+            var wbuf: [8192]u8 = undefined;
+            var w = stream.writer(process_io, &wbuf);
+            _ = std.Io.Writer.writeVec(&w.interface, &.{ list.items, body }) catch return;
+            try w.interface.flush();
             return;
-        };
+        }
+        const n_written = @as(usize, @intCast(n_written_raw));
         const total = list.items.len + body.len;
-        if (n == total) return;
-        if (n < list.items.len) {
-            try stream.writeAll(list.items[n..]);
-            try stream.writeAll(body);
-        } else if (n < total) {
-            try stream.writeAll(body[n - list.items.len ..]);
+        if (n_written == total) return;
+        if (n_written < list.items.len) {
+            const process_io = libs_process.getProcessIo() orelse return;
+            var wbuf: [8192]u8 = undefined;
+            var w = stream.writer(process_io, &wbuf);
+            _ = std.Io.Writer.writeVec(&w.interface, &.{ list.items[n_written..], body }) catch return;
+            try w.interface.flush();
+        } else if (n_written < total) {
+            const process_io = libs_process.getProcessIo() orelse return;
+            var wbuf: [8192]u8 = undefined;
+            var w = stream.writer(process_io, &wbuf);
+            _ = std.Io.Writer.writeVec(&w.interface, &.{body[n_written - list.items.len ..]}) catch return;
+            try w.interface.flush();
         }
         return;
     }
-    try stream.writeAll(list.items);
-    if (use_chunked) {
-        try writeChunkedBody(stream, body, config.chunked_write_chunk_size);
+    const process_io = libs_process.getProcessIo() orelse return error.NoProcessIo;
+    if (is_net_stream) {
+        var wbuf: [8192]u8 = undefined;
+        var w = stream.writer(process_io, &wbuf);
+        _ = std.Io.Writer.writeVec(&w.interface, &.{list.items}) catch return;
+        try w.interface.flush();
+        if (use_chunked) {
+            try writeChunkedBody(stream, body, config.chunked_write_chunk_size);
+        } else {
+            _ = std.Io.Writer.writeVec(&w.interface, &.{body}) catch return;
+            try w.interface.flush();
+        }
     } else {
-        try stream.writeAll(body);
+        try stream.writeAll(list.items);
+        if (use_chunked) {
+            try writeChunkedBody(stream, body, config.chunked_write_chunk_size);
+        } else {
+            try stream.writeAll(body);
+        }
     }
 }
 
-/// 按 chunked 格式写 body：每块 hex(len)\r\n + 数据 + \r\n，结尾 0\r\n\r\n
+/// 按 chunked 格式写 body：每块 hex(len)\r\n + 数据 + \r\n，结尾 0\r\n\r\n。0.16：*std.Io.net.Stream 用 writer+writeVec，其他类型用 writeAll。
 pub fn writeChunkedBody(stream: anytype, body: []const u8, chunk_size: usize) !void {
+    const process_io = libs_process.getProcessIo() orelse return error.NoProcessIo;
+    if (@TypeOf(stream) == *std.Io.net.Stream) {
+        var wbuf: [256]u8 = undefined;
+        var w = stream.writer(process_io, &wbuf);
+        var pos: usize = 0;
+        while (pos < body.len) {
+            const take = @min(chunk_size, body.len - pos);
+            const slice = body[pos .. pos + take];
+            pos += take;
+            var buf: [32]u8 = undefined;
+            const hex_slice = std.fmt.bufPrint(&buf, "{x}\r\n", .{take}) catch buf[0..0];
+            _ = std.Io.Writer.writeVec(&w.interface, &.{ hex_slice, slice, "\r\n" }) catch return;
+            try w.interface.flush();
+        }
+        _ = std.Io.Writer.writeVec(&w.interface, &.{"0\r\n\r\n"}) catch return;
+        try w.interface.flush();
+        return;
+    }
     var pos: usize = 0;
     while (pos < body.len) {
         const take = @min(chunk_size, body.len - pos);
@@ -362,7 +507,7 @@ pub fn writeChunkedBody(stream: anytype, body: []const u8, chunk_size: usize) !v
     try stream.writeAll("0\r\n\r\n");
 }
 
-/// 将完整 HTTP 响应（状态行 + 头 + body）追加到 out，供 I/O 多路复用时先写入 buffer 再非阻塞写出
+/// 将完整 HTTP 响应（状态行 + 头 + body）追加到 out，供 I/O 多路复用时先写入 buffer 再非阻塞写出。0.16：ArrayList 无 writer，用 bufPrint + ensureUnusedCapacity + appendSliceAssumeCapacity
 pub fn writeHttpResponseToBuffer(
     allocator: std.mem.Allocator,
     config: *const types.ServerConfig,
@@ -374,24 +519,47 @@ pub fn writeHttpResponseToBuffer(
     use_keep_alive: bool,
     out: *std.ArrayList(u8),
 ) !void {
-    const w = out.writer(allocator);
-    try w.print("HTTP/1.1 {d} {s}\r\n", .{ status, phrase });
-    try w.print("Date: {s}\r\n", .{getCachedDateHeader()});
-    if (config.server_header) |v| try w.print("Server: {s}\r\n", .{v}) else try w.writeAll(DEFAULT_SERVER_HEADER);
-    if (content_type) |ct| try w.print("Content-Type: {s}\r\n", .{ct});
-    if (content_encoding) |ce| try w.print("Content-Encoding: {s}\r\n", .{ce});
+    var line_buf: [256]u8 = undefined;
+    var part = std.fmt.bufPrint(&line_buf, "HTTP/1.1 {d} {s}\r\n", .{ status, phrase }) catch return error.BufferTooSmall;
+    try out.ensureUnusedCapacity(allocator, part.len);
+    out.appendSliceAssumeCapacity(part);
+    part = std.fmt.bufPrint(&line_buf, "Date: {s}\r\n", .{getCachedDateHeader()}) catch return error.BufferTooSmall;
+    try out.ensureUnusedCapacity(allocator, part.len);
+    out.appendSliceAssumeCapacity(part);
+    if (config.server_header) |v| {
+        part = std.fmt.bufPrint(&line_buf, "Server: {s}\r\n", .{v}) catch return error.BufferTooSmall;
+        try out.ensureUnusedCapacity(allocator, part.len);
+        out.appendSliceAssumeCapacity(part);
+    } else {
+        try out.ensureUnusedCapacity(allocator, DEFAULT_SERVER_HEADER.len);
+        out.appendSliceAssumeCapacity(DEFAULT_SERVER_HEADER);
+    }
+    if (content_type) |ct| {
+        part = std.fmt.bufPrint(&line_buf, "Content-Type: {s}\r\n", .{ct}) catch return error.BufferTooSmall;
+        try out.ensureUnusedCapacity(allocator, part.len);
+        out.appendSliceAssumeCapacity(part);
+    }
+    if (content_encoding) |ce| {
+        part = std.fmt.bufPrint(&line_buf, "Content-Encoding: {s}\r\n", .{ce}) catch return error.BufferTooSmall;
+        try out.ensureUnusedCapacity(allocator, part.len);
+        out.appendSliceAssumeCapacity(part);
+    }
     const use_chunked = body.len > config.chunked_response_threshold;
     if (use_chunked) {
-        try w.writeAll("Transfer-Encoding: chunked\r\n");
+        try out.appendSlice(allocator, "Transfer-Encoding: chunked\r\n");
     } else {
-        try w.print("Content-Length: {d}\r\n", .{body.len});
+        part = std.fmt.bufPrint(&line_buf, "Content-Length: {d}\r\n", .{body.len}) catch return error.BufferTooSmall;
+        try out.ensureUnusedCapacity(allocator, part.len);
+        out.appendSliceAssumeCapacity(part);
     }
     if (use_keep_alive and config.keep_alive_timeout_sec > 0) {
-        try w.print("Connection: keep-alive\r\nKeep-Alive: timeout={d}\r\n\r\n", .{config.keep_alive_timeout_sec});
+        part = std.fmt.bufPrint(&line_buf, "Connection: keep-alive\r\nKeep-Alive: timeout={d}\r\n\r\n", .{config.keep_alive_timeout_sec}) catch return error.BufferTooSmall;
+        try out.ensureUnusedCapacity(allocator, part.len);
+        out.appendSliceAssumeCapacity(part);
     } else if (use_keep_alive) {
-        try w.writeAll("Connection: keep-alive\r\n\r\n");
+        try out.appendSlice(allocator, "Connection: keep-alive\r\n\r\n");
     } else {
-        try w.writeAll("Connection: close\r\n\r\n");
+        try out.appendSlice(allocator, "Connection: close\r\n\r\n");
     }
     if (!use_chunked) {
         try out.appendSlice(allocator, body);
