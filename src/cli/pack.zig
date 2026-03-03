@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const args = @import("args.zig");
+const cli_version = @import("version.zig");
 const manifest = @import("../package/manifest.zig");
 const io_core = @import("io_core");
 const shu_zlib = @import("../runtime/modules/shu/zlib/gzip.zig");
@@ -20,6 +21,7 @@ const shu_zlib = @import("../runtime/modules/shu/zlib/gzip.zig");
 pub fn pack(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional: []const []const u8) !void {
     _ = parsed;
     _ = positional;
+    try cli_version.printCommandHeader("pack");
     var cwd_buf: [1024]u8 = undefined;
     const cwd = std.posix.getcwd(&cwd_buf) catch return error.CwdFailed;
     const cwd_owned = allocator.dupe(u8, cwd) catch return error.OutOfMemory;
@@ -27,7 +29,7 @@ pub fn pack(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional: [
 
     var loaded = manifest.Manifest.load(allocator, cwd_owned) catch |e| {
         if (e == error.ManifestNotFound) {
-            try printToStdout("shu pack: no package.json or package.jsonc in current directory\n", .{});
+            try printToStdout("shu pack: no manifest (package.json or deno.json) in current directory\n", .{});
             return e;
         }
         return e;
@@ -74,6 +76,7 @@ pub fn pack(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional: [
     defer out.close();
     try out.writeAll(gz);
     try printToStdout("shu pack: wrote {s}\n", .{tgz_name});
+    try printToStdout("\n", .{});
 }
 
 /// 向 tar 缓冲追加一个文件条目：512 字节头 + 内容 + 块对齐 padding；name 以 package/ 前缀写入。
