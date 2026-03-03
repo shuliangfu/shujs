@@ -5,6 +5,8 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const errors = @import("errors");
+const libs_process = @import("libs_process");
 const tls = @import("tls");
 const http2 = @import("http2.zig");
 const types = @import("types.zig");
@@ -63,7 +65,7 @@ pub const H2StreamEntry = struct {
 
 /// 单条明文连接的状态与缓冲；phase 驱动 stepPlainConn 的状态机
 pub const PlainConnState = struct {
-    stream: std.net.Stream,
+    stream: std.Io.net.Stream,
     read_buf: []u8,
     read_len: usize,
     phase: MuxConnPhase,
@@ -88,9 +90,9 @@ pub const PlainConnState = struct {
     read_op_ctx: if (use_iocp_full) IocpOpCtx else void,
     write_op_ctx: if (use_iocp_full) IocpOpCtx else void,
 
-    /// 释放连接资源；close_stream 为 true 时关闭底层 stream
+    /// 释放连接资源；close_stream 为 true 时关闭底层 stream。0.16：stream.close(io)
     pub fn deinit(self: *PlainConnState, allocator: std.mem.Allocator, close_stream: bool) void {
-        if (close_stream) self.stream.close();
+        if (close_stream) if (libs_process.getProcessIo()) |io| self.stream.close(io);
         allocator.free(self.read_buf);
         if (self.ws_read_buf) |b| allocator.free(b);
         if (self.arena) |*a| a.deinit();
@@ -106,7 +108,7 @@ pub const PlainConnState = struct {
     }
 
     /// 初始化连接状态；config 提供 read_buffer_size、write_buf/header_list 初始容量；initial_data 非 null 时为首包（如 io_core 首包），会拷贝进 read_buf
-    pub fn init(allocator: std.mem.Allocator, stream: std.net.Stream, config: *const ServerConfig, initial_data: ?[]const u8) !PlainConnState {
+    pub fn init(allocator: std.mem.Allocator, stream: std.Io.net.Stream, config: *const ServerConfig, initial_data: ?[]const u8) !PlainConnState {
         const read_buf = allocator.alloc(u8, config.read_buffer_size) catch return error.OutOfMemory;
         var read_len: usize = 0;
         if (initial_data) |d| {
@@ -162,7 +164,7 @@ pub const PlainConnState = struct {
 /// TLS 非阻塞握手中单条：C 层 pending 与底层 stream；Windows TLS 全 IOCP 时使用 BIO 模式；raw 缓冲堆分配（§1.2）
 pub const TlsPendingEntry = if (build_options.have_tls) struct {
     pending: tls.TlsPending,
-    stream: std.net.Stream,
+    stream: std.Io.net.Stream,
     read_op_ctx: if (use_iocp_full_tls) IocpOpCtx else void,
     write_op_ctx: if (use_iocp_full_tls) IocpOpCtx else void,
     raw_recv_buf: if (use_iocp_full_tls) []u8 else void,
@@ -207,7 +209,7 @@ pub const TlsConnState = if (build_options.have_tls) struct {
     raw_send_buf: if (use_iocp_full_tls) []u8 else void,
 
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator, close_stream: bool) void {
-        if (close_stream) self.stream.close();
+        if (close_stream) if (libs_process.getProcessIo()) |io| self.stream.close(io);
         allocator.free(self.read_buf);
         if (self.ws_read_buf) |b| allocator.free(b);
         if (self.arena) |*a| a.deinit();
