@@ -196,17 +196,15 @@ pub fn decodeHpackBlock(allocator: std.mem.Allocator, block: []const u8, out_hea
         "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", // 47-61
     };
     const static_names = [_][]const u8{
-        ":authority", ":method", ":method", ":path", ":path", ":scheme", ":scheme",
-        ":status", ":status", ":status", ":status", ":status", ":status", ":status",
-        "accept-charset", "accept-encoding", "accept-language", "accept-ranges", "accept",
-        "access-control-allow-origin", "age", "allow", "authorization", "cache-control",
-        "content-disposition", "content-encoding", "content-language", "content-length",
-        "content-location", "content-range", "content-type", "cookie", "date", "etag",
-        "expect", "expires", "from", "host", "if-match", "if-modified-since", "if-none-match",
-        "if-range", "if-unmodified-since", "last-modified", "link", "location", "max-forwards",
-        "proxy-authenticate", "proxy-authorization", "range", "referer", "refresh", "retry-after",
-        "server", "set-cookie", "strict-transport-security", "transfer-encoding", "user-agent",
-        "vary", "via", "www-authenticate",
+        ":authority",          ":method",         ":method",         ":path",               ":path",             ":scheme",                     ":scheme",
+        ":status",             ":status",         ":status",         ":status",             ":status",           ":status",                     ":status",
+        "accept-charset",      "accept-encoding", "accept-language", "accept-ranges",       "accept",            "access-control-allow-origin", "age",
+        "allow",               "authorization",   "cache-control",   "content-disposition", "content-encoding",  "content-language",            "content-length",
+        "content-location",    "content-range",   "content-type",    "cookie",              "date",              "etag",                        "expect",
+        "expires",             "from",            "host",            "if-match",            "if-modified-since", "if-none-match",               "if-range",
+        "if-unmodified-since", "last-modified",   "link",            "location",            "max-forwards",      "proxy-authenticate",          "proxy-authorization",
+        "range",               "referer",         "refresh",         "retry-after",         "server",            "set-cookie",                  "strict-transport-security",
+        "transfer-encoding",   "user-agent",      "vary",            "via",                 "www-authenticate",
     };
     var i: usize = 0;
     while (i < block.len) {
@@ -249,7 +247,16 @@ pub fn decodeHpackBlock(allocator: std.mem.Allocator, block: []const u8, out_hea
                 i += 1;
                 const name_huffman = (h & 0x80) != 0;
                 var name_len: u32 = @as(u32, h & 0x7F);
-                if (name_len > 127) { var shift: u32 = 7; while (i < block.len) { const b = block[i]; i += 1; name_len += @as(u32, b & 0x7F) << @intCast(shift); if (b & 0x80 == 0) break; shift += 7; } }
+                if (name_len > 127) {
+                    var shift: u32 = 7;
+                    while (i < block.len) {
+                        const b = block[i];
+                        i += 1;
+                        name_len += @as(u32, b & 0x7F) << @intCast(shift);
+                        if (b & 0x80 == 0) break;
+                        shift += 7;
+                    }
+                }
                 if (i + name_len > block.len) return error.NeedMore;
                 const name = if (name_huffman) try hpack_huffman.decodeHuffman(allocator, block[i..][0..name_len]) else block[i..][0..name_len];
                 i += name_len;
@@ -258,7 +265,16 @@ pub fn decodeHpackBlock(allocator: std.mem.Allocator, block: []const u8, out_hea
                 i += 1;
                 const value_huffman = (vl & 0x80) != 0;
                 var value_len: u32 = @as(u32, vl & 0x7F);
-                if (value_len > 127) { var shift: u32 = 7; while (i < block.len) { const b = block[i]; i += 1; value_len += @as(u32, b & 0x7F) << @intCast(shift); if (b & 0x80 == 0) break; shift += 7; } }
+                if (value_len > 127) {
+                    var shift: u32 = 7;
+                    while (i < block.len) {
+                        const b = block[i];
+                        i += 1;
+                        value_len += @as(u32, b & 0x7F) << @intCast(shift);
+                        if (b & 0x80 == 0) break;
+                        shift += 7;
+                    }
+                }
                 if (i + value_len > block.len) return error.NeedMore;
                 const value = if (value_huffman) try hpack_huffman.decodeHuffman(allocator, block[i..][0..value_len]) else block[i..][0..value_len];
                 i += value_len;
@@ -271,7 +287,16 @@ pub fn decodeHpackBlock(allocator: std.mem.Allocator, block: []const u8, out_hea
                 i += 1;
                 const value_huffman = (vl & 0x80) != 0;
                 var value_len: u32 = @as(u32, vl & 0x7F);
-                if (value_len > 127) { var shift: u32 = 7; while (i < block.len) { const b = block[i]; i += 1; value_len += @as(u32, b & 0x7F) << @intCast(shift); if (b & 0x80 == 0) break; shift += 7; } }
+                if (value_len > 127) {
+                    var shift: u32 = 7;
+                    while (i < block.len) {
+                        const b = block[i];
+                        i += 1;
+                        value_len += @as(u32, b & 0x7F) << @intCast(shift);
+                        if (b & 0x80 == 0) break;
+                        shift += 7;
+                    }
+                }
                 if (i + value_len > block.len) return error.NeedMore;
                 const value = if (value_huffman) try hpack_huffman.decodeHuffman(allocator, block[i..][0..value_len]) else block[i..][0..value_len];
                 i += value_len;
@@ -288,7 +313,16 @@ pub fn decodeHpackBlock(allocator: std.mem.Allocator, block: []const u8, out_hea
                 i += 1;
                 const value_huffman = (vl & 0x80) != 0;
                 var value_len: u32 = @as(u32, vl & 0x7F);
-                if (value_len > 127) { var shift: u32 = 7; while (i < block.len) { const b = block[i]; i += 1; value_len += @as(u32, b & 0x7F) << @intCast(shift); if (b & 0x80 == 0) break; shift += 7; } }
+                if (value_len > 127) {
+                    var shift: u32 = 7;
+                    while (i < block.len) {
+                        const b = block[i];
+                        i += 1;
+                        value_len += @as(u32, b & 0x7F) << @intCast(shift);
+                        if (b & 0x80 == 0) break;
+                        shift += 7;
+                    }
+                }
                 if (i + value_len > block.len) return error.NeedMore;
                 const value = if (value_huffman) try hpack_huffman.decodeHuffman(allocator, block[i..][0..value_len]) else block[i..][0..value_len];
                 i += value_len;
@@ -301,13 +335,31 @@ pub fn decodeHpackBlock(allocator: std.mem.Allocator, block: []const u8, out_hea
             if (i >= block.len) break;
             var name_len: u32 = @as(u32, block[i] & 0x7F);
             i += 1;
-            if (name_len > 127) { var shift: u32 = 7; while (i < block.len) { const b = block[i]; i += 1; name_len += @as(u32, b & 0x7F) << @intCast(shift); if (b & 0x80 == 0) break; shift += 7; } }
+            if (name_len > 127) {
+                var shift: u32 = 7;
+                while (i < block.len) {
+                    const b = block[i];
+                    i += 1;
+                    name_len += @as(u32, b & 0x7F) << @intCast(shift);
+                    if (b & 0x80 == 0) break;
+                    shift += 7;
+                }
+            }
             if (i + name_len > block.len) return error.NeedMore;
             i += name_len;
             if (i >= block.len) return error.NeedMore;
             var value_len: u32 = @as(u32, block[i] & 0x7F);
             i += 1;
-            if (value_len > 127) { var shift: u32 = 7; while (i < block.len) { const b = block[i]; i += 1; value_len += @as(u32, b & 0x7F) << @intCast(shift); if (b & 0x80 == 0) break; shift += 7; } }
+            if (value_len > 127) {
+                var shift: u32 = 7;
+                while (i < block.len) {
+                    const b = block[i];
+                    i += 1;
+                    value_len += @as(u32, b & 0x7F) << @intCast(shift);
+                    if (b & 0x80 == 0) break;
+                    shift += 7;
+                }
+            }
             if (i + value_len > block.len) return error.NeedMore;
             i += value_len;
         }
@@ -318,24 +370,26 @@ pub fn decodeHpackBlock(allocator: std.mem.Allocator, block: []const u8, out_hea
 /// 静态表与 decodeHpackBlock 一致（RFC 7541 Appendix A 完整 61 条）
 pub fn decodeHpackBlockCapped(allocator: std.mem.Allocator, block: []const u8, out_headers: *std.ArrayList(HeaderEntry), max_headers: usize) !void {
     const static_entries = [_][]const u8{
-        "", "GET", "POST", "/", "/index.html", "http", "https",
-        "200", "204", "206", "304", "400", "404", "500",
-        "", "", "gzip, deflate", "", "", "", "", "", "", "", "", "", "", "", "",
-        "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
-        "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+        "",    "GET", "POST",          "/",   "/index.html", "http", "https",
+        "200", "204", "206",           "304", "400",         "404",  "500",
+        "",    "",    "gzip, deflate", "",    "",            "",     "",
+        "",    "",    "",              "",    "",            "",     "",
+        "",    "",    "",              "",    "",            "",     "",
+        "",    "",    "",              "",    "",            "",     "",
+        "",    "",    "",              "",    "",            "",     "",
+        "",    "",    "",              "",    "",            "",     "",
+        "",    "",    "",              "",
     };
     const static_names = [_][]const u8{
-        ":authority", ":method", ":method", ":path", ":path", ":scheme", ":scheme",
-        ":status", ":status", ":status", ":status", ":status", ":status", ":status",
-        "accept-charset", "accept-encoding", "accept-language", "accept-ranges", "accept",
-        "access-control-allow-origin", "age", "allow", "authorization", "cache-control",
-        "content-disposition", "content-encoding", "content-language", "content-length",
-        "content-location", "content-range", "content-type", "cookie", "date", "etag",
-        "expect", "expires", "from", "host", "if-match", "if-modified-since", "if-none-match",
-        "if-range", "if-unmodified-since", "last-modified", "link", "location", "max-forwards",
-        "proxy-authenticate", "proxy-authorization", "range", "referer", "refresh", "retry-after",
-        "server", "set-cookie", "strict-transport-security", "transfer-encoding", "user-agent",
-        "vary", "via", "www-authenticate",
+        ":authority",          ":method",         ":method",         ":path",               ":path",             ":scheme",                     ":scheme",
+        ":status",             ":status",         ":status",         ":status",             ":status",           ":status",                     ":status",
+        "accept-charset",      "accept-encoding", "accept-language", "accept-ranges",       "accept",            "access-control-allow-origin", "age",
+        "allow",               "authorization",   "cache-control",   "content-disposition", "content-encoding",  "content-language",            "content-length",
+        "content-location",    "content-range",   "content-type",    "cookie",              "date",              "etag",                        "expect",
+        "expires",             "from",            "host",            "if-match",            "if-modified-since", "if-none-match",               "if-range",
+        "if-unmodified-since", "last-modified",   "link",            "location",            "max-forwards",      "proxy-authenticate",          "proxy-authorization",
+        "range",               "referer",         "refresh",         "retry-after",         "server",            "set-cookie",                  "strict-transport-security",
+        "transfer-encoding",   "user-agent",      "vary",            "via",                 "www-authenticate",
     };
     var i: usize = 0;
     while (i < block.len) {
@@ -373,7 +427,16 @@ pub fn decodeHpackBlockCapped(allocator: std.mem.Allocator, block: []const u8, o
                 i += 1;
                 const name_huffman = (h & 0x80) != 0;
                 var name_len: u32 = @as(u32, h & 0x7F);
-                if (name_len > 127) { var shift: u32 = 7; while (i < block.len) { const b = block[i]; i += 1; name_len += @as(u32, b & 0x7F) << @intCast(shift); if (b & 0x80 == 0) break; shift += 7; } }
+                if (name_len > 127) {
+                    var shift: u32 = 7;
+                    while (i < block.len) {
+                        const b = block[i];
+                        i += 1;
+                        name_len += @as(u32, b & 0x7F) << @intCast(shift);
+                        if (b & 0x80 == 0) break;
+                        shift += 7;
+                    }
+                }
                 if (i + name_len > block.len) return error.NeedMore;
                 const name = if (name_huffman) try hpack_huffman.decodeHuffman(allocator, block[i..][0..name_len]) else block[i..][0..name_len];
                 i += name_len;
@@ -382,7 +445,16 @@ pub fn decodeHpackBlockCapped(allocator: std.mem.Allocator, block: []const u8, o
                 i += 1;
                 const value_huffman = (vl & 0x80) != 0;
                 var value_len: u32 = @as(u32, vl & 0x7F);
-                if (value_len > 127) { var shift: u32 = 7; while (i < block.len) { const b = block[i]; i += 1; value_len += @as(u32, b & 0x7F) << @intCast(shift); if (b & 0x80 == 0) break; shift += 7; } }
+                if (value_len > 127) {
+                    var shift: u32 = 7;
+                    while (i < block.len) {
+                        const b = block[i];
+                        i += 1;
+                        value_len += @as(u32, b & 0x7F) << @intCast(shift);
+                        if (b & 0x80 == 0) break;
+                        shift += 7;
+                    }
+                }
                 if (i + value_len > block.len) return error.NeedMore;
                 const value = if (value_huffman) try hpack_huffman.decodeHuffman(allocator, block[i..][0..value_len]) else block[i..][0..value_len];
                 i += value_len;
@@ -396,7 +468,16 @@ pub fn decodeHpackBlockCapped(allocator: std.mem.Allocator, block: []const u8, o
                 i += 1;
                 const value_huffman = (vl & 0x80) != 0;
                 var value_len: u32 = @as(u32, vl & 0x7F);
-                if (value_len > 127) { var shift: u32 = 7; while (i < block.len) { const b = block[i]; i += 1; value_len += @as(u32, b & 0x7F) << @intCast(shift); if (b & 0x80 == 0) break; shift += 7; } }
+                if (value_len > 127) {
+                    var shift: u32 = 7;
+                    while (i < block.len) {
+                        const b = block[i];
+                        i += 1;
+                        value_len += @as(u32, b & 0x7F) << @intCast(shift);
+                        if (b & 0x80 == 0) break;
+                        shift += 7;
+                    }
+                }
                 if (i + value_len > block.len) return error.NeedMore;
                 const value = if (value_huffman) try hpack_huffman.decodeHuffman(allocator, block[i..][0..value_len]) else block[i..][0..value_len];
                 i += value_len;
@@ -412,7 +493,16 @@ pub fn decodeHpackBlockCapped(allocator: std.mem.Allocator, block: []const u8, o
                 const vl = block[i];
                 i += 1;
                 var value_len: u32 = @as(u32, vl & 0x7F);
-                if (value_len > 127) { var shift: u32 = 7; while (i < block.len) { const b = block[i]; i += 1; value_len += @as(u32, b & 0x7F) << @intCast(shift); if (b & 0x80 == 0) break; shift += 7; } }
+                if (value_len > 127) {
+                    var shift: u32 = 7;
+                    while (i < block.len) {
+                        const b = block[i];
+                        i += 1;
+                        value_len += @as(u32, b & 0x7F) << @intCast(shift);
+                        if (b & 0x80 == 0) break;
+                        shift += 7;
+                    }
+                }
                 if (i + value_len > block.len) return error.NeedMore;
                 const value = if (vl & 0x80 != 0) try hpack_huffman.decodeHuffman(allocator, block[i..][0..value_len]) else block[i..][0..value_len];
                 i += value_len;
@@ -425,13 +515,31 @@ pub fn decodeHpackBlockCapped(allocator: std.mem.Allocator, block: []const u8, o
             if (i >= block.len) break;
             var name_len: u32 = @as(u32, block[i] & 0x7F);
             i += 1;
-            if (name_len > 127) { var shift: u32 = 7; while (i < block.len) { const b = block[i]; i += 1; name_len += @as(u32, b & 0x7F) << @intCast(shift); if (b & 0x80 == 0) break; shift += 7; } }
+            if (name_len > 127) {
+                var shift: u32 = 7;
+                while (i < block.len) {
+                    const b = block[i];
+                    i += 1;
+                    name_len += @as(u32, b & 0x7F) << @intCast(shift);
+                    if (b & 0x80 == 0) break;
+                    shift += 7;
+                }
+            }
             if (i + name_len > block.len) return error.NeedMore;
             i += name_len;
             if (i >= block.len) return error.NeedMore;
             var value_len: u32 = @as(u32, block[i] & 0x7F);
             i += 1;
-            if (value_len > 127) { var shift: u32 = 7; while (i < block.len) { const b = block[i]; i += 1; value_len += @as(u32, b & 0x7F) << @intCast(shift); if (b & 0x80 == 0) break; shift += 7; } }
+            if (value_len > 127) {
+                var shift: u32 = 7;
+                while (i < block.len) {
+                    const b = block[i];
+                    i += 1;
+                    value_len += @as(u32, b & 0x7F) << @intCast(shift);
+                    if (b & 0x80 == 0) break;
+                    shift += 7;
+                }
+            }
             if (i + value_len > block.len) return error.NeedMore;
             i += value_len;
         }

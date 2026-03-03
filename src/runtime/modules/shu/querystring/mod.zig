@@ -128,8 +128,8 @@ fn stringifyCallback(
         var v_buf: [4096]u8 = undefined;
         const kn = jsc.JSStringGetUTF8CString(key_str, &k_buf, k_buf.len);
         const vn = jsc.JSStringGetUTF8CString(val_str, &v_buf, v_buf.len);
-        const k_slice = k_buf[0 .. if (kn > 0) kn - 1 else 0];
-        const v_slice = v_buf[0 .. if (vn > 0) vn - 1 else 0];
+        const k_slice = k_buf[0..if (kn > 0) kn - 1 else 0];
+        const v_slice = v_buf[0..if (vn > 0) vn - 1 else 0];
         if (!first) out.append(allocator, '&') catch continue;
         first = false;
         out.appendSlice(allocator, k_slice) catch continue;

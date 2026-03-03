@@ -713,10 +713,8 @@ fn moveCursorCallback(
     if (write_fn) |wfn| {
         var buf: [64]u8 = undefined;
         var n: usize = 0;
-        if (dx > 0) n += (std.fmt.bufPrint(buf[n..], "\x1b[{d}C", .{dx}) catch buf[n..][0..0]).len
-        else if (dx < 0) n += (std.fmt.bufPrint(buf[n..], "\x1b[{d}D", .{-dx}) catch buf[n..][0..0]).len;
-        if (dy > 0) n += (std.fmt.bufPrint(buf[n..], "\x1b[{d}B", .{dy}) catch buf[n..][0..0]).len
-        else if (dy < 0) n += (std.fmt.bufPrint(buf[n..], "\x1b[{d}A", .{-dy}) catch buf[n..][0..0]).len;
+        if (dx > 0) n += (std.fmt.bufPrint(buf[n..], "\x1b[{d}C", .{dx}) catch buf[n..][0..0]).len else if (dx < 0) n += (std.fmt.bufPrint(buf[n..], "\x1b[{d}D", .{-dx}) catch buf[n..][0..0]).len;
+        if (dy > 0) n += (std.fmt.bufPrint(buf[n..], "\x1b[{d}B", .{dy}) catch buf[n..][0..0]).len else if (dy < 0) n += (std.fmt.bufPrint(buf[n..], "\x1b[{d}A", .{-dy}) catch buf[n..][0..0]).len;
         if (n > 0 and n < buf.len) {
             buf[n] = 0;
             const seq_ref = jsc.JSStringCreateWithUTF8CString(&buf);

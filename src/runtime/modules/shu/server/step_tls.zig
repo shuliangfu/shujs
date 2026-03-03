@@ -46,7 +46,7 @@ pub fn stepTlsConn(
     cb: *const step_plain.StepPlainCallbacks,
 ) MuxStepResult {
     if (comptime !build_options.have_tls) return .continue_;
-    return stepTlsConnBody(state, allocator, ctx, @alignCast(@ptrCast(conn_ptr)), fd, cb);
+    return stepTlsConnBody(state, allocator, ctx, @ptrCast(@alignCast(conn_ptr)), fd, cb);
 }
 
 /// TLS 有编时的真实实现：按 conn.phase 执行一步；无 TLS 时为占位实现直接 .continue_。
@@ -488,8 +488,7 @@ const stepTlsConnBody = if (build_options.have_tls) struct {
                                 var method: []const u8 = "";
                                 var path: []const u8 = "";
                                 for (headers_list.items) |h| {
-                                    if (std.mem.eql(u8, h.name, ":method")) method = h.value
-                                    else if (std.mem.eql(u8, h.name, ":path")) path = h.value;
+                                    if (std.mem.eql(u8, h.name, ":method")) method = h.value else if (std.mem.eql(u8, h.name, ":path")) path = h.value;
                                 }
                                 if (method.len == 0) method = "GET";
                                 if (path.len == 0) path = "/";
@@ -561,10 +560,10 @@ const stepTlsConnBody = if (build_options.have_tls) struct {
                                             .headers_head = headers_head,
                                             .body = if (e.body.items.len > 0) e.body.items else null,
                                         };
-                                    var response_ct_buf: [1024]u8 = undefined;
-                                    const response_body_buf = allocator.alloc(u8, step_plain.RESPONSE_BODY_BUF_SIZE) catch return .remove_and_close;
-                                    defer allocator.free(response_body_buf);
-                                    cb.send_h2_response_to_buffer(&conn.write_buf, allocator, ctx, stream_id, state.handler_fn, &state.config, state.compression_enabled, state.error_callback, &parsed, &response_ct_buf, response_body_buf);
+                                        var response_ct_buf: [1024]u8 = undefined;
+                                        const response_body_buf = allocator.alloc(u8, step_plain.RESPONSE_BODY_BUF_SIZE) catch return .remove_and_close;
+                                        defer allocator.free(response_body_buf);
+                                        cb.send_h2_response_to_buffer(&conn.write_buf, allocator, ctx, stream_id, state.handler_fn, &state.config, state.compression_enabled, state.error_callback, &parsed, &response_ct_buf, response_body_buf);
                                         e.deinitEntry(allocator);
                                         _ = streams.remove(stream_id);
                                     }

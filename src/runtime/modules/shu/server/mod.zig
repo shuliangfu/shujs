@@ -387,40 +387,40 @@ fn serverCallback(
             .kernel_backlog = @as(u31, @intCast(config.listen_backlog)),
         };
         if (unix_path != null and unix_path.?.len > 0) {
-        const path = unix_path.?;
-        const addr = std.net.Address.initUnix(path) catch |e| {
-            var msg_buf: [128]u8 = undefined;
-            const msg = std.fmt.bufPrint(&msg_buf, "Shu.server listen (unix) failed: {s}", .{@errorName(e)}) catch "Shu.server listen failed";
-            errors.reportToStderr(.{ .code = .unknown, .message = msg }) catch {};
-            return jsc.JSValueMakeUndefined(ctx);
-        };
-        server = addr.listen(listen_options) catch |e| {
-            var msg_buf: [128]u8 = undefined;
-            const msg = std.fmt.bufPrint(&msg_buf, "Shu.server listen (unix) failed: {s}", .{@errorName(e)}) catch "Shu.server listen failed";
-            errors.reportToStderr(.{ .code = .unknown, .message = msg }) catch {};
-            return jsc.JSValueMakeUndefined(ctx);
-        };
-    } else {
-        var addr_buf: [256]u8 = undefined;
-        const host_z = std.fmt.bufPrintZ(&addr_buf, "{s}", .{host_slice}) catch {
-            errors.reportToStderr(.{ .code = .unknown, .message = "Shu.server host format error" }) catch {};
-            return jsc.JSValueMakeUndefined(ctx);
-        };
-        const addr = std.net.Address.parseIp(host_z, port) catch |e| {
-            var msg_buf: [128]u8 = undefined;
-            const msg = std.fmt.bufPrint(&msg_buf, "Shu.server listen failed: {s}", .{@errorName(e)}) catch "Shu.server listen failed";
-            errors.reportToStderr(.{ .code = .unknown, .message = msg }) catch {};
-            return jsc.JSValueMakeUndefined(ctx);
-        };
-        server = addr.listen(listen_options) catch |e| {
-            var msg_buf: [128]u8 = undefined;
-            const msg = std.fmt.bufPrint(&msg_buf, "Shu.server listen failed: {s}", .{@errorName(e)}) catch "Shu.server listen failed";
-            errors.reportToStderr(.{ .code = .unknown, .message = msg }) catch {};
-            return jsc.JSValueMakeUndefined(ctx);
-        };
-    }
+            const path = unix_path.?;
+            const addr = std.net.Address.initUnix(path) catch |e| {
+                var msg_buf: [128]u8 = undefined;
+                const msg = std.fmt.bufPrint(&msg_buf, "Shu.server listen (unix) failed: {s}", .{@errorName(e)}) catch "Shu.server listen failed";
+                errors.reportToStderr(.{ .code = .unknown, .message = msg }) catch {};
+                return jsc.JSValueMakeUndefined(ctx);
+            };
+            server = addr.listen(listen_options) catch |e| {
+                var msg_buf: [128]u8 = undefined;
+                const msg = std.fmt.bufPrint(&msg_buf, "Shu.server listen (unix) failed: {s}", .{@errorName(e)}) catch "Shu.server listen failed";
+                errors.reportToStderr(.{ .code = .unknown, .message = msg }) catch {};
+                return jsc.JSValueMakeUndefined(ctx);
+            };
+        } else {
+            var addr_buf: [256]u8 = undefined;
+            const host_z = std.fmt.bufPrintZ(&addr_buf, "{s}", .{host_slice}) catch {
+                errors.reportToStderr(.{ .code = .unknown, .message = "Shu.server host format error" }) catch {};
+                return jsc.JSValueMakeUndefined(ctx);
+            };
+            const addr = std.net.Address.parseIp(host_z, port) catch |e| {
+                var msg_buf: [128]u8 = undefined;
+                const msg = std.fmt.bufPrint(&msg_buf, "Shu.server listen failed: {s}", .{@errorName(e)}) catch "Shu.server listen failed";
+                errors.reportToStderr(.{ .code = .unknown, .message = msg }) catch {};
+                return jsc.JSValueMakeUndefined(ctx);
+            };
+            server = addr.listen(listen_options) catch |e| {
+                var msg_buf: [128]u8 = undefined;
+                const msg = std.fmt.bufPrint(&msg_buf, "Shu.server listen failed: {s}", .{@errorName(e)}) catch "Shu.server listen failed";
+                errors.reportToStderr(.{ .code = .unknown, .message = msg }) catch {};
+                return jsc.JSValueMakeUndefined(ctx);
+            };
+        }
 
-    // reusePort 选项仅作 API 兼容；listen 已使用 reuse_address 与 kernel_backlog
+        // reusePort 选项仅作 API 兼容；listen 已使用 reuse_address 与 kernel_backlog
         _ = options.getOptionalBool(ctx, options_obj, "reusePort");
 
         // 若有 options.onListen，在 listen 成功后调用一次
@@ -736,7 +736,6 @@ fn serverTickCallback(
     };
     return tick.run(ctx, state, allocator, timer, callee, &tick_cbs, &g_ws_send_registry);
 }
-
 
 /// server.stop()：请求停止监听，下一轮 tick 会关服并清理
 fn serverStopCallback(

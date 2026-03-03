@@ -224,7 +224,7 @@ pub fn resolveSpecifierForPackageJson(allocator: std.mem.Allocator, base_path: [
             continue;
         };
         sub.close();
-        return std.fs.path.resolve(allocator, &.{ nm_path }) catch return null;
+        return std.fs.path.resolve(allocator, &.{nm_path}) catch return null;
     }
     return null;
 }

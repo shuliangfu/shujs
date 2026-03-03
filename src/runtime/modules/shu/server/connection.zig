@@ -322,8 +322,7 @@ pub fn handleH2Connection(
                 var method: []const u8 = "";
                 var path: []const u8 = "";
                 for (headers_list.items) |h| {
-                    if (std.mem.eql(u8, h.name, ":method")) method = h.value
-                    else if (std.mem.eql(u8, h.name, ":path")) path = h.value;
+                    if (std.mem.eql(u8, h.name, ":method")) method = h.value else if (std.mem.eql(u8, h.name, ":path")) path = h.value;
                 }
                 if (method.len == 0) method = "GET";
                 if (path.len == 0) path = "/";
