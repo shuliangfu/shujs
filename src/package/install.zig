@@ -1,18 +1,18 @@
 // 安装与缓存：根据 manifest 与 lockfile 将依赖从缓存解压到 node_modules；未命中则从 registry 下载后写入缓存并解压；安装完成后写回 shu.lock
 // 参考：docs/PACKAGE_DESIGN.md §4、§7
-// 文件/目录与路径经 io_core（§3.0）；解压 tgz 用 io_core.mapFileReadOnly
+// 文件/目录与路径经 io_core（§3.0）；解压 tgz 用 libs_io.mapFileReadOnly
 
 const std = @import("std");
+const errors = @import("errors");
+const libs_process = @import("libs_process");
 
-/// 将格式化内容直接 write(2, ...) 到 stderr；前导 \\n 避免与进度条（\\r 同行刷新）挤在同一行或被覆盖。
+/// 将格式化内容直接 write(2, ...) 到 stderr；前导 \\n 避免与进度条（\\r 同行刷新）挤在同一行或被覆盖。Zig 0.16 用 std.fmt.bufPrint + std.c.write。
 fn logInstallFailure(comptime fmt: []const u8, args: anytype) void {
     var buf: [2048]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    fbs.writer().print("\n" ++ fmt, args) catch return;
-    const slice = fbs.getWritten();
-    _ = std.posix.write(2, slice) catch {};
+    const slice = std.fmt.bufPrint(&buf, "\n" ++ fmt, args) catch return;
+    _ = std.c.write(2, slice.ptr, slice.len);
 }
-const io_core = @import("io_core");
+const libs_io = @import("libs_io");
 const manifest = @import("manifest.zig");
 const lockfile = @import("lockfile.zig");
 const cache = @import("cache.zig");
@@ -116,7 +116,8 @@ const NpmResolveWorkerCtx = struct {
 /// 后续可考虑改为 per-worker Arena（§1.2），worker 结束时一次性 deinit，减少主线程逐项 free。
 fn npmResolveWorker(ctx: *const NpmResolveWorkerCtx) void {
     const page = std.heap.page_allocator;
-    var client = std.http.Client{ .allocator = page };
+    const io = libs_process.getProcessIo() orelse return;
+    var client = std.http.Client{ .allocator = page, .io = io };
     defer client.deinit();
     while (true) {
         const i = ctx.next_index.fetchAdd(1, .monotonic);
@@ -147,7 +148,7 @@ const JsrInstallTask = struct { name: []const u8, version: []const u8, pkg_dest:
 const LastCompletedName = struct {
     buf: [64]u8 = undefined,
     len: usize = 0,
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = std.Io.Mutex.init,
 };
 
 /// JSR 安装 worker 上下文：tasks/results 在 join 前有效；next_index 原子取任务下标；pool 共享。install_completed_count 非 null 时每完成一包递增；last_completed_name 非 null 时写入最近完成包名。
@@ -158,7 +159,7 @@ const JsrInstallWorkerCtx = struct {
     pool: *jsr.JsrDownloadPool,
     allocator: std.mem.Allocator,
     first_error: *?anyerror,
-    first_error_mutex: *std.Thread.Mutex,
+    first_error_mutex: *std.Io.Mutex,
     error_detail: ?*InstallErrorDetail,
     main_allocator: std.mem.Allocator,
     install_completed_count: ?*std.atomic.Value(usize) = null,
@@ -168,6 +169,7 @@ const JsrInstallWorkerCtx = struct {
 /// JSR 安装 worker：循环取任务并调用 downloadPackageToDir；与 npm 一致，网络类失败（超时、HttpFailed 等）时重试
 /// INSTALL_NETWORK_RETRIES 次，失败写 results[i] 并在 mutex 下写 first_error。
 fn jsrInstallWorker(ctx: *const JsrInstallWorkerCtx) void {
+    const io = libs_process.getProcessIo() orelse return;
     while (true) {
         const i = ctx.next_index.fetchAdd(1, .monotonic);
         if (i >= ctx.tasks.len) return;
@@ -175,7 +177,7 @@ fn jsrInstallWorker(ctx: *const JsrInstallWorkerCtx) void {
         var last_err: anyerror = undefined;
         var ok = false;
         for (0..INSTALL_NETWORK_RETRIES) |ri| {
-            if (ri > 0) std.Thread.sleep(INSTALL_NETWORK_RETRY_DELAYS_NS[ri - 1]);
+            if (ri > 0) std.Io.sleep(io, std.Io.Duration.fromNanoseconds(INSTALL_NETWORK_RETRY_DELAYS_NS[ri - 1]), .awake) catch {};
             jsr.downloadPackageToDir(ctx.allocator, ctx.pool, task.name, task.version, task.pkg_dest) catch |e| {
                 last_err = e;
                 continue;
@@ -185,8 +187,8 @@ fn jsrInstallWorker(ctx: *const JsrInstallWorkerCtx) void {
         }
         if (!ok) {
             ctx.results[i] = last_err;
-            ctx.first_error_mutex.lock();
-            defer ctx.first_error_mutex.unlock();
+            ctx.first_error_mutex.lock(io) catch return;
+            defer ctx.first_error_mutex.unlock(io);
             if (ctx.first_error.* == null) {
                 ctx.first_error.* = last_err;
                 if (ctx.error_detail) |ed| {
@@ -212,8 +214,9 @@ const NpmInstallTask = struct {
 
 /// 写最近完成包名到共享缓冲，供主线程 onProgress 第二行显示；name 过长则截断。
 fn setLastCompletedName(ln: *LastCompletedName, name: []const u8) void {
-    ln.mutex.lock();
-    defer ln.mutex.unlock();
+    const io = libs_process.getProcessIo() orelse return;
+    ln.mutex.lock(io) catch return;
+    defer ln.mutex.unlock(io);
     const n = @min(name.len, ln.buf.len - 1);
     if (n > 0) {
         @memcpy(ln.buf[0..n], name[0..n]);
@@ -230,7 +233,7 @@ const NpmInstallWorkerCtx = struct {
     cache_root: []const u8,
     resolved_tarball_urls: *const std.StringArrayHashMap([]const u8),
     first_error: *?anyerror,
-    first_error_mutex: *std.Thread.Mutex,
+    first_error_mutex: *std.Io.Mutex,
     first_extract_failure_logged: *std.atomic.Value(bool),
     error_detail: ?*InstallErrorDetail,
     main_allocator: std.mem.Allocator,
@@ -242,7 +245,8 @@ const NpmInstallWorkerCtx = struct {
 /// npm 安装 worker：每 worker 持有一个 std.http.Client（Zig 路径）和独立临时文件路径；取任务后查缓存→未命中则下载（Zig client）→写缓存→解压；失败写 results[i] 并在 mutex 下写 first_error/error_detail。
 fn npmInstallWorker(ctx: *const NpmInstallWorkerCtx) void {
     const page = std.heap.page_allocator;
-    var zig_client = std.http.Client{ .allocator = page };
+    const io = libs_process.getProcessIo() orelse return;
+    var zig_client = std.http.Client{ .allocator = page, .io = io };
     defer zig_client.deinit();
     const temp_tgz = std.fmt.allocPrint(page, "{s}/.tmp-download-{d}.tgz", .{ ctx.cache_root, ctx.worker_id }) catch return;
     defer page.free(temp_tgz);
@@ -266,10 +270,10 @@ fn npmInstallWorker(ctx: *const NpmInstallWorkerCtx) void {
         retry_extract: while (invalid_gzip_retries < 2) : (invalid_gzip_retries += 1) {
             if (cache.getCachedPackageDir(page, ctx.cache_root, key)) |hit_dir| {
                 defer page.free(hit_dir);
-                if (io_core.pathDirname(task.pkg_dest)) |parent| io_core.makePathAbsolute(parent) catch {};
-                var link_target_buf: [std.fs.max_path_bytes]u8 = undefined;
-                const link_target = io_core.realpath(hit_dir, &link_target_buf) catch hit_dir;
-                io_core.symLinkAbsolute(link_target, task.pkg_dest, .{}) catch |e| {
+                if (libs_io.pathDirname(task.pkg_dest)) |parent| libs_io.makePathAbsolute(parent) catch {};
+                var link_target_buf: [libs_io.max_path_bytes]u8 = undefined;
+                const link_target = libs_io.realpath(hit_dir, &link_target_buf) catch hit_dir;
+                libs_io.symLinkAbsolute(link_target, task.pkg_dest, .{}) catch |e| {
                     ctx.results[i] = e;
                     setFirstError(ctx, e, task.name, task.version);
                 };
@@ -291,7 +295,7 @@ fn npmInstallWorker(ctx: *const NpmInstallWorkerCtx) void {
             var download_ok = false;
             var last_dl_err: anyerror = undefined;
             for (0..INSTALL_NETWORK_RETRIES) |ri| {
-                if (ri > 0) std.Thread.sleep(INSTALL_NETWORK_RETRY_DELAYS_NS[ri - 1]);
+                if (ri > 0) std.Io.sleep(io, std.Io.Duration.fromNanoseconds(INSTALL_NETWORK_RETRY_DELAYS_NS[ri - 1]), .awake) catch {};
                 registry.downloadToPathWithClient(&zig_client, page, turl, temp_tgz) catch |e| {
                     last_dl_err = e;
                     continue;
@@ -307,25 +311,25 @@ fn npmInstallWorker(ctx: *const NpmInstallWorkerCtx) void {
                 break :retry_extract;
             }
             // 仅一个 worker 创建缓存目录，避免多线程同时解压到同一目录导致竞态（只写出 node_modules、无 package.json）
-            if (io_core.pathDirname(cache_dir_path)) |parent| io_core.makePathAbsolute(parent) catch {};
-            io_core.makeDirAbsolute(cache_dir_path) catch |e| {
+            if (libs_io.pathDirname(cache_dir_path)) |parent| libs_io.makePathAbsolute(parent) catch {};
+            libs_io.makeDirAbsolute(cache_dir_path) catch |e| {
                 if (e == error.PathAlreadyExists) {
                     // 其他 worker 已创建或正在解压；轮询等待 package.json 出现后当作缓存命中建链
-                    io_core.deleteFileAbsolute(temp_tgz) catch {};
+                    libs_io.deleteFileAbsolute(temp_tgz) catch {};
                     for (0..60) |_| {
                         if (cache.getCachedPackageDir(page, ctx.cache_root, key)) |hit_dir| {
                             defer page.free(hit_dir);
-                            if (io_core.pathDirname(task.pkg_dest)) |parent_dest| io_core.makePathAbsolute(parent_dest) catch {};
-                            var link_target_buf: [std.fs.max_path_bytes]u8 = undefined;
-                            const link_target = io_core.realpath(hit_dir, &link_target_buf) catch hit_dir;
-                            io_core.symLinkAbsolute(link_target, task.pkg_dest, .{}) catch |sym_err| {
+                            if (libs_io.pathDirname(task.pkg_dest)) |parent_dest| libs_io.makePathAbsolute(parent_dest) catch {};
+                            var link_target_buf: [libs_io.max_path_bytes]u8 = undefined;
+                            const link_target = libs_io.realpath(hit_dir, &link_target_buf) catch hit_dir;
+                            libs_io.symLinkAbsolute(link_target, task.pkg_dest, .{}) catch |sym_err| {
                                 ctx.results[i] = sym_err;
                                 setFirstError(ctx, sym_err, task.name, task.version);
                             };
                             if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
                             break :retry_extract;
                         }
-                        std.Thread.sleep(100_000_000); // 100ms
+                        std.Io.sleep(io, std.Io.Duration.fromNanoseconds(100_000_000), .awake) catch {}; // 100ms
                     }
                     ctx.results[i] = error.CacheDirBusy;
                     setFirstError(ctx, error.CacheDirBusy, task.name, task.version);
@@ -338,8 +342,8 @@ fn npmInstallWorker(ctx: *const NpmInstallWorkerCtx) void {
             extractTarballToDir(page, temp_tgz, cache_dir_path) catch |e| {
                 logFirstTarballExtractFailure(ctx, temp_tgz, e, task.name, task.version);
                 debugLogTarballExtractFailed(temp_tgz, e);
-                io_core.deleteFileAbsolute(temp_tgz) catch {};
-                io_core.deleteTreeAbsolute(cache_dir_path) catch {};
+                libs_io.deleteFileAbsolute(temp_tgz) catch {};
+                libs_io.deleteTreeAbsolute(page, cache_dir_path) catch {};
                 if (e == error.InvalidGzip and invalid_gzip_retries < 1) {
                     continue :retry_extract;
                 }
@@ -349,23 +353,24 @@ fn npmInstallWorker(ctx: *const NpmInstallWorkerCtx) void {
                 if (ctx.last_completed_name) |ln| setLastCompletedName(ln, task.name);
                 break :retry_extract;
             };
-            io_core.deleteFileAbsolute(temp_tgz) catch {};
+            libs_io.deleteFileAbsolute(temp_tgz) catch {};
             // 解压后必须存在 package.json，否则视为失败、不建链
-            const pkg_json_path = io_core.pathJoin(page, &.{ cache_dir_path, "package.json" }) catch |e| {
+            const pkg_json_path = libs_io.pathJoin(page, &.{ cache_dir_path, "package.json" }) catch |e| {
                 ctx.results[i] = e;
                 setFirstError(ctx, e, task.name, task.version);
                 break :retry_extract;
             };
             defer page.free(pkg_json_path);
-            io_core.accessAbsolute(pkg_json_path, .{}) catch {
+            libs_io.accessAbsolute(pkg_json_path, .{}) catch {
                 // 解压未抛错但 package.json 不存在：打日志并列出解压出的前几项，便于判断是 tar 结构不符（无 package/）还是空解压
                 logInstallFailure("[shu install] extract ok but package.json missing: {s}@{s} dir={s}\n", .{ task.name, task.version, cache_dir_path });
-                var dir_opt = io_core.openDirAbsolute(cache_dir_path, .{ .iterate = true }) catch null;
+                var dir_opt = libs_io.openDirAbsolute(cache_dir_path, .{ .iterate = true }) catch null;
                 if (dir_opt) |*dir_handle| {
-                    defer dir_handle.close();
+                    const proc_io = libs_process.getProcessIo();
+                    defer if (proc_io) |pi| dir_handle.close(pi);
                     var it = dir_handle.iterate();
                     var n: u32 = 0;
-                    while (it.next() catch null) |entry| {
+                    while (if (proc_io) |pi| it.next(pi) catch null else null) |entry| {
                         if (n >= 8) {
                             logInstallFailure("  ... (listing first 8 only)\n", .{});
                             break;
@@ -375,17 +380,17 @@ fn npmInstallWorker(ctx: *const NpmInstallWorkerCtx) void {
                     }
                     if (n == 0) logInstallFailure("  (no entries)\n", .{});
                 } else logInstallFailure("  (could not list dir)\n", .{});
-                io_core.deleteTreeAbsolute(cache_dir_path) catch {};
+                libs_io.deleteTreeAbsolute(page, cache_dir_path) catch {};
                 ctx.results[i] = error.TarballExtractFailed;
                 setFirstError(ctx, error.TarballExtractFailed, task.name, task.version);
                 if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
                 if (ctx.last_completed_name) |ln| setLastCompletedName(ln, task.name);
                 break :retry_extract;
             };
-            if (io_core.pathDirname(task.pkg_dest)) |parent_dest| io_core.makePathAbsolute(parent_dest) catch {};
-            var link_target_buf: [std.fs.max_path_bytes]u8 = undefined;
-            const link_target = io_core.realpath(cache_dir_path, &link_target_buf) catch cache_dir_path;
-            io_core.symLinkAbsolute(link_target, task.pkg_dest, .{}) catch |e| {
+            if (libs_io.pathDirname(task.pkg_dest)) |parent_dest| libs_io.makePathAbsolute(parent_dest) catch {};
+            var link_target_buf: [libs_io.max_path_bytes]u8 = undefined;
+            const link_target = libs_io.realpath(cache_dir_path, &link_target_buf) catch cache_dir_path;
+            libs_io.symLinkAbsolute(link_target, task.pkg_dest, .{}) catch |e| {
                 ctx.results[i] = e;
                 setFirstError(ctx, e, task.name, task.version);
             };
@@ -398,8 +403,9 @@ fn npmInstallWorker(ctx: *const NpmInstallWorkerCtx) void {
 
 /// 在 mutex 下设置首次失败错误与 error_detail（仅当 first_error 尚为 null 时写入）；供 npm 安装 worker 调用。
 fn setFirstError(ctx: *const NpmInstallWorkerCtx, err: anyerror, name: []const u8, version: []const u8) void {
-    ctx.first_error_mutex.lock();
-    defer ctx.first_error_mutex.unlock();
+    const io = libs_process.getProcessIo() orelse return;
+    ctx.first_error_mutex.lock(io) catch return;
+    defer ctx.first_error_mutex.unlock(io);
     if (ctx.first_error.* == null) {
         ctx.first_error.* = err;
         if (ctx.error_detail) |ed| {
@@ -419,8 +425,9 @@ const INSTALL_NETWORK_RETRY_DELAYS_NS = [_]u64{ 500_000_000, 1_000_000_000 };
 /// 当前用 page_allocator，主线程合并后释放；后续可考虑 per-worker Arena（§1.2）。
 fn jsrResolveWorker(ctx: *const JsrResolveWorkerCtx) void {
     const page = std.heap.page_allocator;
+    const io = libs_process.getProcessIo() orelse return;
     while (true) {
-        var client = std.http.Client{ .allocator = page };
+        var client = std.http.Client{ .allocator = page, .io = io };
         var count: usize = 0;
         while (count < JSR_RESOLVE_CLIENT_REUSE_LIMIT) : (count += 1) {
             const i = ctx.next_index.fetchAdd(1, .monotonic);
@@ -438,7 +445,7 @@ fn jsrResolveWorker(ctx: *const JsrResolveWorkerCtx) void {
             const version = jsr.resolveVersionFromMetaWithClient(&client, page, jsr_spec) catch |e| blk: {
                 // 空 body 或非 JSON 常因连接被关/限流导致，用新 client 重试一次
                 if (e == error.JsrMetaEmptyResponse or e == error.JsrMetaNoJsonObject) {
-                    var retry_client = std.http.Client{ .allocator = page };
+                    var retry_client = std.http.Client{ .allocator = page, .io = io };
                     defer retry_client.deinit();
                     break :blk jsr.resolveVersionFromMetaWithClient(&retry_client, page, jsr_spec) catch |e2| {
                         ctx.results[i].err = e2;
@@ -503,7 +510,12 @@ pub const InstallReporter = struct {
 /// §1.2：整次 install 用 Arena 分配临时路径与 key，仅 resolved map 的 key/value 用主 allocator（供 save 后释放），减少 alloc/free 与碎片。
 /// 耗时统计：从本函数入口计时，onDone 时传入 elapsed_ms（含 Resolving + Installing），避免 CLI 只统计安装阶段造成虚假时间。
 pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const InstallReporter, added_names: ?[]const []const u8, error_detail: ?*InstallErrorDetail) !void {
-    const install_start_ms = std.time.milliTimestamp();
+    // Zig 0.16：nanoTimestamp 已移除，用 std.Io.Clock.monotonic + untilNow 得 elapsed ns，再换算毫秒
+    // Zig 0.16：Clock 用 .awake（单调、不含休眠时间）计量耗时
+    const install_start_ts: ?std.Io.Clock.Timestamp = if (libs_process.getProcessIo()) |io|
+        std.Io.Clock.Timestamp.now(io, .awake)
+    else
+        null;
     var loaded = manifest.Manifest.load(allocator, cwd) catch |e| {
         if (e == error.ManifestNotFound) return error.NoManifest;
         return e;
@@ -516,12 +528,12 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
     const a = task_arena.allocator();
 
     // 将 cwd 解析为绝对路径，供 lock_path/nm_dir/pkg_dest 使用，确保 *Absolute 系 API 收到绝对路径
-    var cwd_realpath_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var cwd_realpath_buf: [libs_io.max_path_bytes]u8 = undefined;
     const abs_cwd = blk: {
-        const resolved = io_core.realpath(cwd, &cwd_realpath_buf) catch break :blk cwd;
+        const resolved = libs_io.realpath(cwd, &cwd_realpath_buf) catch break :blk cwd;
         break :blk try a.dupe(u8, resolved);
     };
-    const lock_path = try io_core.pathJoin(a, &.{ abs_cwd, lockfile.lock_file_name });
+    const lock_path = try libs_io.pathJoin(a, &.{ abs_cwd, lockfile.lock_file_name });
     var locked_result = lockfile.loadWithDeps(allocator, lock_path) catch return error.OutOfMemory;
     defer {
         var it = locked_result.packages.iterator();
@@ -539,15 +551,15 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
 
     const cache_root = try cache.getCacheRoot(a);
     // 解析为规范绝对路径，确保软链接目标为绝对路径，从任意 cwd 打开 node_modules 时都能正确解析
-    var cache_root_real_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cache_root_abs = io_core.realpath(cache_root, &cache_root_real_buf) catch cache_root;
+    var cache_root_real_buf: [libs_io.max_path_bytes]u8 = undefined;
+    const cache_root_abs = libs_io.realpath(cache_root, &cache_root_real_buf) catch cache_root;
     const cache_root_abs_owned = try a.dupe(u8, cache_root_abs);
     // 安装前确保缓存根与 content 目录存在，避免解压到缓存目录时 FileNotFound
-    try io_core.makePathAbsolute(cache_root_abs_owned);
-    const cache_content_dir = try io_core.pathJoin(a, &.{ cache_root_abs_owned, "content" });
-    try io_core.makePathAbsolute(cache_content_dir);
-    const nm_dir = try io_core.pathJoin(a, &.{ abs_cwd, "node_modules" });
-    io_core.makePathAbsolute(nm_dir) catch {};
+    try libs_io.makePathAbsolute(cache_root_abs_owned);
+    const cache_content_dir = try libs_io.pathJoin(a, &.{ cache_root_abs_owned, "content" });
+    try libs_io.makePathAbsolute(cache_content_dir);
+    const nm_dir = try libs_io.pathJoin(a, &.{ abs_cwd, "node_modules" });
+    libs_io.makePathAbsolute(nm_dir) catch {};
 
     var resolved = std.StringArrayHashMap([]const u8).init(allocator);
     defer {
@@ -612,8 +624,8 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
     // 优化 B：npm 下载临时文件改为各 worker 内 .tmp-download-<worker_id>.tgz，主线程不再使用单一 temp_tgz
     // 传递依赖统一放在 node_modules/.shu/<name>@<version>，不再使用 .shu/store 子目录
     // Windows：创建符号链接需「开发者模式」或管理员权限，否则会 AccessDenied；失败时见 CLI 的 Hint
-    const shu_dir = try io_core.pathJoin(a, &.{ nm_dir, ".shu" });
-    io_core.makePathAbsolute(shu_dir) catch {};
+    const shu_dir = try libs_io.pathJoin(a, &.{ nm_dir, ".shu" });
+    libs_io.makePathAbsolute(shu_dir) catch {};
 
     // 直接依赖名集合：dependencies + dev_dependencies + imports 中的 jsr:/npm:（三者都装到 node_modules）
     var direct_set = std.StringArrayHashMap(void).init(a);
@@ -667,7 +679,8 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
     }
     var resolution_idx: usize = 0;
     var resolving_emitted = false; // 本轮是否输出过 onResolving，用于 onResolvingComplete 仅在有 Resolving 输出时调用
-    var npm_resolve_client = std.http.Client{ .allocator = allocator };
+    const io = libs_process.getProcessIo() orelse return error.ProcessIoNotSet;
+    var npm_resolve_client = std.http.Client{ .allocator = allocator, .io = io };
     defer npm_resolve_client.deinit();
     // 优化 C：lockfile 已包含全部直接依赖及传递闭包时跳过整段解析
     if (!canSkipResolution(allocator, direct_set, resolved, deps_of)) {
@@ -1295,14 +1308,14 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
     for (install_order.items) |name| {
         const version = resolved.get(name).?;
         const pkg_dest = if (direct_set.contains(name))
-            io_core.pathJoin(a, &.{ nm_dir, name }) catch continue
+            libs_io.pathJoin(a, &.{ nm_dir, name }) catch continue
         else
             storePkgDir(a, shu_dir, name, version) catch continue;
-        var d = io_core.openDirAbsolute(pkg_dest, .{}) catch {
+        var d = libs_io.openDirAbsolute(pkg_dest, .{}) catch {
             new_count += 1;
             continue;
         };
-        d.close();
+        d.close(io);
     }
     if (resolving_emitted) if (reporter) |r| if (r.onResolvingComplete) |cb| cb(r.ctx);
     if (reporter) |r| {
@@ -1343,7 +1356,7 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
     for (install_order.items, already_installed_arr, jsr_task_idx_arr, npm_task_idx_arr) |name, *already_installed, *jsr_task_idx, *npm_task_idx| {
         const version = resolved.get(name).?;
         const pkg_dest = if (direct_set.contains(name))
-            io_core.pathJoin(a, &.{ nm_dir, name }) catch |e| {
+            libs_io.pathJoin(a, &.{ nm_dir, name }) catch |e| {
                 logInstallFailure("[shu install] failed: {s}@{s} (path): {s}\n", .{ name, version, @errorName(e) });
                 if (first_error == null) {
                     first_error = map_install_err(e);
@@ -1368,16 +1381,17 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                 }
                 continue;
             };
-        if (io_core.pathDirname(pkg_dest)) |parent| io_core.makePathAbsolute(parent) catch {};
+        if (libs_io.pathDirname(pkg_dest)) |parent| libs_io.makePathAbsolute(parent) catch {};
         // 已安装判断：JSR 包看目录存在即可（用 deno.json）；npm 包须目录存在且含 package.json，避免空目录被误判
         already_installed.* = blk: {
-            var d = io_core.openDirAbsolute(pkg_dest, .{}) catch break :blk false;
-            d.close();
+            const proc_io = libs_process.getProcessIo() orelse break :blk false;
+            var d = libs_io.openDirAbsolute(pkg_dest, .{}) catch break :blk false;
+            d.close(proc_io);
             if (jsr_packages.contains(name)) break :blk true;
-            const pkg_json = io_core.pathJoin(a, &.{ pkg_dest, "package.json" }) catch break :blk false;
+            const pkg_json = libs_io.pathJoin(a, &.{ pkg_dest, "package.json" }) catch break :blk false;
             defer a.free(pkg_json);
-            var f = io_core.openFileAbsolute(pkg_json, .{}) catch break :blk false;
-            f.close();
+            var f = libs_io.openFileAbsolute(pkg_json, .{}) catch break :blk false;
+            f.close(proc_io);
             break :blk true;
         };
         if (already_installed.*) {
@@ -1424,7 +1438,7 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
         const pool = jsr_pool.?;
         for (jsr_results) |*v| v.* = null;
         var jsr_first_err: ?anyerror = null;
-        var jsr_err_mutex = std.Thread.Mutex{};
+        var jsr_err_mutex = std.Io.Mutex.init;
         const n_jsr_workers = @min(jsr_tasks.items.len, JSR_INSTALL_MAX_WORKERS);
         var jsr_threads = std.ArrayList(std.Thread).initCapacity(allocator, n_jsr_workers) catch return error.OutOfMemory;
         defer jsr_threads.deinit(allocator);
@@ -1456,14 +1470,15 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
             const cur = install_completed_count.load(.monotonic);
             var name_buf: [64]u8 = undefined;
             var name_slice: ?[]const u8 = null;
-            last_completed_name.mutex.lock();
+            const prog_io = libs_process.getProcessIo() orelse break;
+            last_completed_name.mutex.lock(prog_io) catch break;
             if (last_completed_name.len > 0) {
                 @memcpy(name_buf[0..last_completed_name.len], last_completed_name.buf[0..last_completed_name.len]);
                 name_slice = name_buf[0..last_completed_name.len];
             }
-            last_completed_name.mutex.unlock();
+            last_completed_name.mutex.unlock(prog_io);
             if (reporter.?.onProgress) |onProg| onProg(reporter.?.ctx, cur, total_work_items, name_slice);
-            std.Thread.sleep(80_000_000); // 80ms
+            std.Io.sleep(prog_io, std.Io.Duration.fromNanoseconds(80_000_000), .awake) catch {}; // 80ms
         }
         for (jsr_threads.items) |th| th.join();
         if (jsr_first_err) |e| first_error = map_install_err(e);
@@ -1474,7 +1489,7 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
     if (npm_tasks.items.len > 0) {
         for (npm_results) |*v| v.* = null;
         var npm_first_err: ?anyerror = null;
-        var npm_err_mutex = std.Thread.Mutex{};
+        var npm_err_mutex = std.Io.Mutex.init;
         var npm_first_extract_logged = std.atomic.Value(bool).init(false);
         const n_workers = @min(npm_tasks.items.len, NPM_INSTALL_MAX_WORKERS);
         var threads = std.ArrayList(std.Thread).initCapacity(allocator, n_workers) catch return error.OutOfMemory;
@@ -1513,14 +1528,15 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
             const cur = install_completed_count.load(.monotonic);
             var name_buf: [64]u8 = undefined;
             var name_slice: ?[]const u8 = null;
-            last_completed_name.mutex.lock();
+            const prog_io = libs_process.getProcessIo() orelse break;
+            last_completed_name.mutex.lock(prog_io) catch break;
             if (last_completed_name.len > 0) {
                 @memcpy(name_buf[0..last_completed_name.len], last_completed_name.buf[0..last_completed_name.len]);
                 name_slice = name_buf[0..last_completed_name.len];
             }
-            last_completed_name.mutex.unlock();
+            last_completed_name.mutex.unlock(prog_io);
             if (reporter.?.onProgress) |onProg| onProg(reporter.?.ctx, cur, total_work_items, name_slice);
-            std.Thread.sleep(80_000_000); // 80ms
+            std.Io.sleep(prog_io, std.Io.Duration.fromNanoseconds(80_000_000), .awake) catch {}; // 80ms
         }
         for (threads.items) |th| th.join();
         if (npm_first_err) |e| first_error = map_install_err(e);
@@ -1598,12 +1614,12 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
     // 直接依赖已安装在 node_modules/<name>，无需再建顶层符号链接
 
     // node_modules/.bin：为每个直接依赖的 package.json "bin" 在 .bin 下创建符号链接，供 npx/CLI 解析
-    const bin_dir = io_core.pathJoin(a, &.{ nm_dir, ".bin" }) catch return error.OutOfMemory;
-    io_core.makePathAbsolute(bin_dir) catch {};
+    const bin_dir = libs_io.pathJoin(a, &.{ nm_dir, ".bin" }) catch return error.OutOfMemory;
+    libs_io.makePathAbsolute(bin_dir) catch {};
     var direct_it = direct_set.iterator();
     while (direct_it.next()) |e| {
         const pkg_name = e.key_ptr.*;
-        const pkg_dir = io_core.pathJoin(a, &.{ nm_dir, pkg_name }) catch continue;
+        const pkg_dir = libs_io.pathJoin(a, &.{ nm_dir, pkg_name }) catch continue;
         linkPackageBins(a, bin_dir, pkg_name, pkg_dir);
     }
 
@@ -1618,11 +1634,11 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
             continue;
         };
         const pkg_dir = if (direct_set.contains(pkg_name))
-            io_core.pathJoin(a, &.{ nm_dir, pkg_name }) catch continue
+            libs_io.pathJoin(a, &.{ nm_dir, pkg_name }) catch continue
         else
             storePkgDir(a, shu_dir, pkg_name, version) catch continue;
-        const nm_inside = io_core.pathJoin(a, &.{ pkg_dir, "node_modules" }) catch continue;
-        io_core.makePathAbsolute(nm_inside) catch {};
+        const nm_inside = libs_io.pathJoin(a, &.{ pkg_dir, "node_modules" }) catch continue;
+        libs_io.makePathAbsolute(nm_inside) catch {};
         for (deps_list.items) |dep_name| {
             const dep_ver = resolved.get(dep_name) orelse {
                 logInstallFailure("[shu install] skip symlink: no resolved version for dep {s} of {s}\n", .{ dep_name, pkg_name });
@@ -1639,22 +1655,23 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                     const name_at_ver = std.fmt.allocPrint(a, "{s}@{s}", .{ dep_name, dep_ver }) catch continue;
                     if (direct_set.contains(pkg_name)) {
                         // 从「直接依赖包」的 node_modules 链到项目 node_modules/.shu/<name>@<ver>：用绝对路径，确保任意 cwd 下都能解析
-                        break :blk io_core.pathJoin(a, &.{ shu_dir, name_at_ver }) catch continue;
+                        break :blk libs_io.pathJoin(a, &.{ shu_dir, name_at_ver }) catch continue;
                     } else break :blk std.fmt.allocPrint(a, "../{s}", .{name_at_ver}) catch continue;
                 }
             };
-            const dep_link_path = io_core.pathJoin(a, &.{ nm_inside, dep_name }) catch continue;
-            io_core.deleteFileAbsolute(dep_link_path) catch |err| if (err == error.IsDir) io_core.deleteTreeAbsolute(dep_link_path) catch {};
-            const parent = io_core.pathDirname(dep_link_path) orelse continue;
-            const link_name = io_core.pathBasename(dep_link_path);
-            io_core.makePathAbsolute(parent) catch {};
-            var dep_dir = io_core.openDirAbsolute(parent, .{}) catch continue;
-            dep_dir.symLink(target_path, link_name, .{ .is_directory = true }) catch |e| {
+            const dep_link_path = libs_io.pathJoin(a, &.{ nm_inside, dep_name }) catch continue;
+            libs_io.deleteFileAbsolute(dep_link_path) catch |err| if (err == error.IsDir) libs_io.deleteTreeAbsolute(allocator, dep_link_path) catch {};
+            const parent = libs_io.pathDirname(dep_link_path) orelse continue;
+            const link_name = libs_io.pathBasename(dep_link_path);
+            libs_io.makePathAbsolute(parent) catch {};
+            const proc_io = libs_process.getProcessIo() orelse continue;
+            var dep_dir = libs_io.openDirAbsolute(parent, .{}) catch continue;
+            dep_dir.symLink(proc_io, target_path, link_name, .{ .is_directory = true }) catch |e| {
                 if (@import("builtin").os.tag == .windows) {
                     logInstallFailure("[shu install] symlink failed (Windows): enable Developer Mode or run as Administrator. dep={s} error={s}\n", .{ dep_name, @errorName(e) });
                 }
             };
-            dep_dir.close();
+            dep_dir.close(proc_io);
         }
     }
 
@@ -1673,8 +1690,12 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
             // add 流程：统计只显示本次添加的包数，如 "1 package installed"
             const done_total = if (added_names) |names| names.len else total_count;
             const done_new = if (added_names) |names| names.len else new_index;
-            const elapsed_ms = std.time.milliTimestamp() - install_start_ms;
-            cb(r.ctx, done_total, done_new, elapsed_ms);
+            const elapsed_ms: u64 = if (install_start_ts) |start_ts| blk: {
+                const dur = start_ts.untilNow(io);
+                const ns = dur.raw.nanoseconds;
+                break :blk @intCast(@divTrunc(if (ns < 0) 0 else ns, 1_000_000));
+            } else 0;
+            cb(r.ctx, done_total, done_new, @as(i64, @intCast(elapsed_ms)));
         }
     }
     try lockfile.saveFromResolved(allocator, lock_path, resolved, &deps_of, &jsr_packages);
@@ -1685,7 +1706,7 @@ fn streamReadExactlyToBuffer(dec: anytype, buf: []u8, work: []u8) !void {
     var pos: usize = 0;
     while (pos < buf.len) {
         const to_read = @min(work.len, buf.len - pos);
-        var w = std.io.Writer.fixed(work[0..to_read]);
+        var w = std.Io.Writer.fixed(work[0..to_read]);
         const n = dec.reader.stream(&w, .limited(to_read)) catch |e| {
             if (e == error.EndOfStream) return error.UnexpectedEof;
             return e;
@@ -1696,18 +1717,18 @@ fn streamReadExactlyToBuffer(dec: anytype, buf: []u8, work: []u8) !void {
     }
 }
 
-/// 从解压流 dec 中读取恰好 need 字节并写入 file，用 chunk 作为读缓冲。用于 tar 文件条目内容。
-fn streamReadExactlyToFile(dec: anytype, file: std.fs.File, need: usize, chunk: []u8) !void {
+/// 从解压流 dec 中读取恰好 need 字节并写入 file，用 chunk 作为读缓冲。用于 tar 文件条目内容。Zig 0.16 使用 std.Io.File.writeStreamingAll(io, slice)。
+fn streamReadExactlyToFile(dec: anytype, file: std.Io.File, io: std.Io, need: usize, chunk: []u8) !void {
     var pos: usize = 0;
     while (pos < need) {
         const to_read = @min(chunk.len, need - pos);
-        var w = std.io.Writer.fixed(chunk[0..to_read]);
+        var w = std.Io.Writer.fixed(chunk[0..to_read]);
         const n = dec.reader.stream(&w, .limited(to_read)) catch |e| {
             if (e == error.EndOfStream) return error.UnexpectedEof;
             return e;
         };
         if (n == 0) return error.UnexpectedEof;
-        try file.writeAll(chunk[0..n]);
+        try file.writeStreamingAll(io, chunk[0..n]);
         pos += n;
     }
 }
@@ -1717,7 +1738,7 @@ fn streamSkipExactly(dec: anytype, need: usize, chunk: []u8) !void {
     var pos: usize = 0;
     while (pos < need) {
         const to_read = @min(chunk.len, need - pos);
-        var w = std.io.Writer.fixed(chunk[0..to_read]);
+        var w = std.Io.Writer.fixed(chunk[0..to_read]);
         const n = dec.reader.stream(&w, .limited(to_read)) catch |e| {
             if (e == error.EndOfStream) return error.UnexpectedEof;
             return e;
@@ -1729,7 +1750,7 @@ fn streamSkipExactly(dec: anytype, need: usize, chunk: []u8) !void {
 
 /// 返回 .shu 下某传递依赖包的目录路径：shu_dir/<name>@<version>（如 @scope/pkg 则 shu_dir/@scope/pkg@1.0.0）。调用方 free。
 fn storePkgDir(allocator: std.mem.Allocator, shu_dir: []const u8, name: []const u8, version: []const u8) ![]const u8 {
-    return io_core.pathJoin(allocator, &.{ shu_dir, try std.fmt.allocPrint(allocator, "{s}@{s}", .{ name, version }) });
+    return libs_io.pathJoin(allocator, &.{ shu_dir, try std.fmt.allocPrint(allocator, "{s}@{s}", .{ name, version }) });
 }
 
 /// 从包目录 pkg_dir 的 package.json 解析 "bin" 字段，为每个 bin 在 node_modules/.bin 下创建符号链接。
@@ -1741,11 +1762,13 @@ fn linkPackageBins(
     pkg_name: []const u8,
     pkg_dir: []const u8,
 ) void {
-    const pkg_json_path = io_core.pathJoin(allocator, &.{ pkg_dir, "package.json" }) catch return;
+    const pkg_json_path = libs_io.pathJoin(allocator, &.{ pkg_dir, "package.json" }) catch return;
     defer allocator.free(pkg_json_path);
-    var f = io_core.openFileAbsolute(pkg_json_path, .{}) catch return;
-    defer f.close();
-    const raw = f.readToEndAlloc(allocator, std.math.maxInt(usize)) catch return;
+    const io = libs_process.getProcessIo() orelse return;
+    var f = libs_io.openFileAbsolute(pkg_json_path, .{}) catch return;
+    defer f.close(io);
+    var file_reader = f.reader(io, &.{});
+    const raw = file_reader.interface.allocRemaining(allocator, std.Io.Limit.unlimited) catch return;
     defer allocator.free(raw);
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{ .allocate = .alloc_always }) catch return;
     defer parsed.deinit();
@@ -1784,7 +1807,7 @@ fn linkPackageBins(
 }
 
 /// 在 bin_dir 下创建一条 bin 链接：bin_dir/<bin_name> -> pkg_dir/<normalized_path>。
-/// target 须为绝对路径，否则 io_core.symLinkAbsolute 会断言失败。
+/// target 须为绝对路径，否则 libs_io.symLinkAbsolute 会断言失败。
 /// Unix：创建后对目标脚本 fchmod +x，使 exec .bin/<name> 时 shebang 能执行。
 /// Windows：无「可执行位」概念，不需 chmod；额外写 .bin/<bin_name>.cmd 包装脚本（@node "target" %*），
 /// 以便在 cmd 中直接运行 <name> 时能正确执行。
@@ -1796,29 +1819,30 @@ fn linkOneBin(
     rel_path: []const u8,
 ) !void {
     const normalized = std.mem.trim(u8, rel_path, "./");
-    const target_absolute = io_core.pathJoin(allocator, &.{ pkg_dir, normalized }) catch return error.OutOfMemory;
+    const target_absolute = libs_io.pathJoin(allocator, &.{ pkg_dir, normalized }) catch return error.OutOfMemory;
     defer allocator.free(target_absolute);
-    const link_path = io_core.pathJoin(allocator, &.{ bin_dir, bin_name }) catch return error.OutOfMemory;
+    const link_path = libs_io.pathJoin(allocator, &.{ bin_dir, bin_name }) catch return error.OutOfMemory;
     defer allocator.free(link_path);
-    io_core.deleteFileAbsolute(link_path) catch |err| if (err == error.IsDir) io_core.deleteTreeAbsolute(link_path) catch {};
-    io_core.symLinkAbsolute(target_absolute, link_path, .{}) catch return;
+    libs_io.deleteFileAbsolute(link_path) catch |err| if (err == error.IsDir) libs_io.deleteTreeAbsolute(allocator, link_path) catch {};
+    libs_io.symLinkAbsolute(target_absolute, link_path, .{}) catch return;
+    const io = libs_process.getProcessIo() orelse return;
     const is_windows = @import("builtin").os.tag == .windows;
     if (is_windows) {
         // Windows：写 .cmd 包装，使 cmd 中运行 <name> 时执行 node target %*
         const cmd_path = std.fmt.allocPrint(allocator, "{s}.cmd", .{link_path}) catch return;
         defer allocator.free(cmd_path);
-        io_core.deleteFileAbsolute(cmd_path) catch {};
-        var f = io_core.createFileAbsolute(cmd_path, .{}) catch return;
-        defer f.close();
+        libs_io.deleteFileAbsolute(cmd_path) catch {};
+        var f = libs_io.createFileAbsolute(cmd_path, .{}) catch return;
+        defer f.close(io);
         // @echo off & node "target_absolute" %*
         var buf: [4096]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, "@echo off\r\nnode \"{s}\" %*\r\n", .{target_absolute}) catch return;
-        f.writeAll(line) catch return;
+        f.writeStreamingAll(io, line) catch return;
     } else {
-        // Unix：对目标脚本加可执行权限
-        var f = io_core.openFileAbsolute(target_absolute, .{}) catch return;
-        defer f.close();
-        std.posix.fchmod(f.handle, 0o755) catch {};
+        // Unix：对目标脚本加可执行权限。Zig 0.16 使用 std.c.fchmod，File.close 需传 io。
+        var f = libs_io.openFileAbsolute(target_absolute, .{}) catch return;
+        defer f.close(io);
+        _ = std.c.fchmod(f.handle, 0o755);
     }
 }
 
@@ -1826,18 +1850,19 @@ fn linkOneBin(
 fn logFirstTarballExtractFailure(ctx: *const NpmInstallWorkerCtx, tgz_path: []const u8, err: anyerror, name: []const u8, version: []const u8) void {
     if (ctx.first_extract_failure_logged.swap(true, .monotonic)) return;
     logInstallFailure("[shu install] first tarball extract failure: {s}@{s} error={s}\n", .{ name, version, @errorName(err) });
-    var f = io_core.openFileAbsolute(tgz_path, .{}) catch {
+    const proc_io = libs_process.getProcessIo() orelse return;
+    var f = libs_io.openFileAbsolute(tgz_path, .{}) catch {
         logInstallFailure("[shu install] first tarball extract failure: {s}@{s} error={s} path={s} (file not openable)\n", .{ name, version, @errorName(err), tgz_path });
         return;
     };
-    defer f.close();
+    defer f.close(proc_io);
     var buf: [16]u8 = undefined;
-    const n = f.read(buf[0..]) catch 0;
+    const n = f.readStreaming(proc_io, &.{buf[0..]}) catch 0;
     var hex: [64]u8 = undefined;
     for (buf[0..n], 0..) |b, i| {
         _ = std.fmt.bufPrint(hex[i * 3 ..][0..3], "{x:0>2} ", .{b}) catch break;
     }
-    const stat = f.stat() catch return;
+    const stat = f.stat(proc_io) catch return;
     logInstallFailure("[shu install] first tarball extract failure: {s}@{s} error={s} path={s} size={d} first_bytes=[{s}]\n", .{
         name,
         version,
@@ -1850,7 +1875,7 @@ fn logFirstTarballExtractFailure(ctx: *const NpmInstallWorkerCtx, tgz_path: []co
 
 /// 当 SHU_DEBUG_TGZ 非空时，在 extractRawTarFromSlice 返回 InvalidGzip 前调用，打印解压后 content 长度与首个 tar 条目的名字，用于区分「截断」与「无 package/」。
 fn logInvalidTarContent(tgz_path: []const u8, content: []const u8, reason: []const u8) void {
-    if (std.posix.getenv("SHU_DEBUG_TGZ")) |_| {} else return;
+    if (std.c.getenv("SHU_DEBUG_TGZ")) |_| {} else return;
     var name_buf: [120]u8 = undefined;
     var name_slice: []const u8 = "?";
     if (content.len >= 512) {
@@ -1862,13 +1887,13 @@ fn logInvalidTarContent(tgz_path: []const u8, content: []const u8, reason: []con
         if (ustar.len >= 5 and ustar[0] == 'u' and ustar[1] == 's' and ustar[2] == 't' and ustar[3] == 'a' and ustar[4] == 'r') {
             const prefix_end = std.mem.indexOfScalar(u8, content[345..500], 0) orelse 155;
             const prefix_slice = content[345..][0..prefix_end];
-            var fbs = std.io.fixedBufferStream(&name_buf);
+            var w = std.Io.Writer.fixed(&name_buf);
             if (prefix_slice.len > 0) {
-                fbs.writer().print("{s}/{s}", .{ prefix_slice, name_slice }) catch {};
+                w.print("{s}/{s}", .{ prefix_slice, name_slice }) catch {};
             } else {
-                fbs.writer().print("{s}", .{name_slice}) catch {};
+                w.print("{s}", .{name_slice}) catch {};
             }
-            name_slice = fbs.getWritten();
+            name_slice = std.Io.Writer.buffered(&w);
         }
     }
     logInstallFailure("[shu tgz debug] InvalidGzip reason={s} path={s} decompressed_len={d} first_entry={s}\n", .{
@@ -1881,7 +1906,7 @@ fn logInvalidTarContent(tgz_path: []const u8, content: []const u8, reason: []con
 
 /// 当 SHU_DEBUG_TGZ 非空时，解压某步骤失败则向 stderr 打印步骤、路径与错误，便于定位 TarballExtractFailed 等。
 fn logExtractFailureStep(tgz_path: []const u8, step: []const u8, path_or_rel: []const u8, err: anyerror) void {
-    if (std.posix.getenv("SHU_DEBUG_TGZ")) |_| {} else return;
+    if (std.c.getenv("SHU_DEBUG_TGZ")) |_| {} else return;
     logInstallFailure("[shu tgz debug] step={s} path={s} target={s} error={s}\n", .{
         step,
         tgz_path,
@@ -1892,19 +1917,20 @@ fn logExtractFailureStep(tgz_path: []const u8, step: []const u8, path_or_rel: []
 
 /// 当 SHU_DEBUG_TGZ 非空时，解压失败则向 stderr 打印 tgz 路径、错误、文件大小及前 16 字节（hex）。
 fn debugLogTarballExtractFailed(tgz_path: []const u8, err: anyerror) void {
-    if (std.posix.getenv("SHU_DEBUG_TGZ")) |_| {} else return;
-    var f = io_core.openFileAbsolute(tgz_path, .{}) catch {
+    if (std.c.getenv("SHU_DEBUG_TGZ")) |_| {} else return;
+    const proc_io = libs_process.getProcessIo() orelse return;
+    var f = libs_io.openFileAbsolute(tgz_path, .{}) catch {
         logInstallFailure("[shu tgz debug] path={s} error={s} (could not open file)\n", .{ tgz_path, @errorName(err) });
         return;
     };
-    defer f.close();
+    defer f.close(proc_io);
     var buf: [16]u8 = undefined;
-    const n = f.read(buf[0..]) catch 0;
+    const n = f.readStreaming(proc_io, &.{buf[0..]}) catch 0;
     var hex: [64]u8 = undefined;
     for (buf[0..n], 0..) |b, i| {
         _ = std.fmt.bufPrint(hex[i * 3 ..][0..3], "{x:0>2} ", .{b}) catch break;
     }
-    const stat = f.stat() catch return;
+    const stat = f.stat(proc_io) catch return;
     logInstallFailure("[shu tgz debug] path={s} error={s} size={d} first_bytes={s}\n", .{
         tgz_path,
         @errorName(err),
@@ -1916,13 +1942,14 @@ fn debugLogTarballExtractFailed(tgz_path: []const u8, err: anyerror) void {
 /// 从内存中的 raw tar 切片解析并解出「单层顶层目录」下内容到 dest_dir。与 extractTarballToDir 的 tar 解析逻辑一致，用于服务端返回未压缩 tar（Accept-Encoding: identity）时。
 /// 兼容任意单层顶层目录：从第一条条目的路径推断前缀（如 package/、ws/、foo/ 等），只解压该前缀下的文件到 dest_dir。
 fn extractRawTarFromSlice(tgz_path: []const u8, content: []const u8, dest_dir: []const u8) !void {
-    try io_core.makePathAbsolute(dest_dir);
+    const proc_io = libs_process.getProcessIo() orelse return error.ProcessIoNotSet;
+    try libs_io.makePathAbsolute(dest_dir);
     // §3.0: 目录打开经 io_core，与模块约定一致
-    var dest_dir_handle = io_core.openDirAbsolute(dest_dir, .{}) catch |e| {
+    var dest_dir_handle = libs_io.openDirAbsolute(dest_dir, .{}) catch |e| {
         logExtractFailureStep(tgz_path, "open_dest_dir", dest_dir, e);
         return error.TarballExtractFailed;
     };
-    defer dest_dir_handle.close();
+    defer dest_dir_handle.close(proc_io);
     var wrote_any_file = false;
     var offset: usize = 0;
     var prefix_buf: [256]u8 = undefined;
@@ -1947,9 +1974,9 @@ fn extractRawTarFromSlice(tgz_path: []const u8, content: []const u8, dest_dir: [
                 const prefix_slice = header_buf[345..][0..prefix_end];
                 if (prefix_slice.len > 0) {
                     var buf: [256]u8 = undefined;
-                    var fbs = std.io.fixedBufferStream(&buf);
-                    fbs.writer().print("{s}/{s}", .{ prefix_slice, name_slice }) catch break :blk name_slice;
-                    break :blk fbs.getWritten();
+                    var w = std.Io.Writer.fixed(&buf);
+                    w.print("{s}/{s}", .{ prefix_slice, name_slice }) catch break :blk name_slice;
+                    break :blk std.Io.Writer.buffered(&w);
                 }
             }
             break :blk name_slice;
@@ -1996,23 +2023,23 @@ fn extractRawTarFromSlice(tgz_path: []const u8, content: []const u8, dest_dir: [
             continue;
         }
         if (typeflag == '5') {
-            dest_dir_handle.makePath(rel) catch {};
+            dest_dir_handle.createDirPath(proc_io, rel) catch {};
             offset += block_rounded;
         } else {
             if (std.mem.indexOf(u8, rel, "..")) |_| {
                 offset += block_rounded;
                 continue;
             }
-            if (io_core.pathDirname(rel)) |rel_dir| if (rel_dir.len > 0) dest_dir_handle.makePath(rel_dir) catch {};
-            const out_file = dest_dir_handle.createFile(rel, .{}) catch |e| {
+            if (libs_io.pathDirname(rel)) |rel_dir| if (rel_dir.len > 0) dest_dir_handle.createDirPath(proc_io, rel_dir) catch {};
+            const out_file = dest_dir_handle.createFile(proc_io, rel, .{}) catch |e| {
                 logExtractFailureStep(tgz_path, "create_file", rel, e);
                 offset += block_rounded;
                 return e;
             };
-            defer out_file.close();
+            defer out_file.close(proc_io);
             wrote_any_file = true;
             if (size > 0) {
-                try out_file.writeAll(content[offset..][0..size]);
+                try out_file.writeStreamingAll(proc_io, content[offset..][0..size]);
             }
             offset += block_rounded;
         }
@@ -2023,11 +2050,11 @@ fn extractRawTarFromSlice(tgz_path: []const u8, content: []const u8, dest_dir: [
     }
 }
 
-/// 将 .tgz 解压到指定目录 dest_dir（tgz 内 package/ 前缀下的内容写入 dest_dir）。使用 io_core.mapFileReadOnly 映射 tgz，gzip 解压后流式解析 tar。
-/// 通过 io_core.openDirAbsolute(dest_dir) + Dir.createFile/makePath 写文件。
+/// 将 .tgz 解压到指定目录 dest_dir（tgz 内 package/ 前缀下的内容写入 dest_dir）。使用 libs_io.mapFileReadOnly 映射 tgz，gzip 解压后流式解析 tar。
+/// 通过 libs_io.openDirAbsolute(dest_dir) + Dir.createFile/makePath 写文件。
 /// allocator 用于 gzip 一次性解压的临时缓冲；若由安装 worker 调用，建议传入该 worker 的 Arena 或独立 allocator。
 fn extractTarballToDir(allocator: std.mem.Allocator, tgz_path: []const u8, dest_dir: []const u8) !void {
-    var mapped = io_core.mapFileReadOnly(tgz_path) catch |e| {
+    var mapped = libs_io.mapFileReadOnly(tgz_path) catch |e| {
         debugLogTarballExtractFailed(tgz_path, e);
         return e;
     };
@@ -2054,13 +2081,14 @@ fn extractTarballToDir(allocator: std.mem.Allocator, tgz_path: []const u8, dest_
     var in_reader = std.Io.Reader.fixed(tgz_content);
     var dec = std.compress.flate.Decompress.init(&in_reader, .gzip, &[0]u8{});
 
-    try io_core.makePathAbsolute(dest_dir);
+    const proc_io = libs_process.getProcessIo() orelse return error.ProcessIoNotSet;
+    try libs_io.makePathAbsolute(dest_dir);
     // §3.0: 目录打开经 io_core
-    var dest_dir_handle = io_core.openDirAbsolute(dest_dir, .{}) catch |e| {
+    var dest_dir_handle = libs_io.openDirAbsolute(dest_dir, .{}) catch |e| {
         logExtractFailureStep(tgz_path, "open_dest_dir(stream)", dest_dir, e);
         return error.TarballExtractFailed;
     };
-    defer dest_dir_handle.close();
+    defer dest_dir_handle.close(proc_io);
 
     var header_buf: [512]u8 = undefined;
     var chunk: [8192]u8 = undefined;
@@ -2093,10 +2121,9 @@ fn extractTarballToDir(allocator: std.mem.Allocator, tgz_path: []const u8, dest_
                 const prefix_slice = header_buf[345..][0..prefix_end];
                 if (prefix_slice.len > 0) {
                     var buf: [256]u8 = undefined;
-                    var fbs = std.io.fixedBufferStream(&buf);
-                    fbs.writer().print("{s}/{s}", .{ prefix_slice, name_slice }) catch break :blk name_slice;
-                    const written = fbs.getWritten();
-                    break :blk written;
+                    var w = std.Io.Writer.fixed(&buf);
+                    w.print("{s}/{s}", .{ prefix_slice, name_slice }) catch break :blk name_slice;
+                    break :blk std.Io.Writer.buffered(&w);
                 }
             }
             break :blk name_slice;
@@ -2144,24 +2171,24 @@ fn extractTarballToDir(allocator: std.mem.Allocator, tgz_path: []const u8, dest_
         }
 
         if (typeflag == '5') {
-            dest_dir_handle.makePath(rel) catch {};
+            dest_dir_handle.createDirPath(proc_io, rel) catch {};
             try streamSkipExactly(&dec, block_rounded, &chunk);
         } else {
             if (std.mem.indexOf(u8, rel, "..")) |_| {
                 try streamSkipExactly(&dec, block_rounded, &chunk);
                 continue;
             }
-            if (io_core.pathDirname(rel)) |rel_dir| if (rel_dir.len > 0) dest_dir_handle.makePath(rel_dir) catch {};
-            const out_file = dest_dir_handle.createFile(rel, .{}) catch |e| {
+            if (libs_io.pathDirname(rel)) |rel_dir| if (rel_dir.len > 0) dest_dir_handle.createDirPath(proc_io, rel_dir) catch {};
+            const out_file = dest_dir_handle.createFile(proc_io, rel, .{}) catch |e| {
                 logExtractFailureStep(tgz_path, "create_file(stream)", rel, e);
                 try streamSkipExactly(&dec, block_rounded, &chunk);
                 return e;
             };
-            defer out_file.close();
+            defer out_file.close(proc_io);
             wrote_any_file = true;
             // 必须完整读出文件内容；失败则直接返回，避免流位置错位导致后续条目（如 package.json）解析错乱
             if (size > 0) {
-                streamReadExactlyToFile(&dec, out_file, size, &chunk) catch |e| {
+                streamReadExactlyToFile(&dec, out_file, proc_io, size, &chunk) catch |e| {
                     logExtractFailureStep(tgz_path, "stream_read_file", rel, e);
                     return e;
                 };
@@ -2200,13 +2227,13 @@ test "extractTarballToDir: minimal tgz produces package.json" {
     const tgz_path = try std.fmt.allocPrint(a, "{s}/minimal.tgz", .{dest_dir_path});
     defer a.free(tgz_path);
     try tmp.dir.writeFile("minimal.tgz", decoded[0..tgz_bytes]);
-    const extract_dest = try io_core.pathJoin(a, &.{ dest_dir_path, "out" });
+    const extract_dest = try libs_io.pathJoin(a, &.{ dest_dir_path, "out" });
     defer a.free(extract_dest);
-    try io_core.makePathAbsolute(extract_dest);
+    try libs_io.makePathAbsolute(extract_dest);
     try extractTarballToDir(a, tgz_path, extract_dest);
-    const pkg_json = try io_core.pathJoin(a, &.{ extract_dest, "package.json" });
+    const pkg_json = try libs_io.pathJoin(a, &.{ extract_dest, "package.json" });
     defer a.free(pkg_json);
-    try std.testing.expect(io_core.accessAbsolute(pkg_json, .{}) == .ok);
+    try std.testing.expect(libs_io.accessAbsolute(pkg_json, .{}) == .ok);
     const content = try tmp.dir.readFileAlloc(a, "out/package.json", 64);
     defer a.free(content);
     try std.testing.expect(std.mem.eql(u8, std.mem.trim(u8, content, " \n"), "{}"));
@@ -2214,17 +2241,17 @@ test "extractTarballToDir: minimal tgz produces package.json" {
 
 // 可选：若环境变量 SHU_TGZ_PATH 指向某 .tgz 文件，解压并断言存在 package.json（用于调试真实 npm tgz）。
 test "extractTarballToDir: real tgz when SHU_TGZ_PATH set" {
-    const path = std.posix.getenv("SHU_TGZ_PATH") orelse return;
+    const path = std.c.getenv("SHU_TGZ_PATH") orelse return;
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dest = try tmp.dir.realpathAlloc(a, ".");
     defer a.free(dest);
-    const out_dir = try io_core.pathJoin(a, &.{ dest, "out" });
+    const out_dir = try libs_io.pathJoin(a, &.{ dest, "out" });
     defer a.free(out_dir);
-    try io_core.makePathAbsolute(out_dir);
+    try libs_io.makePathAbsolute(out_dir);
     try extractTarballToDir(a, path, out_dir);
-    const pkg_json = try io_core.pathJoin(a, &.{ out_dir, "package.json" });
+    const pkg_json = try libs_io.pathJoin(a, &.{ out_dir, "package.json" });
     defer a.free(pkg_json);
-    try std.testing.expect(io_core.accessAbsolute(pkg_json, .{}) == .ok);
+    try std.testing.expect(libs_io.accessAbsolute(pkg_json, .{}) == .ok);
 }
