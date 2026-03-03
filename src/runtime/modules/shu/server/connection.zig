@@ -6,6 +6,8 @@
 const std = @import("std");
 const jsc = @import("jsc");
 const build_options = @import("build_options");
+const errors = @import("errors");
+const libs_process = @import("libs_process");
 const types = @import("types.zig");
 const parse = @import("parse.zig");
 const response = @import("response.zig");
@@ -28,6 +30,26 @@ const gzip_mod = shu_zlib;
 // 带前缀的 Reader / TLS 流
 // ------------------------------------------------------------------------------
 
+/// 0.16：*std.Io.net.Stream 适配器，提供 .read() 与 .writeAll() 供 parse/http2 等使用（内部用 reader/writer+readVec/writeVec）
+pub const NetStreamAdapter = struct {
+    stream: *std.Io.net.Stream,
+    io: std.Io,
+    read_buf: [8192]u8 = undefined,
+    write_buf: [8192]u8 = undefined,
+
+    pub fn read(self: *@This(), dest: []u8) !usize {
+        var r = self.stream.reader(self.io, &self.read_buf);
+        var d = [1][]u8{dest};
+        return std.Io.Reader.readVec(&r.interface, &d) catch error.ConnectionClosed;
+    }
+
+    pub fn writeAll(self: *@This(), buf: []const u8) !void {
+        var w = self.stream.writer(self.io, &self.write_buf);
+        _ = std.Io.Writer.writeVec(&w.interface, &.{buf}) catch return;
+        try w.interface.flush();
+    }
+};
+
 /// 带前缀的 Reader：先返回 prefix 内容，再从 underlying 读；用于 h2c prior 时把已读 24 字节喂给 HTTP 解析
 pub fn PreReadReader(comptime StreamT: type) type {
     return struct {
@@ -42,6 +64,13 @@ pub fn PreReadReader(comptime StreamT: type) type {
                 @memcpy(buf[0..n], self.prefix[self.consumed..][0..n]);
                 self.consumed += n;
                 return n;
+            }
+            if (StreamT == std.Io.net.Stream) {
+                const io = libs_process.getProcessIo() orelse return error.NoProcessIo;
+                var io_buf: [4096]u8 = undefined;
+                var r = self.stream.reader(io, &io_buf);
+                var dest: [1][]u8 = .{buf};
+                return std.Io.Reader.readVec(&r.interface, &dest);
             }
             return self.stream.read(buf);
         }
