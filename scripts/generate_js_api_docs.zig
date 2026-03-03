@@ -107,8 +107,8 @@ fn categoryTitle(cat: []const u8) []const u8 {
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.debug.assert(gpa.deinit() == .ok);
     const allocator = gpa.allocator();
 
     var args = try std.process.argsWithAllocator(allocator);
@@ -139,7 +139,7 @@ pub fn main() !void {
     };
     std.mem.sort(ApiRow, rows.items, {}, sort_ctx.lessThan);
 
-    // 先写入内存，再一次性写入文件（避免 Zig 0.15 File.Writer API 差异）
+    // 先写入内存，再一次性写入文件（Zig 0.16.0-dev：ArrayList/Writer API）
     var output = try std.ArrayList(u8).initCapacity(allocator, 16384);
     defer output.deinit(allocator);
     const w = output.writer(allocator);
