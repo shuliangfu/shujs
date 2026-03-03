@@ -22,7 +22,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const args = @import("args.zig");
 const version = @import("version.zig");
-const io_core = @import("io_core");
+const libs_io = @import("libs_io");
+const errors = @import("errors");
+const libs_process = @import("libs_process");
 const manifest = @import("../package/manifest.zig");
 const scan = @import("scan.zig");
 const strip_types = @import("../transpiler/strip_types.zig");
@@ -42,7 +44,8 @@ fn parseLintMarkdownFlag(positional: []const []const u8) bool {
 /// （传 --md/--markdown 时额外检查 .md/.mdc），仅用 ESLint，
 /// 不可用时对 .ts/.tsx 做 strip_types。
 pub fn lint(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional: []const []const u8) !void {
-    try version.printCommandHeader("lint");
+    const io = libs_process.getProcessIo() orelse return error.NoProcessIo;
+    try version.printCommandHeader(io, "lint");
     if (LINT_PLACEHOLDER) {
         try printStderr("shu lint: placeholder, full implementation coming soon.\n", .{});
         return;
@@ -50,7 +53,7 @@ pub fn lint(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional: [
     _ = parsed;
     const markdown = parseLintMarkdownFlag(positional);
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd = io_core.realpath(".", &cwd_buf) catch {
+    const cwd = libs_io.realpath(".", &cwd_buf) catch {
         try printStderr("shu lint: cannot get current directory\n", .{});
         return error.CwdFailed;
     };
@@ -162,7 +165,8 @@ fn filterPathsByLintConfig(
 /// 若 manifest 存在则用其 lint 配置过滤。JS/TS 仅用 ESLint，
 /// 不可用时对 .ts/.tsx 做 strip_types；.md/.mdc 用 markdownlint。
 fn runDefaultLint(allocator: std.mem.Allocator, cwd_owned: []const u8, markdown: bool, lint_value: ?std.json.Value) !void {
-    var list = try scan.collectFilesRecursive(allocator, cwd_owned, &scan.lint_extensions);
+    const io = libs_process.getProcessIo() orelse return error.NoProcessIo;
+    var list = try scan.collectFilesRecursive(allocator, cwd_owned, &scan.lint_extensions, io);
     if (lint_value) |lv| {
         const filtered = try filterPathsByLintConfig(allocator, list, lv);
         for (list.items) |p| allocator.free(p);
@@ -188,7 +192,7 @@ fn runDefaultLint(allocator: std.mem.Allocator, cwd_owned: []const u8, markdown:
         md_list.deinit(allocator);
     }
     if (markdown) {
-        var collected = try scan.collectFilesRecursive(allocator, cwd_owned, &scan.lint_md_extensions);
+        var collected = try scan.collectFilesRecursive(allocator, cwd_owned, &scan.lint_md_extensions, io);
         defer {
             for (collected.items) |p| allocator.free(p);
             collected.deinit(allocator);
@@ -217,9 +221,9 @@ fn runDefaultLint(allocator: std.mem.Allocator, cwd_owned: []const u8, markdown:
             var has_error = false;
             for (js_ts.items) |rel| {
                 if (std.mem.endsWith(u8, rel, ".ts") or std.mem.endsWith(u8, rel, ".tsx")) {
-                    const abs = try io_core.pathJoin(allocator, &.{ cwd_owned, rel });
+                    const abs = try libs_io.pathJoin(allocator, &.{ cwd_owned, rel });
                     defer allocator.free(abs);
-                    var f = io_core.openFileAbsolute(abs, .{}) catch {
+                    var f = libs_io.openFileAbsolute(abs, .{}) catch {
                         try printStderr("shu lint: {s}: open failed\n", .{rel});
                         has_error = true;
                         continue;
@@ -269,9 +273,9 @@ fn hasEslintFlatConfig(cwd: []const u8) bool {
 /// 检测 package.json 是否包含 "eslintConfig"（ESLint 旧版配置）。
 /// 若有且无扁平配置，需设 ESLINT_USE_FLAT_CONFIG=false 让 ESLint 读取。
 fn hasPackageJsonEslintConfig(allocator: std.mem.Allocator, cwd: []const u8) bool {
-    const path = io_core.pathJoin(allocator, &.{ cwd, "package.json" }) catch return false;
+    const path = libs_io.pathJoin(allocator, &.{ cwd, "package.json" }) catch return false;
     defer allocator.free(path);
-    var f = io_core.openFileAbsolute(path, .{}) catch return false;
+    var f = libs_io.openFileAbsolute(path, .{}) catch return false;
     defer f.close();
     const raw = f.readToEndAlloc(allocator, std.math.maxInt(usize)) catch return false;
     defer allocator.free(raw);
@@ -301,8 +305,8 @@ fn shellQuotePath(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
 /// 调用方负责 free 返回的切片。
 fn resolveLocalEslintBin(allocator: std.mem.Allocator, cwd: []const u8) ?[]const u8 {
     const bin_name = if (builtin.os.tag == .windows) "eslint.cmd" else "eslint";
-    const path = io_core.pathJoin(allocator, &.{ cwd, "node_modules", ".bin", bin_name }) catch return null;
-    var f = io_core.openFileAbsolute(path, .{}) catch {
+    const path = libs_io.pathJoin(allocator, &.{ cwd, "node_modules", ".bin", bin_name }) catch return null;
+    var f = libs_io.openFileAbsolute(path, .{}) catch {
         allocator.free(path);
         return null;
     };
@@ -334,7 +338,7 @@ fn runEslint(allocator: std.mem.Allocator, cwd: []const u8, files: []const []con
             child.spawn() catch return false;
             const term = child.wait() catch return false;
             return switch (term) {
-                .Exited => |code| code == 0,
+                .exited => |code| code == 0,
                 else => false,
             };
         }
@@ -363,7 +367,7 @@ fn runEslint(allocator: std.mem.Allocator, cwd: []const u8, files: []const []con
         child.spawn() catch return false;
         const term = child.wait() catch return false;
         return switch (term) {
-            .Exited => |code| code == 0,
+            .exited => |code| code == 0,
             else => false,
         };
     }
@@ -384,7 +388,7 @@ fn runEslint(allocator: std.mem.Allocator, cwd: []const u8, files: []const []con
         child.spawn() catch return false;
         const term = child.wait() catch return false;
         return switch (term) {
-            .Exited => |code| code == 0,
+            .exited => |code| code == 0,
             else => false,
         };
     }
@@ -404,7 +408,7 @@ fn runEslint(allocator: std.mem.Allocator, cwd: []const u8, files: []const []con
     child.spawn() catch return false;
     const term = child.wait() catch return false;
     return switch (term) {
-        .Exited => |code| code == 0,
+        .exited => |code| code == 0,
         else => false,
     };
 }
@@ -431,12 +435,14 @@ fn runMarkdownLint(allocator: std.mem.Allocator, cwd: []const u8, files: []const
     };
     const term = child.wait() catch return false;
     return switch (term) {
-        .Exited => |code| code == 0,
+        .exited => |code| code == 0,
         else => false,
     };
 }
 
 fn runScriptInCwd(allocator: std.mem.Allocator, cwd: []const u8, cmd: []const u8) !void {
+    const io = libs_process.getProcessIo() orelse return error.NoProcessIo;
+    _ = allocator;
     var argv_buf: [3][]const u8 = undefined;
     if (builtin.os.tag == .windows) {
         argv_buf[0] = "cmd.exe";
@@ -447,30 +453,34 @@ fn runScriptInCwd(allocator: std.mem.Allocator, cwd: []const u8, cmd: []const u8
         argv_buf[1] = "-c";
         argv_buf[2] = cmd;
     }
-    var child = std.process.Child.init(&argv_buf, allocator);
-    child.cwd = cwd;
-    child.stdin_behavior = .Inherit;
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-    try child.spawn();
-    const term = try child.wait();
+    const argv = argv_buf[0..3];
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .cwd = .{ .path = cwd },
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    const term = try child.wait(io);
     switch (term) {
-        .Exited => |code| if (code != 0) return error.ScriptExitedNonZero,
-        .Signal, .Stopped => return error.ScriptSignalled,
-        .Unknown => return error.ScriptExitedNonZero,
+        .exited => |code| if (code != 0) return error.ScriptExitedNonZero,
+        .signal, .stopped => return error.ScriptSignalled,
+        .unknown => return error.ScriptExitedNonZero,
     }
 }
 
 fn printToStdout(comptime fmt_str: []const u8, fargs: anytype) !void {
+    const io_out = libs_process.getProcessIo() orelse return error.NoProcessIo;
     var buf: [64]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf);
+    var w = std.Io.File.Writer.init(std.Io.File.stdout(), io_out, &buf);
     try w.interface.print(fmt_str, fargs);
     try w.interface.flush();
 }
 
 fn printStderr(comptime fmt_str: []const u8, fargs: anytype) !void {
+    const io = libs_process.getProcessIo() orelse return error.NoProcessIo;
     var buf: [256]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
+    var w = std.Io.File.Writer.init(std.Io.File.stderr(), io, &buf);
     try w.interface.print(fmt_str, fargs);
     try w.interface.flush();
 }
