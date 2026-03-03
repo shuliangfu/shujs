@@ -758,9 +758,7 @@ fn performanceGetEntriesByNameCallback(
         const tn = jsc.JSStringGetUTF8CString(type_str, &type_buf, type_buf.len);
         if (tn > 0) {
             const ts = type_buf[0 .. tn - 1];
-            if (std.mem.eql(u8, ts, "mark")) filter_type = .mark
-            else if (std.mem.eql(u8, ts, "measure")) filter_type = .measure
-            else if (std.mem.eql(u8, ts, "function")) filter_type = .function;
+            if (std.mem.eql(u8, ts, "mark")) filter_type = .mark else if (std.mem.eql(u8, ts, "measure")) filter_type = .measure else if (std.mem.eql(u8, ts, "function")) filter_type = .function;
         }
     }
     var empty_arr2: [0]jsc.JSValueRef = .{};
@@ -801,9 +799,7 @@ fn performanceGetEntriesByTypeCallback(
     var list = std.ArrayList(PerfEntry).initCapacity(g_perf_alloc, 0) catch return jsc.JSObjectMakeArray(ctx, 0, &empty_arr, null);
     defer list.deinit(g_perf_alloc);
     for (g_entries.items) |e| {
-        if (e.entry_type == .mark and want_mark) list.append(g_perf_alloc, e) catch {}
-        else if (e.entry_type == .measure and want_measure) list.append(g_perf_alloc, e) catch {}
-        else if (e.entry_type == .function and want_function) list.append(g_perf_alloc, e) catch {};
+        if (e.entry_type == .mark and want_mark) list.append(g_perf_alloc, e) catch {} else if (e.entry_type == .measure and want_measure) list.append(g_perf_alloc, e) catch {} else if (e.entry_type == .function and want_function) list.append(g_perf_alloc, e) catch {};
     }
     const list_refs = g_perf_alloc.alloc(jsc.JSValueRef, list.items.len) catch return jsc.JSObjectMakeArray(ctx, 0, &empty_arr, null);
     defer g_perf_alloc.free(list_refs);

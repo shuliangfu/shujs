@@ -1040,7 +1040,7 @@ fn socketEndCallback(
     _: [*]jsc.JSValueRef,
 ) callconv(.c) jsc.JSValueRef {
     if (argumentCount >= 1 and !jsc.JSValueIsUndefined(ctx, arguments[0])) {
-        var args = [_]jsc.JSValueRef{ arguments[0] };
+        var args = [_]jsc.JSValueRef{arguments[0]};
         var exc: ?jsc.JSValueRef = null;
         _ = socketWriteCallback(ctx, this, this, 1, &args, @ptrCast(&exc));
     }

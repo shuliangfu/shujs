@@ -68,7 +68,9 @@ pub const TlsClientContext = if (build_options.have_tls) struct {
 /// 当 have_tls 时的非阻塞握手中句柄：fd 须已 non-blocking，由 tlsAcceptStart 创建，step 推进或 free 释放
 pub const TlsPending = if (build_options.have_tls) struct {
     ptr: *opaque {},
-    const c = @cImport({ @cInclude("tls.h"); });
+    const c = @cImport({
+        @cInclude("tls.h");
+    });
 
     /// 开始非阻塞握手；调用方须已对 fd 调用 setNonBlocking。失败返回 null（调用方需 close(fd)）
     pub fn start(ctx: *const TlsContext, fd: std.posix.socket_t) ?@This() {

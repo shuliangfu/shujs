@@ -708,7 +708,7 @@ fn pathFilePathToUrlCallback(
     const allocator = globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
     const path = getPathArg(allocator, ctx, arguments, argumentCount, 0) orelse return jsc.JSValueMakeUndefined(ctx);
     defer allocator.free(path);
-    const resolved = std.fs.path.resolve(allocator, &.{opts.cwd, path}) catch return jsc.JSValueMakeUndefined(ctx);
+    const resolved = std.fs.path.resolve(allocator, &.{ opts.cwd, path }) catch return jsc.JSValueMakeUndefined(ctx);
     defer allocator.free(resolved);
     var path_for_url = resolved;
     if (is_windows) {
