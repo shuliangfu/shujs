@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "node",
+    "target": "ES2022",
+    "checkJs": false,
+    "baseUrl": ".",
+    "paths": {}
+  },
+  "include": ["**/*.js", "**/*.mjs", "**/*.cjs", "eslint.config.js"],
+  "exclude": ["node_modules", "zig-out", "deps"]
+}
