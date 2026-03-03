@@ -199,77 +199,6 @@ pub fn get(allocator: std.mem.Allocator, url: []const u8, options: GetOptions) !
     return resp.body;
 }
 
-/// Zig 路径下从已读到的 head 缓冲区解析出的最小信息，仅用于 br 分支。reason 为指向原 bytes 的切片，调用方若需保留须 dupe。
-const ZigPathBrHeadInfo = struct {
-    status: u16,
-    reason: []const u8,
-    content_length: ?u64,
-    transfer_encoding: std.http.TransferEncoding,
-    content_encoding_br: bool,
-};
-
-/// 从 head 缓冲区解析出 status、reason、content_length、transfer_encoding、是否为 br。仅用于 Head.parse 返回 HttpContentEncodingUnsupported 时判定并处理 br。
-fn parseHeadMinimalForBr(bytes: []const u8) ZigPathBrHeadInfo {
-    var result: ZigPathBrHeadInfo = .{
-        .status = 0,
-        .reason = bytes.ptr[0..0],
-        .content_length = null,
-        .transfer_encoding = .none,
-        .content_encoding_br = false,
-    };
-    var it = std.mem.splitSequence(u8, bytes, "\r\n");
-    const first_line = it.first();
-    if (first_line.len < 12) return result;
-    result.status = std.fmt.parseInt(u16, first_line[9..12], 10) catch return result;
-    result.reason = std.mem.trimLeft(u8, first_line[12..], " ");
-    while (it.next()) |line| {
-        if (line.len == 0) break;
-        var line_it = std.mem.splitScalar(u8, line, ':');
-        const name = line_it.next() orelse continue;
-        const value = std.mem.trim(u8, line_it.rest(), " \t");
-        if (std.ascii.eqlIgnoreCase(name, "content-length")) {
-            result.content_length = std.fmt.parseInt(u64, value, 10) catch null;
-        } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
-            const trimmed = std.mem.trim(u8, value, " ");
-            if (std.ascii.eqlIgnoreCase(trimmed, "chunked")) result.transfer_encoding = .chunked;
-        } else if (std.ascii.eqlIgnoreCase(name, "content-encoding")) {
-            const enc = std.mem.trim(u8, value, " \t");
-            result.content_encoding_br = std.ascii.eqlIgnoreCase(enc, "br");
-        }
-    }
-    return result;
-}
-
-/// Zig 路径下当 Head.parse 因 Content-Encoding: br 失败时，读取原始 body 并用 shu_zlib.decompressBrotli 解压后返回 Response。调用方负责 free 返回的 body 与 status_text。
-fn handleZigPathBrResponse(
-    allocator: std.mem.Allocator,
-    req: *std.http.Client.Request,
-    br_info: ZigPathBrHeadInfo,
-    url: []const u8,
-    options: RequestOptions,
-) !Response {
-    var transfer_buf: [64 * 1024]u8 = undefined;
-    const raw_reader = req.reader.bodyReader(&transfer_buf, br_info.transfer_encoding, br_info.content_length);
-    const raw_body = file.readReaderUpTo(allocator, raw_reader, options.max_response_bytes) catch |e| {
-        if (e == error.ResponseTooLarge) debugLogResponseTooLarge(url, options.max_response_bytes);
-        debugLogReadFailed(url, e, "read");
-        return e;
-    };
-    defer allocator.free(raw_body);
-    const body = try shu_zlib.decompressBrotli(allocator, raw_body);
-    errdefer allocator.free(body);
-    const status_text = try allocator.dupe(u8, br_info.reason);
-    errdefer allocator.free(status_text);
-    if (std.posix.getenv("SHU_DEBUG_HTTP")) |_| {
-        debugLogDecompress("br", raw_body.len, body.len);
-    }
-    return .{
-        .status = br_info.status,
-        .status_text = status_text,
-        .body = body,
-    };
-}
-
 /// 当 SHU_DEBUG_HTTP 非空且 raw_body 为空时，向 stderr 打印 url、status、content_encoding、content_length，便于区分「服务端返回空」与「Zig 路径未读到 body」。
 fn debugLogEmptyRawBody(url: []const u8, status: u16, content_encoding: std.http.ContentEncoding, content_length: ?u64) void {
     const env = std.posix.getenv("SHU_DEBUG_HTTP") orelse return;
@@ -489,6 +418,7 @@ fn requestViaZigWithClient(client: *std.http.Client, allocator: std.mem.Allocato
         extra_list[n_extra] = .{ .name = h.name, .value = h.value };
         n_extra += 1;
     }
+    // Zig 路径仅支持 gzip/deflate，不支持 br；Accept-Encoding 固定为 gzip, deflate，服务端若回 br 则 receiveHead 返回 HttpContentEncodingUnsupported，转为 ReadFailed 走 libcurl。
     const enc = options.accept_encoding orelse "gzip, deflate";
     var req = client.request(method, uri, .{
         .redirect_behavior = std.http.Client.Request.RedirectBehavior.init(5),
@@ -515,26 +445,18 @@ fn requestViaZigWithClient(client: *std.http.Client, allocator: std.mem.Allocato
         try req.sendBodiless();
     }
 
-    // 先自行读取 head 缓冲区，再 parse；若标准库因 Content-Encoding: br 返回 HttpContentEncodingUnsupported，则自解析并走 br 解压（shu_zlib），否则与原先一致。
-    const Head = std.http.Client.Response.Head;
-    var head_buf = req.reader.receiveHead() catch |e| return e;
-    var head = Head.parse(head_buf) catch |e| {
-        if (e != error.HttpContentEncodingUnsupported) return e;
-        const br_info = parseHeadMinimalForBr(head_buf);
-        if (!br_info.content_encoding_br) return e;
-        return handleZigPathBrResponse(allocator, &req, br_info, url, options);
+    // 使用标准库 req.receiveHead() 保证 Request 内部状态（response_transfer_encoding/response_content_length）正确，body 才能被正确读取。不支持 br：服务端若回 Content-Encoding: br 则转为 ReadFailed 走 libcurl。
+    var redirect_buf: [8 * 1024]u8 = undefined;
+    var response = req.receiveHead(&redirect_buf) catch |e| {
+        if (e == error.HttpContentEncodingUnsupported) return error.ReadFailed;
+        return e;
     };
-    // 100-continue：继续读下一个 head
-    while (head.status == .@"continue") {
-        head_buf = req.reader.receiveHead() catch |e| return e;
-        head = Head.parse(head_buf) catch |e| {
-            if (e != error.HttpContentEncodingUnsupported) return e;
-            const br_info = parseHeadMinimalForBr(head_buf);
-            if (!br_info.content_encoding_br) return e;
-            return handleZigPathBrResponse(allocator, &req, br_info, url, options);
+    while (response.head.status == .@"continue") {
+        response = req.receiveHead(&redirect_buf) catch |e| {
+            if (e == error.HttpContentEncodingUnsupported) return error.ReadFailed;
+            return e;
         };
     }
-    var response: std.http.Client.Response = .{ .request = &req, .head = head };
     const status: u16 = @intFromEnum(response.head.status);
     const phrase = response.head.status.phrase();
     // 始终用 allocator 分配，便于 errdefer 统一释放；dupe 失败时退化为 "Unknown" 再 dupe，仍失败则返回 OOM
@@ -555,11 +477,14 @@ fn requestViaZigWithClient(client: *std.http.Client, allocator: std.mem.Allocato
     // 先取 content_encoding / content_length，再调 reader()（reader 会 invalidate response.head 的字符串）
     const content_encoding = response.head.content_encoding;
     const content_length = response.head.content_length;
-    // 大缓冲（64KB）减少读次数，避免大 body（如 registry 元数据数 MB）时因小缓冲导致读取过慢、连接被服务端或中间层关闭而 body_truncated
+    // 使用 allocRemaining 读 body，与 Zig Cookbook / fetch 一致；readReaderUpTo 在首读返回 0 时误当 EOF 会得到空 body（连接复用下常见），allocRemaining 会读到 EndOfStream 或 limit。
     var transfer_buf: [64 * 1024]u8 = undefined;
     const raw_reader = response.reader(&transfer_buf);
-    const raw_body = file.readReaderUpTo(allocator, raw_reader, options.max_response_bytes) catch |e| {
-        if (e == error.ResponseTooLarge) debugLogResponseTooLarge(url, options.max_response_bytes);
+    const raw_body = raw_reader.allocRemaining(allocator, std.io.Limit.limited(options.max_response_bytes)) catch |e| {
+        if (e == error.StreamTooLong) {
+            debugLogResponseTooLarge(url, options.max_response_bytes);
+            return error.ResponseTooLarge;
+        }
         debugLogReadFailed(url, e, "read");
         return e;
     };
@@ -588,7 +513,7 @@ fn requestViaZigWithClient(client: *std.http.Client, allocator: std.mem.Allocato
         }
     }
 
-    // Zig 路径自动解压：gzip/deflate 用 std.compress.flate；br 在 Head.parse 失败时由上方分支自行解析并 handleZigPathBrResponse + shu_zlib.decompressBrotli 解压，与 libcurl 路径一致支持 br/gzip/deflate。
+    // Zig 路径仅解压 gzip/deflate（std.compress.flate）；br 由 receiveHead 返回 HttpContentEncodingUnsupported 已转为 ReadFailed 走 libcurl。
     const body = switch (content_encoding) {
         .identity => try allocator.dupe(u8, raw_body),
         .gzip, .deflate => blk: {

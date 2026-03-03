@@ -442,7 +442,7 @@ pub fn resolveVersionTarballAndDeps(
     version_spec: []const u8,
     client: ?*std.http.Client,
 ) !TarballAndDepsResult {
-    _ = client; // npm 元数据已统一走 registryGet（libcurl），保留参数以兼容调用方
+    // 有 client 时走 Zig 路径（registryGetWithClient），无则走 libcurl（registryGet）。用于验证 Zig Client 请求是否可用。
     // 优先读元数据缓存，避免重复请求 registry
     const cache_root = cache.getCacheRoot(allocator) catch null;
     var registry_host: ?[]const u8 = null;
@@ -466,10 +466,16 @@ pub fn resolveVersionTarballAndDeps(
             defer allocator.free(cached);
             const url = buildRegistryUrl(allocator, cached, name) catch break :try_cached;
             defer allocator.free(url);
-            const body = registryGet(allocator, url, getRegistryMetaMaxBytes(), REGISTRY_GET_FALLBACK_TIMEOUT_SEC) catch {
-                clearCachedRegistry(allocator);
-                break :try_cached;
-            };
+            const body = if (client) |c|
+                registryGetWithClient(c, allocator, url, getRegistryMetaMaxBytes()) catch {
+                    clearCachedRegistry(allocator);
+                    break :try_cached;
+                }
+            else
+                registryGet(allocator, url, getRegistryMetaMaxBytes(), REGISTRY_GET_FALLBACK_TIMEOUT_SEC) catch {
+                    clearCachedRegistry(allocator);
+                    break :try_cached;
+                };
             defer allocator.free(body);
             const body_trimmed = std.mem.trim(u8, body, " \t\r\n");
             if (body_trimmed.len == 0 or body_trimmed[0] != '{') break :try_cached;
@@ -491,7 +497,10 @@ pub fn resolveVersionTarballAndDeps(
     }
     const url = try buildRegistryUrl(allocator, registry_base, name);
     defer allocator.free(url);
-    const body = registryGet(allocator, url, getRegistryMetaMaxBytes(), REGISTRY_GET_FALLBACK_TIMEOUT_SEC) catch |e| return e;
+    const body = if (client) |c|
+        registryGetWithClient(c, allocator, url, getRegistryMetaMaxBytes()) catch |e| return e
+    else
+        registryGet(allocator, url, getRegistryMetaMaxBytes(), REGISTRY_GET_FALLBACK_TIMEOUT_SEC) catch |e| return e;
     defer allocator.free(body);
     const body_trimmed = std.mem.trim(u8, body, " \t\r\n");
     if (body_trimmed.len == 0) {
