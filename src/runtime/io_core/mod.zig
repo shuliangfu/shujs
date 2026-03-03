@@ -21,6 +21,11 @@
 
 const builtin = @import("builtin");
 
+// Zig 0.16：进程级 Io，main 启动时 setProcessIo(init.io)，供 file.zig 等使用
+const process_io = @import("process_io.zig");
+pub const setProcessIo = process_io.setProcessIo;
+pub const getProcessIo = process_io.getProcessIo;
+
 // 公共类型与错误，三端共用
 pub const api = @import("api.zig");
 pub const Completion = api.Completion;
