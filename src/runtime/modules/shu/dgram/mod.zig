@@ -4,12 +4,93 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const jsc = @import("jsc");
-const io_core = @import("io_core");
+const libs_io = @import("libs_io");
 const common = @import("../../../common.zig");
 const globals = @import("../../../globals.zig");
 
 /// 是否 Windows（comptime 分派，用于非阻塞/socket 选项等分支）
 const is_windows = builtin.os.tag == .windows;
+
+/// Zig 0.16 无 std.net，用 posix.sockaddr 存储 + 本文件内辅助。sockaddr_storage 通常 128 字节。
+const DGRAM_ADDR_STORAGE_LEN = 128;
+const DgramAddr = struct {
+    storage: [DGRAM_ADDR_STORAGE_LEN]u8 align(8),
+
+    fn ptr(self: *DgramAddr) *std.posix.sockaddr {
+        return @ptrCast(self);
+    }
+    fn len(self: *const DgramAddr) std.posix.socklen_t {
+        const sa = @as(*const std.posix.sockaddr, @ptrCast(self));
+        if (sa.family == std.posix.AF.INET) return @sizeOf(std.posix.sockaddr.in);
+        return @sizeOf(std.posix.sockaddr.in6);
+    }
+    fn getPort(self: *const DgramAddr) u16 {
+        const sa = @as(*const std.posix.sockaddr, @ptrCast(self));
+        if (sa.family == std.posix.AF.INET) {
+            const in4 = @as(*const std.posix.sockaddr.in, @ptrCast(self));
+            return @byteSwap(in4.port);
+        }
+        const in6 = @as(*const std.posix.sockaddr.in6, @ptrCast(self));
+        return @byteSwap(in6.port);
+    }
+    fn family(self: *const DgramAddr) u16 {
+        return @as(*const std.posix.sockaddr, @ptrCast(self)).family;
+    }
+    /// 格式化为 "ip:port" 字符串；调用方 free 返回的 slice。
+    fn formatAddress(self: *const DgramAddr, allocator: std.mem.Allocator) ![]const u8 {
+        const sa = @as(*const std.posix.sockaddr, @ptrCast(self));
+        const port = self.getPort();
+        if (sa.family == std.posix.AF.INET) {
+            const in4 = @as(*const std.posix.sockaddr.in, @ptrCast(self));
+            const addr_bytes = std.mem.asBytes(&in4.addr);
+            return std.fmt.allocPrint(allocator, "{d}.{d}.{d}.{d}:{d}", .{ addr_bytes[0], addr_bytes[1], addr_bytes[2], addr_bytes[3], port });
+        }
+        const in6 = @as(*const std.posix.sockaddr.in6, @ptrCast(self));
+        var buf: [64]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        w.print("[", .{}) catch return std.fmt.allocPrint(allocator, "[::]:{d}", .{port});
+        for (0..8) |i| {
+            const a = in6.addr[i * 2];
+            const b = in6.addr[i * 2 + 1];
+            if (i > 0) w.print(":", .{}) catch {};
+            w.print("{x:0>2}{x:0>2}", .{ a, b }) catch return std.fmt.allocPrint(allocator, "[::]:{d}", .{port});
+        }
+        w.print("]:{d}", .{port}) catch return std.fmt.allocPrint(allocator, "[::]:{d}", .{port});
+        return allocator.dupe(u8, std.Io.Writer.buffered(&w));
+    }
+    fn initIp4(bytes: [4]u8, port: u16) DgramAddr {
+        var addr: DgramAddr = undefined;
+        @memset(&addr.storage, 0);
+        const in4 = @as(*std.posix.sockaddr.in, @ptrCast(&addr));
+        in4.family = std.posix.AF.INET;
+        in4.port = @byteSwap(port);
+        in4.addr = std.mem.readInt(u32, &bytes, .big);
+        return addr;
+    }
+    fn initIp6(bytes: [16]u8, port: u16, flow: u32, scope: u32) DgramAddr {
+        var addr: DgramAddr = undefined;
+        @memset(&addr.storage, 0);
+        const in6 = @as(*std.posix.sockaddr.in6, @ptrCast(&addr));
+        in6.family = std.posix.AF.INET6;
+        in6.port = @byteSwap(port);
+        in6.flowinfo = flow;
+        @memcpy(&in6.addr, &bytes);
+        in6.scope_id = scope;
+        return addr;
+    }
+    /// 用 std.Io.net.IpAddress.resolve(io, host, port) 解析后写入 storage。
+    fn resolve(addr: *DgramAddr, io: std.Io, host: []const u8, port: u16) !void {
+        const ip = try std.Io.net.IpAddress.resolve(io, host, port);
+        switch (ip) {
+            .ip4 => |a| {
+                addr.* = initIp4(a.bytes, port);
+            },
+            .ip6 => |a| {
+                addr.* = initIp6(a.bytes, port, a.flow, a.interface.index);
+            },
+        }
+    }
+};
 
 /// 接收池槽位数；扩大可减少池满时走 makeMessageBufferCopy 拷贝路径（§3.1）
 const DGRAM_RECV_POOL_SIZE = 64;
@@ -19,7 +100,7 @@ const DGRAM_RECV_BUF_SIZE = 2048;
 const DgramSlotContext = struct {
     allocator: std.mem.Allocator,
     slot: usize,
-    free_list: *io_core.RingBuffer(usize),
+    free_list: *libs_io.RingBuffer(usize),
 };
 fn dgramSlotDeallocator(bytes: *anyopaque, deallocator_context: ?*anyopaque) callconv(.c) void {
     _ = bytes;
@@ -40,9 +121,9 @@ fn dgramCopyDeallocator(bytes: *anyopaque, deallocator_context: ?*anyopaque) cal
 /// recv 缓冲池：free_list 可用槽位，pending 待交付槽位，meta 存每槽 len+addr+socket_id
 const DgramRecvPool = struct {
     buffers: [DGRAM_RECV_POOL_SIZE][]u8,
-    free_list: io_core.RingBuffer(usize),
-    pending: io_core.RingBuffer(usize),
-    meta: [DGRAM_RECV_POOL_SIZE]struct { len: usize, addr: std.net.Address, socket_id: u32 },
+    free_list: libs_io.RingBuffer(usize),
+    pending: libs_io.RingBuffer(usize),
+    meta: [DGRAM_RECV_POOL_SIZE]struct { len: usize, addr: DgramAddr, socket_id: u32 },
     allocator: std.mem.Allocator,
 };
 var g_dgram_recv_pool: ?DgramRecvPool = null;
@@ -71,12 +152,12 @@ fn ensureDgramRecvPool() void {
     while (i < DGRAM_RECV_POOL_SIZE) : (i += 1) {
         buffers[i] = allocator.alloc(u8, DGRAM_RECV_BUF_SIZE) catch return;
     }
-    var free_list = io_core.RingBuffer(usize).init(allocator, DGRAM_RECV_POOL_SIZE) catch {
+    var free_list = libs_io.RingBuffer(usize).init(allocator, DGRAM_RECV_POOL_SIZE) catch {
         i = 0;
         while (i < DGRAM_RECV_POOL_SIZE) : (i += 1) allocator.free(buffers[i]);
         return;
     };
-    const pending = io_core.RingBuffer(usize).init(allocator, DGRAM_RECV_POOL_SIZE) catch {
+    const pending = libs_io.RingBuffer(usize).init(allocator, DGRAM_RECV_POOL_SIZE) catch {
         free_list.deinit(allocator);
         i = 0;
         while (i < DGRAM_RECV_POOL_SIZE) : (i += 1) allocator.free(buffers[i]);
@@ -130,11 +211,11 @@ fn makeMessageBufferCopy(ctx: jsc.JSContextRef, slice: []const u8) jsc.JSValueRe
     return if (arr != null) @ptrCast(arr.?) else jsc.JSValueMakeUndefined(ctx);
 }
 
-/// 将 fd 设为非阻塞，便于 tick 内 recvfrom 不阻塞
+/// 将 fd 设为非阻塞，便于 tick 内 recvfrom 不阻塞。Zig 0.16：std.c.fcntl 返回 c_int，不返回错误联合。
 fn setNonBlocking(fd: std.posix.socket_t) void {
     if (is_windows) return;
-    const flags = std.posix.fcntl(fd, std.posix.F.GETFL, 0) catch return;
-    _ = std.posix.fcntl(fd, std.posix.F.SETFL, flags | 0x4) catch {};
+    const flags = std.c.fcntl(fd, std.posix.F.GETFL, @as(c_int, 0));
+    if (flags >= 0) _ = std.c.fcntl(fd, std.posix.F.SETFL, @as(c_int, @intCast(flags | 0x4)));
 }
 
 /// 调度下一轮 dgramTick（setImmediate），用于接收 UDP 并触发 message
@@ -184,16 +265,15 @@ fn dgramTickCallback(
 
         if (g_dgram_recv_pool) |*p| {
             while (p.free_list.pop()) |slot| {
-                var src_addr: std.net.Address = undefined;
-                var addr_len: std.posix.socklen_t = @sizeOf(std.net.Address);
-                const n = std.posix.recvfrom(entry.fd, p.buffers[slot], 0, @ptrCast(&src_addr.any), &addr_len) catch |e| {
-                    if (e == error.WouldBlock) {
-                        _ = p.free_list.push(slot);
-                        break;
-                    }
+                var src_addr: DgramAddr = undefined;
+                var addr_len: std.posix.socklen_t = DGRAM_ADDR_STORAGE_LEN;
+                const n_raw = std.c.recvfrom(entry.fd, p.buffers[slot].ptr, p.buffers[slot].len, 0, src_addr.ptr(), &addr_len);
+                if (n_raw < 0) {
                     _ = p.free_list.push(slot);
+                    if (std.c.errno(n_raw) == std.posix.E.AGAIN) break;
                     break;
-                };
+                }
+                const n = @as(usize, @intCast(n_raw));
                 if (n == 0) {
                     _ = p.free_list.push(slot);
                     break;
@@ -204,12 +284,14 @@ fn dgramTickCallback(
         } else {
             var recv_buf: [DGRAM_RECV_BUF_SIZE]u8 = undefined;
             while (true) {
-                var src_addr: std.net.Address = undefined;
-                var addr_len: std.posix.socklen_t = @sizeOf(std.net.Address);
-                const n = std.posix.recvfrom(entry.fd, &recv_buf, 0, @ptrCast(&src_addr.any), &addr_len) catch |e| {
-                    if (e == error.WouldBlock) break;
+                var src_addr: DgramAddr = undefined;
+                var addr_len: std.posix.socklen_t = DGRAM_ADDR_STORAGE_LEN;
+                const n_raw = std.c.recvfrom(entry.fd, &recv_buf, recv_buf.len, 0, src_addr.ptr(), &addr_len);
+                if (n_raw < 0) {
+                    if (std.c.errno(n_raw) == std.posix.E.AGAIN) break;
                     break;
-                };
+                }
+                const n = @as(usize, @intCast(n_raw));
                 if (n == 0) break;
                 const msg_val = makeMessageBufferCopy(entry.ctx, recv_buf[0..n]);
                 const rinfo = makeRinfoObject(entry.ctx, &src_addr);
@@ -333,10 +415,10 @@ fn makeBufferFromSlice(ctx: jsc.JSContextRef, slice: []const u8) jsc.JSValueRef 
     return jsc.JSValueMakeString(ctx, js_str);
 }
 
-fn makeRinfoObject(ctx: jsc.JSContextRef, addr: *const std.net.Address) jsc.JSValueRef {
+fn makeRinfoObject(ctx: jsc.JSContextRef, addr: *const DgramAddr) jsc.JSValueRef {
     const obj = jsc.JSObjectMake(ctx, null, null);
     const allocator = globals.current_allocator orelse return obj;
-    const addr_str = std.fmt.allocPrint(allocator, "{any}", .{addr.*}) catch return obj;
+    const addr_str = addr.*.formatAddress(allocator) catch return obj;
     defer allocator.free(addr_str);
     const k_addr = jsc.JSStringCreateWithUTF8CString("address");
     defer jsc.JSStringRelease(k_addr);
@@ -350,7 +432,7 @@ fn makeRinfoObject(ctx: jsc.JSContextRef, addr: *const std.net.Address) jsc.JSVa
     defer jsc.JSStringRelease(addr_js);
     _ = jsc.JSObjectSetProperty(ctx, obj, k_addr, jsc.JSValueMakeString(ctx, addr_js), jsc.kJSPropertyAttributeNone, null);
     _ = jsc.JSObjectSetProperty(ctx, obj, k_port, jsc.JSValueMakeNumber(ctx, @floatFromInt(addr.getPort())), jsc.kJSPropertyAttributeNone, null);
-    const family_str = if (addr.any.family == std.posix.AF.INET) "IPv4" else "IPv6";
+    const family_str = if (addr.family() == std.posix.AF.INET) "IPv4" else "IPv6";
     const fam_js = jsc.JSStringCreateWithUTF8CString(family_str);
     defer jsc.JSStringRelease(fam_js);
     _ = jsc.JSObjectSetProperty(ctx, obj, k_family, jsc.JSValueMakeString(ctx, fam_js), jsc.kJSPropertyAttributeNone, null);
@@ -381,9 +463,10 @@ fn createSocketCallback(
     const n = jsc.JSStringGetUTF8CString(type_str, buf[0..].ptr, buf.len);
     const is_udp6 = (n > 0 and std.mem.indexOf(u8, buf[0..], "udp6") != null);
     const family: u32 = if (is_udp6) @intCast(std.posix.AF.INET6) else @intCast(std.posix.AF.INET);
-    const fd = std.posix.socket(family, std.posix.SOCK.DGRAM, 0) catch return jsc.JSValueMakeUndefined(ctx);
+    const fd = std.c.socket(@intCast(family), std.posix.SOCK.DGRAM, 0);
+    if (fd == -1) return jsc.JSValueMakeUndefined(ctx);
     const allocator = globals.current_allocator orelse {
-        std.posix.close(fd);
+        _ = std.c.close(fd);
         return jsc.JSValueMakeUndefined(ctx);
     };
     if (g_dgram_sockets == null) g_dgram_sockets = std.AutoHashMap(u32, DgramEntry).init(allocator);
@@ -392,7 +475,7 @@ fn createSocketCallback(
     g_dgram_next_id +%= 1;
     setNonBlocking(fd);
     g_dgram_sockets.?.put(id, .{ .fd = fd, .family = family, .bound = false, .ctx = ctx, .ref_count = 1, .broadcast = false, .multicast_ttl = 1 }) catch {
-        std.posix.close(fd);
+        _ = std.c.close(fd);
         return jsc.JSValueMakeUndefined(ctx);
     };
     const socket = makeDgramSocketObject(ctx, id);
@@ -433,9 +516,9 @@ fn dgramAddressCallback(
     const id = getDgramIdFromThis(ctx, this) orelse return jsc.JSValueMakeUndefined(ctx);
     const sockets = g_dgram_sockets orelse return jsc.JSValueMakeUndefined(ctx);
     const entry = sockets.get(id) orelse return jsc.JSValueMakeUndefined(ctx);
-    var addr: std.net.Address = undefined;
-    var len: std.posix.socklen_t = @sizeOf(std.net.Address);
-    std.posix.getsockname(entry.fd, @ptrCast(&addr.any), &len) catch return jsc.JSValueMakeUndefined(ctx);
+    var addr: DgramAddr = undefined;
+    var len: std.posix.socklen_t = DGRAM_ADDR_STORAGE_LEN;
+    if (std.c.getsockname(entry.fd, addr.ptr(), &len) != 0) return jsc.JSValueMakeUndefined(ctx);
     return makeRinfoObject(ctx, &addr);
 }
 
@@ -464,12 +547,10 @@ fn dgramBindCallback(
     const port_n = jsc.JSValueToNumber(ctx, arguments[0], null);
     if (port_n != port_n or port_n < 0 or port_n > 65535) return jsc.JSValueMakeUndefined(ctx);
     const port = @as(u16, @intFromFloat(port_n));
-    var addr: std.net.Address = undefined;
-    if (entry.family == @as(u32, @intCast(std.posix.AF.INET6))) {
-        addr = std.net.Address.initIp6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, port, 0, 0);
-    } else {
-        addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, port);
-    }
+    var addr: DgramAddr = if (entry.family == @as(u32, @intCast(std.posix.AF.INET6)))
+        DgramAddr.initIp6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, port, 0, 0)
+    else
+        DgramAddr.initIp4(.{ 0, 0, 0, 0 }, port);
     if (argumentCount >= 2 and !jsc.JSValueIsUndefined(ctx, arguments[1])) {
         var host_buf: [256]u8 = undefined;
         const js_str = jsc.JSValueToStringCopy(ctx, arguments[1], null);
@@ -477,11 +558,11 @@ fn dgramBindCallback(
         const n = jsc.JSStringGetUTF8CString(js_str, host_buf[0..].ptr, host_buf.len);
         if (n > 0) {
             const host = host_buf[0 .. n - 1];
-            addr = std.net.Address.resolveIp(host, port) catch return jsc.JSValueMakeUndefined(ctx);
-            addr.setPort(port);
+            const io = libs_io.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
+            addr.resolve(io, host, port) catch return jsc.JSValueMakeUndefined(ctx);
         }
     }
-    std.posix.bind(entry.fd, &addr.any, addr.getOsSockLen()) catch return jsc.JSValueMakeUndefined(ctx);
+    if (std.c.bind(entry.fd, addr.ptr(), addr.len()) != 0) return jsc.JSValueMakeUndefined(ctx);
     entry.bound = true;
     scheduleDgramTick(ctx);
     if (argumentCount >= 3 and jsc.JSObjectIsFunction(ctx, @ptrCast(arguments[2]))) {
@@ -538,32 +619,32 @@ fn dgramSendCallback(
     const port_idx: usize = if (use_offset_length) 3 else 1;
     const address_idx: usize = if (use_offset_length) 4 else 2;
     const port: u16 = if (argumentCount > port_idx) @as(u16, @intFromFloat(jsc.JSValueToNumber(ctx, arguments[port_idx], null))) else 0;
-    var dest_addr: std.net.Address = if (entry.family == @as(u32, @intCast(std.posix.AF.INET6)))
-        std.net.Address.initIp6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, port, 0, 0)
+    var dest_addr: DgramAddr = if (entry.family == @as(u32, @intCast(std.posix.AF.INET6)))
+        DgramAddr.initIp6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, port, 0, 0)
     else
-        std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
+        DgramAddr.initIp4(.{ 127, 0, 0, 1 }, port);
     if (argumentCount > address_idx and !jsc.JSObjectIsFunction(ctx, @ptrCast(arguments[address_idx]))) {
         var host_buf: [256]u8 = undefined;
         const hs = jsc.JSValueToStringCopy(ctx, arguments[address_idx], null);
         defer jsc.JSStringRelease(hs);
         const hn = jsc.JSStringGetUTF8CString(hs, host_buf[0..].ptr, host_buf.len);
         if (hn > 0) {
-            dest_addr = std.net.Address.resolveIp(host_buf[0 .. hn - 1], port) catch return jsc.JSValueMakeUndefined(ctx);
-            dest_addr.setPort(port);
+            const io = libs_io.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
+            dest_addr.resolve(io, host_buf[0 .. hn - 1], port) catch return jsc.JSValueMakeUndefined(ctx);
         }
     }
-    const send_result = std.posix.sendto(entry.fd, data_slice[offset .. offset + length], 0, &dest_addr.any, dest_addr.getOsSockLen());
+    const send_result = std.c.sendto(entry.fd, data_slice[offset..].ptr, length, 0, dest_addr.ptr(), dest_addr.len());
     const cb_val = if (argumentCount >= 2 and jsc.JSObjectIsFunction(ctx, @ptrCast(arguments[argumentCount - 1]))) arguments[argumentCount - 1] else null;
     if (cb_val != null) {
-        if (send_result) |_| {
+        if (send_result >= 0) {
             const global = jsc.JSContextGetGlobalObject(ctx);
             const k_null = jsc.JSStringCreateWithUTF8CString("null");
             defer jsc.JSStringRelease(k_null);
             const null_val = jsc.JSObjectGetProperty(ctx, global, k_null, null);
             var args = [_]jsc.JSValueRef{ null_val, jsc.JSValueMakeNumber(ctx, @floatFromInt(length)) };
             _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(cb_val), this, 2, &args, null);
-        } else |err| {
-            const err_str = std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)}) catch "send failed";
+        } else {
+            const err_str = std.fmt.allocPrint(allocator, "send failed (errno {d})", .{std.c.errno(send_result)}) catch "send failed";
             defer allocator.free(err_str);
             const z = allocator.dupeZ(u8, err_str) catch "";
             defer if (z.len > 0) allocator.free(z);
@@ -592,7 +673,7 @@ fn dgramCloseCallback(
 ) callconv(.c) jsc.JSValueRef {
     const id = getDgramIdFromThis(ctx, this) orelse return jsc.JSValueMakeUndefined(ctx);
     if (g_dgram_sockets) |*sockets| {
-        if (sockets.fetchRemove(id)) |kv| std.posix.close(kv.value.fd);
+        if (sockets.fetchRemove(id)) |kv| _ = std.c.close(kv.value.fd);
     }
     if (g_dgram_socket_objs) |*objs| _ = objs.fetchRemove(id);
     if (argumentCount >= 1 and jsc.JSObjectIsFunction(ctx, @ptrCast(arguments[0]))) {
