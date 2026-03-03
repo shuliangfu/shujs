@@ -7,7 +7,8 @@ const jsc = @import("jsc");
 const globals = @import("../../../globals.zig");
 const common = @import("../../../common.zig");
 const timer_state = @import("../timers/state.zig");
-const errors = @import("../../../../errors.zig");
+const errors = @import("errors");
+const libs_process = @import("libs_process");
 // 压缩实现统一从 modules/shu/zlib 引用，与 shu:zlib / node:zlib 共用
 const shu_zlib = @import("../zlib/mod.zig");
 const brotli = shu_zlib;
@@ -24,7 +25,7 @@ const parse = @import("parse.zig");
 const response = @import("response.zig");
 const request_js = @import("request_js.zig");
 const options = @import("options.zig");
-const io_core = @import("io_core");
+const libs_io = @import("libs_io");
 const constants = @import("constants.zig");
 const conn_state = @import("conn_state.zig");
 const state_mod = @import("state.zig");
@@ -43,8 +44,8 @@ const ClusterAffinityImpl = if (builtin.os.tag == .linux) struct {
         @cInclude("sched.h");
     });
     fn apply() void {
-        const worker_env = std.posix.getenv("SHU_CLUSTER_WORKER") orelse return;
-        const worker_index = std.fmt.parseInt(usize, worker_env, 10) catch return;
+        const worker_env = std.c.getenv("SHU_CLUSTER_WORKER") orelse return;
+        const worker_index = std.fmt.parseInt(usize, std.mem.span(worker_env), 10) catch return;
         const cpu_count = std.Thread.getCpuCount() catch return;
         if (cpu_count == 0) return;
         const cpu = worker_index % cpu_count;
@@ -57,8 +58,8 @@ const ClusterAffinityImpl = if (builtin.os.tag == .linux) struct {
     const win = std.os.windows;
     extern "kernel32" fn SetProcessAffinityMask(hProcess: win.HANDLE, dwProcessAffinityMask: win.DWORD_PTR) win.BOOL;
     fn apply() void {
-        const worker_env = std.posix.getenv("SHU_CLUSTER_WORKER") orelse return;
-        const worker_index = std.fmt.parseInt(usize, worker_env, 10) catch return;
+        const worker_env = std.c.getenv("SHU_CLUSTER_WORKER") orelse return;
+        const worker_index = std.fmt.parseInt(usize, std.mem.span(worker_env), 10) catch return;
         const cpu_count = std.Thread.getCpuCount() catch return;
         if (cpu_count == 0) return;
         const cpu = worker_index % cpu_count;
@@ -73,8 +74,8 @@ const ClusterAffinityImpl = if (builtin.os.tag == .linux) struct {
     extern "c" fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) i32;
     const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
     fn apply() void {
-        const worker_env = std.posix.getenv("SHU_CLUSTER_WORKER") orelse return;
-        const worker_index = std.fmt.parseInt(usize, worker_env, 10) catch return;
+        const worker_env = std.c.getenv("SHU_CLUSTER_WORKER") orelse return;
+        const worker_index = std.fmt.parseInt(usize, std.mem.span(worker_env), 10) catch return;
         // 1) 亲和性标签：每个 worker 不同 tag，调度器尽量放到不同 L2 簇；Apple Silicon 会返回 KERN_NOT_SUPPORTED，忽略即可
         var policy: c.thread_affinity_policy_data_t = .{ .affinity_tag = @intCast(worker_index + 1) };
         const thread = c.mach_thread_self();
@@ -134,16 +135,24 @@ var g_next_ws_id: u32 = 0;
 /// 当前运行中的 server 实例（非阻塞模式下单例），供 tick 与 stop/reload/restart 回调访问
 var g_server_state: ?*ServerState = null;
 fn wsWriteNet(ctx: *anyopaque, data: []const u8) void {
-    const s: *std.net.Stream = @ptrCast(@alignCast(ctx));
-    s.writeAll(data) catch {};
+    const s: *std.Io.net.Stream = @ptrCast(@alignCast(ctx));
+    const io = libs_process.getProcessIo() orelse return;
+    var wbuf: [8192]u8 = undefined;
+    var w = s.writer(io, &wbuf);
+    _ = std.Io.Writer.writeVec(&w.interface, &.{data}) catch return;
+    w.interface.flush() catch {};
 }
 fn wsWriteTls(ctx: *anyopaque, data: []const u8) void {
     const s: *tls.TlsStream = @ptrCast(@alignCast(ctx));
     s.writeAll(data) catch {};
 }
 fn wsReadNet(ctx: *anyopaque, buf: []u8) usize {
-    const s: *const std.net.Stream = @ptrCast(@alignCast(ctx));
-    return s.read(buf) catch 0;
+    const s: *const std.Io.net.Stream = @ptrCast(@alignCast(ctx));
+    const io = libs_process.getProcessIo() orelse return 0;
+    var rbuf: [4096]u8 = undefined;
+    var r = s.reader(io, &rbuf);
+    var dest = [1][]u8{buf};
+    return std.Io.Reader.readVec(&r.interface, &dest) catch 0;
 }
 fn wsReadTls(ctx: *anyopaque, buf: []u8) usize {
     const s: *tls.TlsStream = @ptrCast(@alignCast(ctx));
@@ -301,7 +310,7 @@ fn serverCallback(
     if (workers_u < 1) workers_u = 1;
     if (workers_u > 64) workers_u = 64;
     const workers: usize = workers_u;
-    const is_cluster_worker = (std.posix.getenv("SHU_CLUSTER_WORKER") != null);
+    const is_cluster_worker = (std.c.getenv("SHU_CLUSTER_WORKER") != null);
     const is_cluster_master = (workers > 1 and !is_cluster_worker and opts.permissions.allow_run);
 
     const ws_options = options.getOptionalWebSocket(ctx, options_obj);
@@ -317,14 +326,15 @@ fn serverCallback(
         host_len = @min(host_slice.len, 256);
     }
 
-    var server: ?std.net.Server = null;
+    var server: ?std.Io.net.Server = null;
     var cluster_worker_pids: ?[]std.posix.pid_t = null;
     var cluster_argv_owned: ?[]const []const u8 = null;
     var cluster_workers_count: usize = 0;
 
     if (is_cluster_master) {
         // 主进程：spawn workers 个子进程（同命令行 + env SHU_CLUSTER_WORKER=i），不 listen；保存 argv 副本供后续 worker 存活监控与自动重启
-        const self_exe = std.fs.selfExePathAlloc(allocator) catch {
+        const proc_io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
+        const self_exe = std.process.executablePathAlloc(proc_io, allocator) catch {
             errors.reportToStderr(.{ .code = .unknown, .message = "Shu.server cluster: getSelfExePath failed" }) catch {};
             return jsc.JSValueMakeUndefined(ctx);
         };
@@ -356,17 +366,20 @@ fn serverCallback(
             return jsc.JSValueMakeUndefined(ctx);
         };
         for (0..workers) |i| {
-            var env = std.process.getEnvMap(allocator) catch return jsc.JSValueMakeUndefined(ctx);
+            const env_block = libs_process.getProcessEnviron() orelse std.process.Environ.empty;
+            var env = std.process.Environ.createMap(env_block, allocator) catch return jsc.JSValueMakeUndefined(ctx);
             defer env.deinit();
             var num_buf: [16]u8 = undefined;
             const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{i + 1}) catch return jsc.JSValueMakeUndefined(ctx);
             env.put("SHU_CLUSTER_WORKER", num_str) catch return jsc.JSValueMakeUndefined(ctx);
-            var child = std.process.Child.init(argv_dup, allocator);
-            child.stdin_behavior = .Inherit;
-            child.stdout_behavior = .Inherit;
-            child.stderr_behavior = .Inherit;
-            child.env_map = &env;
-            child.spawn() catch {
+            var child = std.process.spawn(proc_io, .{
+                .argv = argv_dup,
+                .cwd = .inherit,
+                .environ_map = &env,
+                .stdin = .inherit,
+                .stdout = .inherit,
+                .stderr = .inherit,
+            }) catch {
                 for (pids[0..i]) |pid| std.posix.kill(pid, std.posix.SIG.TERM) catch {};
                 allocator.free(pids);
                 if (cluster_argv_owned) |argv| {
@@ -376,25 +389,22 @@ fn serverCallback(
                 errors.reportToStderr(.{ .code = .unknown, .message = "Shu.server cluster: spawn worker failed" }) catch {};
                 return jsc.JSValueMakeUndefined(ctx);
             };
-            pids[i] = child.id;
+            pids[i] = child.id.?;
         }
         cluster_worker_pids = pids;
     } else {
         // 单进程或 worker：正常 listen；Linux 下 cluster worker 绑核以降低迁移与缓存抖动
         applyClusterWorkerCpuAffinity();
-        const listen_options = std.net.Address.ListenOptions{
-            .reuse_address = true,
-            .kernel_backlog = @as(u31, @intCast(config.listen_backlog)),
-        };
+        const proc_io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
         if (unix_path != null and unix_path.?.len > 0) {
             const path = unix_path.?;
-            const addr = std.net.Address.initUnix(path) catch |e| {
+            var ua = std.Io.net.UnixAddress.init(path) catch |e| {
                 var msg_buf: [128]u8 = undefined;
                 const msg = std.fmt.bufPrint(&msg_buf, "Shu.server listen (unix) failed: {s}", .{@errorName(e)}) catch "Shu.server listen failed";
                 errors.reportToStderr(.{ .code = .unknown, .message = msg }) catch {};
                 return jsc.JSValueMakeUndefined(ctx);
             };
-            server = addr.listen(listen_options) catch |e| {
+            server = std.Io.net.UnixAddress.listen(&ua, proc_io, .{ .kernel_backlog = @as(u31, @intCast(config.listen_backlog)) }) catch |e| {
                 var msg_buf: [128]u8 = undefined;
                 const msg = std.fmt.bufPrint(&msg_buf, "Shu.server listen (unix) failed: {s}", .{@errorName(e)}) catch "Shu.server listen failed";
                 errors.reportToStderr(.{ .code = .unknown, .message = msg }) catch {};
@@ -406,13 +416,13 @@ fn serverCallback(
                 errors.reportToStderr(.{ .code = .unknown, .message = "Shu.server host format error" }) catch {};
                 return jsc.JSValueMakeUndefined(ctx);
             };
-            const addr = std.net.Address.parseIp(host_z, port) catch |e| {
+            const addr = std.Io.net.IpAddress.parse(host_z, port) catch |e| {
                 var msg_buf: [128]u8 = undefined;
                 const msg = std.fmt.bufPrint(&msg_buf, "Shu.server listen failed: {s}", .{@errorName(e)}) catch "Shu.server listen failed";
                 errors.reportToStderr(.{ .code = .unknown, .message = msg }) catch {};
                 return jsc.JSValueMakeUndefined(ctx);
             };
-            server = addr.listen(listen_options) catch |e| {
+            server = std.Io.net.IpAddress.listen(addr, proc_io, .{ .kernel_backlog = @as(u31, @intCast(config.listen_backlog)) }) catch |e| {
                 var msg_buf: [128]u8 = undefined;
                 const msg = std.fmt.bufPrint(&msg_buf, "Shu.server listen failed: {s}", .{@errorName(e)}) catch "Shu.server listen failed";
                 errors.reportToStderr(.{ .code = .unknown, .message = msg }) catch {};
@@ -482,13 +492,13 @@ fn serverCallback(
     // 有 listen socket 时即创建 io_core（TCP 与 Unix）：明文连接 I/O 全部走 io_core，便于统一维护与优化
     if (state.server != null) {
         const pool_size = config.max_connections * (64 * 1024);
-        state.buffer_pool = io_core.api.BufferPool.allocAligned(state.allocator, pool_size) catch return jsc.JSValueMakeUndefined(ctx);
-        const hio = state.allocator.create(io_core.HighPerfIO) catch {
+        state.buffer_pool = libs_io.api.BufferPool.allocAligned(state.allocator, pool_size) catch return jsc.JSValueMakeUndefined(ctx);
+        const hio = state.allocator.create(libs_io.HighPerfIO) catch {
             state.buffer_pool.?.deinit();
             state.buffer_pool = null;
             return jsc.JSValueMakeUndefined(ctx);
         };
-        hio.* = io_core.HighPerfIO.init(state.allocator, .{
+        hio.* = libs_io.HighPerfIO.init(state.allocator, .{
             .max_connections = config.max_connections,
             .max_completions = config.max_completions,
         }) catch {
@@ -612,7 +622,7 @@ fn updateStateFromOptions(ctx: jsc.JSContextRef, options_obj: jsc.JSObjectRef, s
     }
 }
 
-/// 释放 state 占用的资源并置空 g_server_state（stop 或出错时调用）
+/// 释放 state 占用的资源并置空 g_server_state（stop 或出错时调用）。0.16：server.deinit(io)
 fn serverStateCleanup(ctx: jsc.JSContextRef, state: *ServerState) void {
     if (build_options.use_iocp and state.iocp != null) {
         state.iocp.?.deinit();
@@ -627,7 +637,9 @@ fn serverStateCleanup(ctx: jsc.JSContextRef, state: *ServerState) void {
         pool.deinit();
         state.buffer_pool = null;
     }
-    if (state.server) |*srv| srv.deinit();
+    if (state.server) |*srv| {
+        if (libs_process.getProcessIo()) |io| srv.deinit(io);
+    }
     if (state.cluster_worker_pids) |pids| {
         for (pids) |pid| std.posix.kill(pid, std.posix.SIG.TERM) catch {};
         state.allocator.free(pids);
@@ -642,11 +654,12 @@ fn serverStateCleanup(ctx: jsc.JSContextRef, state: *ServerState) void {
     if (state.signal_ref) |v| jsc.JSValueUnprotect(ctx, v);
     if (state.tls_ctx) |*tc| tc.destroy();
     if (build_options.have_tls and state.tls_pending != null) {
+        const io_opt = libs_process.getProcessIo();
         var it = state.tls_pending.?.iterator();
         while (it.next()) |e| {
             e.value_ptr.deinit(state.allocator);
             e.value_ptr.pending.free();
-            e.value_ptr.stream.close();
+            if (io_opt) |i| e.value_ptr.stream.close(i);
         }
         state.tls_pending.?.deinit();
         if (state.tls_conns != null) {
@@ -664,21 +677,18 @@ fn serverStateCleanup(ctx: jsc.JSContextRef, state: *ServerState) void {
     g_server_state = null;
 }
 
-/// 根据 state 中保存的地址重新 listen，用于 restart
+/// 根据 state 中保存的地址重新 listen，用于 restart。0.16：UnixAddress/IpAddress.listen(io, options)
 fn doListen(state: *ServerState) !void {
-    const listen_options = std.net.Address.ListenOptions{
-        .reuse_address = true,
-        .kernel_backlog = state.listen_backlog,
-    };
+    const io = libs_process.getProcessIo() orelse return error.NoProcessIo;
     if (state.use_unix) {
         const path = state.unix_path_buf[0..state.unix_path_len];
-        const addr = std.net.Address.initUnix(path) catch |e| {
+        var ua = std.Io.net.UnixAddress.init(path) catch |e| {
             var msg_buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrint(&msg_buf, "Shu.server restart listen (unix) failed: {s}", .{@errorName(e)}) catch "restart listen failed";
             errors.reportToStderr(.{ .code = .unknown, .message = msg }) catch {};
             return e;
         };
-        state.server = addr.listen(listen_options) catch |e| {
+        state.server = std.Io.net.UnixAddress.listen(&ua, io, .{ .kernel_backlog = state.listen_backlog }) catch |e| {
             var msg_buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrint(&msg_buf, "Shu.server restart listen (unix) failed: {s}", .{@errorName(e)}) catch "restart listen failed";
             errors.reportToStderr(.{ .code = .unknown, .message = msg }) catch {};
@@ -688,13 +698,13 @@ fn doListen(state: *ServerState) !void {
         var addr_buf: [256]u8 = undefined;
         const host_slice = state.host_buf[0..state.host_len];
         const host_z = std.fmt.bufPrintZ(&addr_buf, "{s}", .{host_slice}) catch return error.RestartListenFailed;
-        const addr = std.net.Address.parseIp(host_z, state.port) catch |e| {
+        const addr = std.Io.net.IpAddress.parse(host_z, state.port) catch |e| {
             var msg_buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrint(&msg_buf, "Shu.server restart listen failed: {s}", .{@errorName(e)}) catch "restart listen failed";
             errors.reportToStderr(.{ .code = .unknown, .message = msg }) catch {};
             return e;
         };
-        state.server = addr.listen(listen_options) catch |e| {
+        state.server = std.Io.net.IpAddress.listen(addr, io, .{ .kernel_backlog = state.listen_backlog }) catch |e| {
             var msg_buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrint(&msg_buf, "Shu.server restart listen failed: {s}", .{@errorName(e)}) catch "restart listen failed";
             errors.reportToStderr(.{ .code = .unknown, .message = msg }) catch {};
@@ -704,7 +714,7 @@ fn doListen(state: *ServerState) !void {
 }
 
 /// tick 回调：明文 handoff 时调 handleConnectionPlain
-fn handoffPlainForTick(state: *ServerState, allocator: std.mem.Allocator, ctx: jsc.JSContextRef, stream: *std.net.Stream, initial_data: ?[]const u8) u32 {
+fn handoffPlainForTick(state: *ServerState, allocator: std.mem.Allocator, ctx: jsc.JSContextRef, stream: *std.Io.net.Stream, initial_data: ?[]const u8) u32 {
     _ = allocator;
     return handleConnectionPlain(state.allocator, ctx, stream, state.handler_fn, &state.config, state.compression_enabled, state.error_callback, state.ws_options, &state.ws_registry, &state.next_ws_id, initial_data) catch 0;
 }
@@ -969,7 +979,7 @@ fn stepPlainConn(
 fn handleConnectionPlain(
     allocator: std.mem.Allocator,
     ctx: jsc.JSContextRef,
-    stream: *std.net.Stream,
+    stream: *std.Io.net.Stream,
     handler_fn: jsc.JSValueRef,
     config: *const ServerConfig,
     compression_enabled: bool,
@@ -996,7 +1006,7 @@ fn handleConnectionPlain(
         if (first_round) {
             first_round = false;
             if (initial_data) |id| {
-                var pre_reader = connection.PreReadReader(std.net.Stream){ .prefix = id, .consumed = 0, .stream = stream };
+                var pre_reader = connection.PreReadReader(std.Io.net.Stream){ .prefix = id, .consumed = 0, .stream = stream };
                 parsed = parse.parseHttpRequest(arena, &pre_reader, read_buf, config) catch |e| {
                     if (e == error.ConnectionClosed) return count;
                     if (e == error.BadRequest) {
@@ -1010,12 +1020,14 @@ fn handleConnectionPlain(
                     return e;
                 };
             } else {
-                const nr = stream.read(read_buf[0..24]) catch return count;
+                const io = libs_process.getProcessIo() orelse return count;
+                var net_adapter = connection.NetStreamAdapter{ .stream = stream, .io = io };
+                const nr = net_adapter.read(read_buf[0..24]) catch return count;
                 if (nr < 24) return count;
                 if (std.mem.eql(u8, read_buf[0..24], http2.CLIENT_PREFACE)) {
-                    return connection.handleH2Connection(allocator, ctx, stream, handler_fn, config, compression_enabled, error_callback, true);
+                    return connection.handleH2Connection(allocator, ctx, &net_adapter, handler_fn, config, compression_enabled, error_callback, true);
                 }
-                var pre_reader = connection.PreReadReader(std.net.Stream){ .prefix = read_buf[0..24], .consumed = 0, .stream = stream };
+                var pre_reader = connection.PreReadReader(connection.NetStreamAdapter){ .prefix = read_buf[0..24], .consumed = 0, .stream = &net_adapter };
                 parsed = parse.parseHttpRequest(arena, &pre_reader, read_buf, config) catch |e| {
                     if (e == error.ConnectionClosed) return count;
                     if (e == error.BadRequest) {
@@ -1030,7 +1042,9 @@ fn handleConnectionPlain(
                 };
             }
         } else {
-            parsed = parse.parseHttpRequest(arena, stream, read_buf, config) catch |e| {
+            const io = libs_process.getProcessIo() orelse return count;
+            var net_adapter = connection.NetStreamAdapter{ .stream = stream, .io = io };
+            parsed = parse.parseHttpRequest(arena, &net_adapter, read_buf, config) catch |e| {
                 if (e == error.ConnectionClosed) return count;
                 if (e == error.BadRequest) {
                     try response.writeHttpResponse(arena, stream, config, 400, "Bad Request", null, null, "Invalid Content-Length or request", false, null);
@@ -1081,8 +1095,10 @@ fn handleConnectionPlain(
             return count;
         }
         if (connection.isH2cUpgrade(parse.getHeader(parsed.headers_head, "connection"), parse.getHeader(parsed.headers_head, "upgrade"))) {
-            try stream.writeAll("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n");
-            return connection.handleH2Connection(allocator, ctx, stream, handler_fn, config, compression_enabled, error_callback, false);
+            const io = libs_process.getProcessIo() orelse return count;
+            var net_adapter = connection.NetStreamAdapter{ .stream = stream, .io = io };
+            try net_adapter.writeAll("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n");
+            return connection.handleH2Connection(allocator, ctx, &net_adapter, handler_fn, config, compression_enabled, error_callback, false);
         }
         const req_obj = request_js.makeRequestObject(ctx, arena, &parsed) orelse return count;
         const result = request_js.invokeHandlerWithOnError(ctx, handler_fn, req_obj, error_callback);
@@ -1131,7 +1147,7 @@ fn handleConnectionPlain(
 
 /// 是否 Upgrade: h2c（Connection 含 upgrade，Upgrade 含 h2c，不区分大小写）
 /// 处理单连接：支持 keep-alive 时循环「读请求 → 解析 → handler → 写响应」；若首请求为 WebSocket Upgrade 则握手后走帧循环
-/// stream 为 *std.net.Stream 或 *tls.TlsStream；关闭由调用方负责
+/// stream 为 *std.Io.net.Stream 或 *tls.TlsStream；关闭由调用方负责
 fn handleConnection(
     allocator: std.mem.Allocator,
     ctx: jsc.JSContextRef,
@@ -1187,7 +1203,7 @@ fn handleConnection(
 
             const ws_id = next_ws_id.*;
             next_ws_id.* += 1;
-            const write_entry: WsSendEntry = if (@TypeOf(stream) == *const std.net.Stream) .{
+            const write_entry: WsSendEntry = if (@TypeOf(stream) == *const std.Io.net.Stream) .{
                 .blocking = .{ .write_fn = wsWriteNet, .ctx = @ptrCast(@constCast(stream)) },
             } else .{
                 .blocking = .{ .write_fn = wsWriteTls, .ctx = @ptrCast(@constCast(stream)) },
@@ -1203,11 +1219,11 @@ fn handleConnection(
             }
             const frame_buf = allocator.alloc(u8, config.ws_frame_buffer_size) catch return count;
             defer allocator.free(frame_buf);
-            const reader: ws_mod.Reader = if (@TypeOf(stream) == *const std.net.Stream)
+            const reader: ws_mod.Reader = if (@TypeOf(stream) == *const std.Io.net.Stream)
                 .{ .ctx = @ptrCast(@constCast(stream)), .read_fn = wsReadNet }
             else
                 .{ .ctx = @ptrCast(@constCast(stream)), .read_fn = wsReadTls };
-            const writer: ws_mod.Writer = if (@TypeOf(stream) == *const std.net.Stream)
+            const writer: ws_mod.Writer = if (@TypeOf(stream) == *const std.Io.net.Stream)
                 .{ .ctx = @ptrCast(@constCast(stream)), .send_fn = wsWriteNet }
             else
                 .{ .ctx = @ptrCast(@constCast(stream)), .send_fn = wsWriteTls };
