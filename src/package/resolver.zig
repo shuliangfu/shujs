@@ -4,7 +4,9 @@
 // 文件/目录与路径解析经 io_core（§3.0）
 
 const std = @import("std");
-const io_core = @import("io_core");
+const errors = @import("errors");
+const libs_io = @import("libs_io");
+const libs_process = @import("libs_process");
 const manifest = @import("manifest.zig");
 const export_map = @import("export_map.zig");
 const cache = @import("cache.zig");
@@ -27,26 +29,27 @@ pub const Condition = export_map.Condition;
 fn findProjectRoot(allocator: std.mem.Allocator, start_dir: []const u8) ?[]const u8 {
     var dir = allocator.dupe(u8, start_dir) catch return null;
     defer allocator.free(dir);
+    const io = libs_process.getProcessIo() orelse return null;
     while (true) {
-        var d = io_core.openDirAbsolute(dir, .{}) catch break;
-        defer d.close();
-        if (d.openFile("package.json", .{}) catch null) |file| {
-            file.close();
+        var d = libs_io.openDirAbsolute(dir, .{}) catch break;
+        defer d.close(io);
+        if (d.openFile(io, "package.json", .{}) catch null) |file| {
+            file.close(io);
             return allocator.dupe(u8, dir) catch null;
         }
-        if (d.openFile("package.jsonc", .{}) catch null) |file| {
-            file.close();
+        if (d.openFile(io, "package.jsonc", .{}) catch null) |file| {
+            file.close(io);
             return allocator.dupe(u8, dir) catch null;
         }
-        if (d.openFile("deno.json", .{}) catch null) |file| {
-            file.close();
+        if (d.openFile(io, "deno.json", .{}) catch null) |file| {
+            file.close(io);
             return allocator.dupe(u8, dir) catch null;
         }
-        if (d.openFile("deno.jsonc", .{}) catch null) |file| {
-            file.close();
+        if (d.openFile(io, "deno.jsonc", .{}) catch null) |file| {
+            file.close(io);
             return allocator.dupe(u8, dir) catch null;
         }
-        const parent = io_core.pathDirname(dir) orelse break;
+        const parent = libs_io.pathDirname(dir) orelse break;
         if (std.mem.eql(u8, parent, dir)) break;
         const new_dir = allocator.dupe(u8, parent) catch break;
         allocator.free(dir);
@@ -58,32 +61,33 @@ fn findProjectRoot(allocator: std.mem.Allocator, start_dir: []const u8) ?[]const
 /// 沿 parent_dir 向上查找 node_modules/<specifier> 目录，返回包目录绝对路径；未找到返回 null。调用方负责 free。
 fn findNodeModulesPackage(allocator: std.mem.Allocator, parent_dir: []const u8, specifier: []const u8) ?[]const u8 {
     if (specifier.len == 0) return null;
+    const io = libs_process.getProcessIo() orelse return null;
     var dir = allocator.dupe(u8, parent_dir) catch return null;
     defer allocator.free(dir);
     while (true) {
-        const nm_path = io_core.pathJoin(allocator, &.{ dir, "node_modules", specifier }) catch return null;
+        const nm_path = libs_io.pathJoin(allocator, &.{ dir, "node_modules", specifier }) catch return null;
         defer allocator.free(nm_path);
-        var dir_handle = io_core.openDirAbsolute(dir, .{}) catch break;
-        defer dir_handle.close();
-        var nm_handle = dir_handle.openDir("node_modules", .{}) catch {
-            const parent = io_core.pathDirname(dir) orelse break;
+        var dir_handle = libs_io.openDirAbsolute(dir, .{}) catch break;
+        defer dir_handle.close(io);
+        var nm_handle = dir_handle.openDir(io, "node_modules", .{}) catch {
+            const parent = libs_io.pathDirname(dir) orelse break;
             if (std.mem.eql(u8, parent, dir)) break;
             const new_dir = allocator.dupe(u8, parent) catch break;
             allocator.free(dir);
             dir = new_dir;
             continue;
         };
-        defer nm_handle.close();
-        var sub = nm_handle.openDir(specifier, .{}) catch {
-            const parent = io_core.pathDirname(dir) orelse break;
+        defer nm_handle.close(io);
+        var sub = nm_handle.openDir(io, specifier, .{}) catch {
+            const parent = libs_io.pathDirname(dir) orelse break;
             if (std.mem.eql(u8, parent, dir)) break;
             const new_dir = allocator.dupe(u8, parent) catch break;
             allocator.free(dir);
             dir = new_dir;
             continue;
         };
-        sub.close();
-        return io_core.pathResolve(allocator, &.{nm_path}) catch return null;
+        sub.close(io);
+        return libs_io.pathResolve(allocator, &.{nm_path}) catch return null;
     }
     return null;
 }
@@ -116,12 +120,12 @@ fn resolvePackageEntry(
         const entry_rel = try export_map.resolve(allocator, exp, subpath, condition);
         if (entry_rel) |res| {
             defer if (res.caller_owns) allocator.free(res.path);
-            return io_core.pathJoin(allocator, &.{ pkg_dir, res.path });
+            return libs_io.pathJoin(allocator, &.{ pkg_dir, res.path });
         }
     }
     if (subpath.len > 0) return error.PackagePathNotExported;
-    if (m.main) |main_val| return io_core.pathJoin(allocator, &.{ pkg_dir, main_val });
-    return io_core.pathJoin(allocator, &.{ pkg_dir, "index.js" });
+    if (m.main) |main_val| return libs_io.pathJoin(allocator, &.{ pkg_dir, main_val });
+    return libs_io.pathJoin(allocator, &.{ pkg_dir, "index.js" });
 }
 
 /// 解析说明符为绝对文件路径。顺序：协议/内置不处理；import map；相对/绝对路径；https:（仅支持，从缓存解析）；jsr:；裸说明符 node_modules + main/exports。http:// 不支持。
@@ -151,8 +155,8 @@ pub fn resolve(
         }
     }
 
-    if (path_part.len >= 1 and (path_part[0] == '.' or io_core.pathIsAbsolute(path_part))) {
-        const file_path = try io_core.pathResolve(allocator, &.{ parent_dir, path_part });
+    if (path_part.len >= 1 and (path_part[0] == '.' or libs_io.pathIsAbsolute(path_part))) {
+        const file_path = try libs_io.pathResolve(allocator, &.{ parent_dir, path_part });
         errdefer allocator.free(file_path);
         const cache_key = if (query.len == 0) file_path else try std.mem.concat(allocator, u8, &.{ file_path, query });
         return .{ .file_path = file_path, .cache_key = cache_key };
