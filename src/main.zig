@@ -1,8 +1,11 @@
 // CLI 入口，解析子命令并分发到 run/install/add/build/test/check/lint/fmt 及建议新增子命令（占位）
 // 参考：README.md ⌨️ CLI 实用命令分析、SHU_RUNTIME_ANALYSIS.md 6.1
-// Zig 0.15.2：stdout/stderr 使用 std.fs.File.stdout().writer(...)，无旧版 API
+// Zig 0.16.0-dev：stdout/stderr 使用 std.Io；main 设置 process io 并向下传递 init.io
 
 const std = @import("std");
+const errors = @import("errors");
+const libs_io = @import("libs_io");
+const libs_process = @import("libs_process");
 const cli_args = @import("cli/args.zig");
 const cli_run = @import("cli/run.zig");
 const cli_install = @import("cli/install.zig");
@@ -50,27 +53,27 @@ const cli_serve = @import("cli/serve.zig");
 const cli_help = @import("cli/help.zig");
 
 /// CLI 入口：解析子命令与全局选项，分发到各子命令（含文档「还可实现的命令」占位）
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
+/// Zig 0.16：使用 process.Init 获取 args/arena，argv 由 init.minimal.args.toSlice(arena) 得到，由 arena 持有无需单独 free。
+pub fn main(init: std.process.Init) !void {
+    libs_process.setProcessIo(init.io);
+    libs_process.setProcessEnviron(init.minimal.environ);
+    const allocator = init.arena.allocator();
+    const argv = try init.minimal.args.toSlice(allocator);
+    const io = init.io;
 
     if (argv.len < 2) {
-        try cli_help.printGlobalUsage();
+        try cli_help.printGlobalUsage(io);
         std.process.exit(1);
     }
 
     const subcommand = argv[1];
     // -v / --version 优先：无需子命令解析，直接打印版本并退出
     if (std.mem.eql(u8, subcommand, "-v") or std.mem.eql(u8, subcommand, "--version")) {
-        try cli_version.printVersion();
+        try cli_version.printVersion(io);
         return;
     }
     if (std.mem.eql(u8, subcommand, "--help") or std.mem.eql(u8, subcommand, "-h")) {
-        try cli_help.printGlobalUsage();
+        try cli_help.printGlobalUsage(io);
         return;
     }
 
@@ -78,44 +81,44 @@ pub fn main() !void {
     const parse_result = cli_args.parse(rest);
 
     if (parse_result.parsed.help) {
-        try cli_help.printGlobalUsage();
+        try cli_help.printGlobalUsage(io);
         return;
     }
     if (std.mem.eql(u8, subcommand, "help")) {
-        try cli_help.help(allocator, parse_result.positional);
+        try cli_help.help(allocator, parse_result.positional, io);
         return;
     }
 
     if (std.mem.eql(u8, subcommand, "run")) {
-        cli_run.run(allocator, parse_result.parsed, parse_result.positional, argv) catch |e| {
-            if (e == error.MissingEntry or e == std.fs.File.OpenError.FileNotFound) std.process.exit(1);
+        cli_run.run(allocator, parse_result.parsed, parse_result.positional, argv, io) catch |e| {
+            if (e == error.MissingEntry or e == std.Io.File.OpenError.FileNotFound) std.process.exit(1);
             return e;
         };
         return;
     }
     if (std.mem.eql(u8, subcommand, "install") or std.mem.eql(u8, subcommand, "-i")) {
-        cli_install.install(allocator, parse_result.parsed, parse_result.positional) catch {
+        cli_install.install(allocator, parse_result.parsed, parse_result.positional, io) catch {
             // 错误信息已由 install 打印，此处仅退出码，避免 Debug 下打印错误栈
             std.process.exit(1);
         };
         return;
     }
     if (std.mem.eql(u8, subcommand, "add")) {
-        cli_add.add(allocator, parse_result.parsed, parse_result.positional) catch {
+        cli_add.add(allocator, parse_result.parsed, parse_result.positional, io) catch {
             std.process.exit(1);
         };
         return;
     }
     if (std.mem.eql(u8, subcommand, "build")) {
-        try cli_build.build(allocator, parse_result.parsed, parse_result.positional);
+        try cli_build.build(allocator, parse_result.parsed, parse_result.positional, io);
         return;
     }
     if (std.mem.eql(u8, subcommand, "test")) {
-        try cli_test.runTest(allocator, parse_result.parsed, parse_result.positional);
+        try cli_test.runTest(allocator, parse_result.parsed, parse_result.positional, io);
         return;
     }
     if (std.mem.eql(u8, subcommand, "check")) {
-        try cli_check.check(allocator, parse_result.parsed, parse_result.positional);
+        try cli_check.check(allocator, parse_result.parsed, parse_result.positional, io);
         return;
     }
     if (std.mem.eql(u8, subcommand, "lint")) {
@@ -127,7 +130,7 @@ pub fn main() !void {
         return;
     }
     if (std.mem.eql(u8, subcommand, "version")) {
-        try cli_version.printVersion();
+        try cli_version.printVersion(io);
         return;
     }
     if (std.mem.eql(u8, subcommand, "init")) {
@@ -267,15 +270,15 @@ pub fn main() !void {
         return;
     }
 
-    try printToStdout("Unknown subcommand: {s}\n", .{subcommand});
-    try cli_help.printGlobalUsage();
+    try printToStdout(io, "Unknown subcommand: {s}\n", .{subcommand});
+    try cli_help.printGlobalUsage(io);
     std.process.exit(1);
 }
 
-fn printToStdout(comptime fmt: []const u8, args: anytype) !void {
+/// Zig 0.16：使用 std.Io 写 stdout
+fn printToStdout(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
     var buf: [256]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf);
-    const out = &w.interface;
-    try out.print(fmt, args);
-    try out.flush();
+    var w = std.Io.File.Writer.init(std.Io.File.stdout(), io, &buf);
+    try w.interface.print(fmt, args);
+    w.flush() catch {};
 }
