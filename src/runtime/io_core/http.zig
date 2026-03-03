@@ -52,6 +52,7 @@
 
 const std = @import("std");
 const file = @import("file.zig");
+const process_io = @import("process_io.zig");
 const shu_zlib = @import("shu_zlib");
 
 // -----------------------------------------------------------------------------
@@ -167,7 +168,10 @@ pub fn freeResponse(allocator: std.mem.Allocator, resp: *const Response) void {
 pub fn request(allocator: std.mem.Allocator, url: []const u8, options: RequestOptions) !Response {
     var last_err: anyerror = error.ReadFailed;
     for (0..read_failed_retries + 1) |i| {
-        if (i > 0) std.Thread.sleep(1_000_000_000); // 1s 间隔
+        if (i > 0) {
+            const proc_io = process_io.getProcessIo();
+            if (proc_io) |io| std.Io.sleep(io, std.Io.Duration.fromSeconds(1), .awake) catch {};
+        }
         const resp = requestViaZig(allocator, url, options) catch |e| {
             last_err = e;
             continue;
@@ -211,55 +215,59 @@ pub fn get(allocator: std.mem.Allocator, url: []const u8, options: GetOptions) !
 
 /// 当 SHU_DEBUG_HTTP 非空且 raw_body 为空时，向 stderr 打印 url、status、content_encoding、content_length，便于区分「服务端返回空」与「Zig 路径未读到 body」。开头 \n 避免与进度条同显时接在同一行。
 fn debugLogEmptyRawBody(url: []const u8, status: u16, content_encoding: std.http.ContentEncoding, content_length: ?u64) void {
-    const env = std.posix.getenv("SHU_DEBUG_HTTP") orelse return;
-    if (env.len == 0) return;
+    const env = std.c.getenv("SHU_DEBUG_HTTP") orelse return;
+    if (std.mem.span(env).len == 0) return;
+    const io = process_io.getProcessIo() orelse return;
     var buf: [512]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
+    var w = std.Io.File.Writer.init(std.Io.File.stderr(), io, &buf);
     w.interface.print("\n[shu http debug] empty raw_body url={s} status={d} content_encoding={s} content_length={?d}\n", .{
         url,
         status,
         @tagName(content_encoding),
         content_length,
     }) catch return;
-    w.interface.flush() catch return;
+    w.flush() catch return;
 }
 
 /// 当 SHU_DEBUG_HTTP 非空且读 body 失败时，向 stderr 打印 url、错误名与可选 reason（path=zig 表示 Zig 路径；reason=empty_raw_body 表示头有 Content-Length 但读到 0 字节）。开头 \n 避免与进度条同显时接在同一行。
 fn debugLogReadFailed(url: []const u8, read_err: anyerror, reason: ?[]const u8) void {
-    const env = std.posix.getenv("SHU_DEBUG_HTTP") orelse return;
-    if (env.len == 0) return;
+    const env = std.c.getenv("SHU_DEBUG_HTTP") orelse return;
+    if (std.mem.span(env).len == 0) return;
+    const io = process_io.getProcessIo() orelse return;
     var buf: [640]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
+    var w = std.Io.File.Writer.init(std.Io.File.stderr(), io, &buf);
     if (reason) |r| {
         w.interface.print("\n[shu http] read failed url={s} error={s} path=zig reason={s}\n", .{ url, @errorName(read_err), r }) catch return;
     } else {
         w.interface.print("\n[shu http] read failed url={s} error={s} path=zig\n", .{ url, @errorName(read_err) }) catch return;
     }
-    w.interface.flush() catch return;
+    w.flush() catch return;
 }
 
 /// 当 SHU_DEBUG_HTTP 非空且触发 ResponseTooLarge 时，向 stderr 打印 url 与 max_response_bytes，便于定位是哪个请求、用的哪个 limit。开头 \n 避免与进度条同显时接在同一行。
 fn debugLogResponseTooLarge(url: []const u8, max_response_bytes: usize) void {
-    const env = std.posix.getenv("SHU_DEBUG_HTTP") orelse return;
-    if (env.len == 0) return;
+    const env = std.c.getenv("SHU_DEBUG_HTTP") orelse return;
+    if (std.mem.span(env).len == 0) return;
+    const io = process_io.getProcessIo() orelse return;
     var buf: [512]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
+    var w = std.Io.File.Writer.init(std.Io.File.stderr(), io, &buf);
     w.interface.print("\n[shu http] ResponseTooLarge url={s} limit={d}\n", .{ url, max_response_bytes }) catch return;
-    w.interface.flush() catch return;
+    w.flush() catch return;
 }
 
 /// 当 SHU_DEBUG_HTTP 非空时，向 stderr 打印响应头（status + 逐条 Header），便于排查 Content-Encoding 等。在调用 reader() 之前调用，避免 head 被 invalidate。
 fn debugLogResponseHeaders(url: []const u8, status: u16, head: std.http.Client.Response.Head) void {
-    const env = std.posix.getenv("SHU_DEBUG_HTTP") orelse return;
-    if (env.len == 0) return;
+    const env = std.c.getenv("SHU_DEBUG_HTTP") orelse return;
+    if (std.mem.span(env).len == 0) return;
+    const io = process_io.getProcessIo() orelse return;
     var buf: [1024]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
+    var w = std.Io.File.Writer.init(std.Io.File.stderr(), io, &buf);
     w.interface.print("\n[shu http] response headers url={s} status={d}\n", .{ url, status }) catch return;
     var it = head.iterateHeaders();
     while (it.next()) |header| {
         w.interface.print("  {s}: {s}\n", .{ header.name, header.value }) catch return;
     }
-    w.interface.flush() catch return;
+    w.flush() catch return;
 }
 
 /// 使用已有 Client 做 GET，便于同一 host 连接复用（Keep-Alive）。仅 Zig 路径；若 ReadFailed 或 2xx 空 body 则重试最多 read_failed_retries 次、每次间隔 1 秒，仍失败返回 error.HttpFailed。调用方负责 client 生命周期。
@@ -284,8 +292,8 @@ pub fn getWithClient(client: *std.http.Client, allocator: std.mem.Allocator, url
     };
     var last_err: anyerror = error.HttpFailed;
     for (0..read_failed_retries + 1) |i| {
-        if (i > 0) std.Thread.sleep(1_000_000_000); // 1s 间隔
-        // 重试一律用同一 client，避免 ReadFailed 时新建 one-off Client 触发 Zig 0.15.2 connect() 内 proxy.host 未初始化野指针 segfault（gzip 时易触发 ReadFailed 故易进重试路径）。
+        if (i > 0) std.Io.sleep(client.io, std.Io.Duration.fromSeconds(1), .awake) catch {}; // 1s 间隔
+        // 重试一律用同一 client，避免 ReadFailed 时新建 one-off Client 触发 connect() 内 proxy.host 未初始化野指针 segfault（gzip 时易触发 ReadFailed 故易进重试路径）。
         const resp = requestViaZigWithClient(client, allocator, url, opts) catch |e| {
             last_err = e;
             continue;
@@ -303,11 +311,11 @@ pub fn getWithClient(client: *std.http.Client, allocator: std.mem.Allocator, url
         return resp.body;
     }
     // SHU_DEBUG_HTTP 时打印最终错误，便于区分 empty_raw_body_chunked、body_truncated、decompress 等
-    if (std.posix.getenv("SHU_DEBUG_HTTP")) |_| {
+    if (std.c.getenv("SHU_DEBUG_HTTP")) |_| {
         var buf: [256]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
-        fbs.writer().print("\n[shu http] after retries url={s} last_err={s}\n", .{ url, @errorName(last_err) }) catch {};
-        _ = std.posix.write(2, fbs.getWritten()) catch {};
+        if (std.fmt.bufPrint(&buf, "\n[shu http] after retries url={s} last_err={s}\n", .{ url, @errorName(last_err) })) |slice|
+            _ = std.c.write(2, slice.ptr, slice.len)
+        else |_| {}
     }
     return if (last_err == error.ReadFailed) error.HttpFailed else last_err;
 }
@@ -317,7 +325,8 @@ pub fn getWithClient(client: *std.http.Client, allocator: std.mem.Allocator, url
 // -----------------------------------------------------------------------------
 
 fn requestViaZig(allocator: std.mem.Allocator, url: []const u8, options: RequestOptions) !Response {
-    var client = std.http.Client{ .allocator = allocator };
+    const io = process_io.getProcessIo() orelse return error.ProcessIoNotSet;
+    var client = std.http.Client{ .allocator = allocator, .io = io };
     defer client.deinit();
     return requestViaZigWithClient(&client, allocator, url, options);
 }
@@ -410,7 +419,7 @@ fn requestViaZigWithClient(client: *std.http.Client, allocator: std.mem.Allocato
     if (content_length != null) {
         // 有 Content-Length：读满 raw body 再按需解压（与 Zig Cookbook / 原逻辑一致）
         const raw_reader = response.reader(&tls_transfer_buf);
-        const raw_body = raw_reader.allocRemaining(allocator, std.io.Limit.limited(options.max_response_bytes)) catch |e| {
+        const raw_body = raw_reader.allocRemaining(allocator, std.Io.Limit.limited(options.max_response_bytes)) catch |e| {
             if (e == error.StreamTooLong) {
                 debugLogResponseTooLarge(url, options.max_response_bytes);
                 return error.ResponseTooLarge;
@@ -426,11 +435,11 @@ fn requestViaZigWithClient(client: *std.http.Client, allocator: std.mem.Allocato
         }
         if (content_length) |expected| {
             if (raw_body.len < expected) {
-                if (std.posix.getenv("SHU_DEBUG_HTTP")) |_| {
+                if (std.c.getenv("SHU_DEBUG_HTTP")) |_| {
                     var buf: [256]u8 = undefined;
-                    var fbs = std.io.fixedBufferStream(&buf);
-                    fbs.writer().print("[shu http] body truncated url={s} expected={d} got={d}\n", .{ url, expected, raw_body.len }) catch {};
-                    _ = std.posix.write(2, fbs.getWritten()) catch {};
+                    if (std.fmt.bufPrint(&buf, "[shu http] body truncated url={s} expected={d} got={d}\n", .{ url, expected, raw_body.len })) |slice|
+                        _ = std.c.write(2, slice.ptr, slice.len)
+                    else |_| {}
                 }
                 debugLogReadFailed(url, error.ReadFailed, "body_truncated");
                 return error.ReadFailed;
@@ -439,7 +448,7 @@ fn requestViaZigWithClient(client: *std.http.Client, allocator: std.mem.Allocato
         body = switch (content_encoding) {
             .identity => try allocator.dupe(u8, raw_body),
             .gzip, .deflate => blk: {
-                var in_reader = std.io.Reader.fixed(raw_body);
+                var in_reader = std.Io.Reader.fixed(raw_body);
                 const container: std.compress.flate.Container = if (content_encoding == .gzip) .gzip else .zlib;
                 var dec = std.compress.flate.Decompress.init(&in_reader, container, &tls_decompress_buf);
                 break :blk file.readReaderUpTo(allocator, &dec.reader, options.max_response_bytes) catch |e| {
@@ -458,7 +467,7 @@ fn requestViaZigWithClient(client: *std.http.Client, allocator: std.mem.Allocato
         }
         if (content_encoding == .identity) {
             const raw_reader = response.reader(&tls_transfer_buf);
-            body = raw_reader.allocRemaining(allocator, std.io.Limit.limited(options.max_response_bytes)) catch |e| {
+            body = raw_reader.allocRemaining(allocator, std.Io.Limit.limited(options.max_response_bytes)) catch |e| {
                 if (e == error.StreamTooLong) {
                     debugLogResponseTooLarge(url, options.max_response_bytes);
                     return error.ResponseTooLarge;
@@ -474,7 +483,7 @@ fn requestViaZigWithClient(client: *std.http.Client, allocator: std.mem.Allocato
         } else {
             var decompress: std.http.Decompress = undefined;
             const dec_reader = response.readerDecompressing(&tls_transfer_buf, &decompress, &tls_decompress_buf);
-            body = dec_reader.allocRemaining(allocator, std.io.Limit.limited(options.max_response_bytes)) catch |e| {
+            body = dec_reader.allocRemaining(allocator, std.Io.Limit.limited(options.max_response_bytes)) catch |e| {
                 if (e == error.StreamTooLong) {
                     debugLogResponseTooLarge(url, options.max_response_bytes);
                     return error.ResponseTooLarge;
@@ -484,11 +493,11 @@ fn requestViaZigWithClient(client: *std.http.Client, allocator: std.mem.Allocato
             };
             if (body.len == 0) {
                 debugLogEmptyRawBody(url, status, content_encoding, content_length);
-                if (std.posix.getenv("SHU_DEBUG_HTTP")) |_| {
+                if (std.c.getenv("SHU_DEBUG_HTTP")) |_| {
                     var buf: [320]u8 = undefined;
-                    var fbs = std.io.fixedBufferStream(&buf);
-                    fbs.writer().print("\n[shu http] chunked stream decompress read 0 bytes, url={s}\n", .{url}) catch {};
-                    _ = std.posix.write(2, fbs.getWritten()) catch {};
+                    if (std.fmt.bufPrint(&buf, "\n[shu http] chunked stream decompress read 0 bytes, url={s}\n", .{url})) |slice|
+                        _ = std.c.write(2, slice.ptr, slice.len)
+                    else |_| {}
                 }
                 debugLogReadFailed(url, error.ReadFailed, "empty_raw_body_chunked");
                 return error.ReadFailed;
@@ -602,9 +611,9 @@ fn decompressResponseBodyIfNeeded(allocator: std.mem.Allocator, resp: *Response)
 }
 
 fn debugLogDecompress(enc: []const u8, before: usize, after: usize) void {
-    if (std.posix.getenv("SHU_DEBUG_HTTP")) |_| {} else return;
+    if (std.c.getenv("SHU_DEBUG_HTTP")) |_| {} else return;
     var buf: [128]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    fbs.writer().print("[shu http] decompress enc={s} before={d} after={d}\n", .{ enc, before, after }) catch return;
-    _ = std.posix.write(2, fbs.getWritten()) catch {};
+    if (std.fmt.bufPrint(&buf, "[shu http] decompress enc={s} before={d} after={d}\n", .{ enc, before, after })) |slice|
+        _ = std.c.write(2, slice.ptr, slice.len)
+    else |_| {}
 }
