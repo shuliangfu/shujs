@@ -1,7 +1,7 @@
-//! Gzip Compression Library for Zig 0.15
+//! Gzip Compression Library for Zig 0.16
 //!
 //! This is a single-file implementation of gzip/deflate compression copied from
-//! the Zig 0.14 standard library, as compression was removed in Zig 0.15.
+//! the Zig 0.14 standard library, as compression was removed in Zig 0.15+.
 //!
 //! Usage:
 //! ```zig
@@ -40,7 +40,7 @@
 //! - Configurable compression levels (fast, default, best)
 //! - Gzip format with proper headers and CRC32 checksums
 //! - All unit and integration tests included
-//! - Uses Zig 0.15's new std.Io.Reader and std.Io.Writer interfaces
+//! - Uses Zig 0.16's std.Io.Reader and std.Io.Writer interfaces
 
 const std = @import("std");
 const assert = std.debug.assert;
