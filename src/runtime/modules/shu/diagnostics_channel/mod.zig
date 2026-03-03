@@ -5,11 +5,12 @@ const std = @import("std");
 const jsc = @import("jsc");
 const common = @import("../../../common.zig");
 const globals = @import("../../../globals.zig");
+const libs_io = @import("libs_io");
 
 /// 单个订阅者：保存 JS 回调的 ctx 与 ref，订阅时 Protect、取消时 Unprotect
 const Subscriber = struct { ctx: jsc.JSContextRef, ref: jsc.JSValueRef };
 
-/// 某命名通道的订阅者列表（Zig 0.15：ArrayList 用 initCapacity/append(allocator, x)）
+/// 某命名通道的订阅者列表（Zig 0.16.0-dev：ArrayList 用 initCapacity/append(allocator, x)）
 const ChannelState = struct {
     subscribers: std.ArrayList(Subscriber),
     fn init(allocator: std.mem.Allocator) ChannelState {
@@ -23,12 +24,13 @@ const ChannelState = struct {
 /// 全局：通道名 -> ChannelState；首次使用时用 globals.current_allocator 初始化
 var g_allocator: ?std.mem.Allocator = null;
 var g_channels: ?std.StringHashMap(ChannelState) = null;
-var g_lock: std.Thread.Mutex = .{};
+var g_lock: std.Io.Mutex = .{ .state = std.atomic.Value(std.Io.Mutex.State).init(.unlocked) };
 
 fn ensureChannels() ?std.mem.Allocator {
     const allocator = globals.current_allocator orelse return null;
-    g_lock.lock();
-    defer g_lock.unlock();
+    const io = libs_io.getProcessIo() orelse return null;
+    g_lock.lock(io) catch return null;
+    defer g_lock.unlock(io);
     if (g_channels == null) {
         g_allocator = allocator;
         g_channels = std.StringHashMap(ChannelState).init(allocator);
@@ -74,14 +76,15 @@ fn channelCallback(
 ) callconv(.c) jsc.JSValueRef {
     if (argumentCount < 1) return jsc.JSValueMakeUndefined(ctx);
     const allocator = ensureChannels() orelse return jsc.JSValueMakeUndefined(ctx);
+    const io = libs_io.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
     const name = getNameFromArg(allocator, ctx, arguments[0]) orelse return jsc.JSValueMakeUndefined(ctx);
     defer allocator.free(name);
     const key = allocator.dupe(u8, name) catch return jsc.JSValueMakeUndefined(ctx);
-    g_lock.lock();
+    g_lock.lock(io) catch return jsc.JSValueMakeUndefined(ctx);
     var channels = g_channels.?;
     const gop = channels.getOrPut(key) catch {
         allocator.free(key);
-        g_lock.unlock();
+        g_lock.unlock(io);
         return jsc.JSValueMakeUndefined(ctx);
     };
     if (!gop.found_existing) {
@@ -89,7 +92,7 @@ fn channelCallback(
     } else {
         allocator.free(key);
     }
-    g_lock.unlock();
+    g_lock.unlock(io);
     const channel_obj = jsc.JSObjectMake(ctx, null, null);
     const k_priv = jsc.JSStringCreateWithUTF8CString("__name");
     defer jsc.JSStringRelease(k_priv);
@@ -112,17 +115,18 @@ fn subscribeCallback(
 ) callconv(.c) jsc.JSValueRef {
     if (argumentCount < 2) return jsc.JSValueMakeUndefined(ctx);
     const allocator = ensureChannels() orelse return jsc.JSValueMakeUndefined(ctx);
+    const io = libs_io.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
     const name = getNameFromArg(allocator, ctx, arguments[0]) orelse return jsc.JSValueMakeUndefined(ctx);
     defer allocator.free(name);
     const on_message = arguments[1];
     const on_obj = jsc.JSValueToObject(ctx, on_message, null) orelse return jsc.JSValueMakeUndefined(ctx);
     if (!jsc.JSObjectIsFunction(ctx, on_obj)) return jsc.JSValueMakeUndefined(ctx);
     const key = allocator.dupe(u8, name) catch return jsc.JSValueMakeUndefined(ctx);
-    g_lock.lock();
+    g_lock.lock(io) catch return jsc.JSValueMakeUndefined(ctx);
     var channels = g_channels.?;
     const gop = channels.getOrPut(key) catch {
         allocator.free(key);
-        g_lock.unlock();
+        g_lock.unlock(io);
         return jsc.JSValueMakeUndefined(ctx);
     };
     if (!gop.found_existing) {
@@ -131,11 +135,11 @@ fn subscribeCallback(
         allocator.free(key);
     }
     gop.value_ptr.subscribers.append(allocator, .{ .ctx = ctx, .ref = on_message }) catch {
-        g_lock.unlock();
+        g_lock.unlock(io);
         return jsc.JSValueMakeUndefined(ctx);
     };
     jsc.JSValueProtect(ctx, on_message);
-    g_lock.unlock();
+    g_lock.unlock(io);
     return jsc.JSValueMakeUndefined(ctx);
 }
 
@@ -150,10 +154,11 @@ fn unsubscribeCallback(
 ) callconv(.c) jsc.JSValueRef {
     if (argumentCount < 2) return jsc.JSValueMakeUndefined(ctx);
     const allocator = ensureChannels() orelse return jsc.JSValueMakeUndefined(ctx);
+    const io = libs_io.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
     const name = getNameFromArg(allocator, ctx, arguments[0]) orelse return jsc.JSValueMakeUndefined(ctx);
     defer allocator.free(name);
     const on_message = arguments[1];
-    g_lock.lock();
+    g_lock.lock(io) catch return jsc.JSValueMakeUndefined(ctx);
     if (g_channels) |*channels| {
         if (channels.getPtr(name)) |state| {
             var i: usize = 0;
@@ -167,7 +172,7 @@ fn unsubscribeCallback(
             }
         }
     }
-    g_lock.unlock();
+    g_lock.unlock(io);
     return jsc.JSValueMakeUndefined(ctx);
 }
 
@@ -182,13 +187,14 @@ fn hasSubscribersCallback(
 ) callconv(.c) jsc.JSValueRef {
     if (argumentCount < 1) return jsc.JSValueMakeBoolean(ctx, false);
     const allocator = ensureChannels() orelse return jsc.JSValueMakeBoolean(ctx, false);
+    const io = libs_io.getProcessIo() orelse return jsc.JSValueMakeBoolean(ctx, false);
     const name = getNameFromArg(allocator, ctx, arguments[0]) orelse return jsc.JSValueMakeBoolean(ctx, false);
     defer allocator.free(name);
-    g_lock.lock();
+    g_lock.lock(io) catch return jsc.JSValueMakeBoolean(ctx, false);
     const has = if (g_channels) |*channels| blk: {
         break :blk if (channels.get(name)) |state| state.subscribers.items.len > 0 else false;
     } else false;
-    g_lock.unlock();
+    g_lock.unlock(io);
     return jsc.JSValueMakeBoolean(ctx, has);
 }
 
@@ -203,22 +209,23 @@ fn channelSubscribeCallback(
 ) callconv(.c) jsc.JSValueRef {
     if (argumentCount < 1) return jsc.JSValueMakeUndefined(ctx);
     const allocator = ensureChannels() orelse return jsc.JSValueMakeUndefined(ctx);
+    const io = libs_io.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
     const name = getChannelNameFromThis(allocator, ctx, this_obj) orelse return jsc.JSValueMakeUndefined(ctx);
     defer allocator.free(name);
     const on_message = arguments[0];
     const on_obj = jsc.JSValueToObject(ctx, on_message, null) orelse return jsc.JSValueMakeUndefined(ctx);
     if (!jsc.JSObjectIsFunction(ctx, on_obj)) return jsc.JSValueMakeUndefined(ctx);
-    g_lock.lock();
+    g_lock.lock(io) catch return jsc.JSValueMakeUndefined(ctx);
     if (g_channels) |*channels| {
         if (channels.getPtr(name)) |state| {
             state.subscribers.append(allocator, .{ .ctx = ctx, .ref = on_message }) catch {
-                g_lock.unlock();
+                g_lock.unlock(io);
                 return jsc.JSValueMakeUndefined(ctx);
             };
             jsc.JSValueProtect(ctx, on_message);
         }
     }
-    g_lock.unlock();
+    g_lock.unlock(io);
     return jsc.JSValueMakeUndefined(ctx);
 }
 
@@ -233,10 +240,11 @@ fn channelUnsubscribeCallback(
 ) callconv(.c) jsc.JSValueRef {
     if (argumentCount < 1) return jsc.JSValueMakeUndefined(ctx);
     const allocator = ensureChannels() orelse return jsc.JSValueMakeUndefined(ctx);
+    const io = libs_io.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
     const name = getChannelNameFromThis(allocator, ctx, this_obj) orelse return jsc.JSValueMakeUndefined(ctx);
     defer allocator.free(name);
     const on_message = arguments[0];
-    g_lock.lock();
+    g_lock.lock(io) catch return jsc.JSValueMakeUndefined(ctx);
     if (g_channels) |*channels| {
         if (channels.getPtr(name)) |state| {
             var i: usize = 0;
@@ -250,7 +258,7 @@ fn channelUnsubscribeCallback(
             }
         }
     }
-    g_lock.unlock();
+    g_lock.unlock(io);
     return jsc.JSValueMakeUndefined(ctx);
 }
 
@@ -264,29 +272,30 @@ fn channelPublishCallback(
     _: [*]jsc.JSValueRef,
 ) callconv(.c) jsc.JSValueRef {
     const allocator = ensureChannels() orelse return jsc.JSValueMakeUndefined(ctx);
+    const io = libs_io.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
     const name = getChannelNameFromThis(allocator, ctx, this_obj) orelse return jsc.JSValueMakeUndefined(ctx);
     defer allocator.free(name);
     const message = if (argumentCount >= 1) arguments[0] else jsc.JSValueMakeUndefined(ctx);
     const name_js = jsc.JSStringCreateWithUTF8CString(name.ptr);
     defer jsc.JSStringRelease(name_js);
     const name_val = jsc.JSValueMakeString(ctx, name_js);
-    g_lock.lock();
+    g_lock.lock(io) catch return jsc.JSValueMakeUndefined(ctx);
     const list = if (g_channels) |*channels| blk: {
         const state = channels.getPtr(name) orelse {
-            g_lock.unlock();
+            g_lock.unlock(io);
             return jsc.JSValueMakeUndefined(ctx);
         };
         break :blk state.subscribers.items;
     } else {
-        g_lock.unlock();
+        g_lock.unlock(io);
         return jsc.JSValueMakeUndefined(ctx);
     };
     const copy = allocator.dupe(Subscriber, list) catch {
-        g_lock.unlock();
+        g_lock.unlock(io);
         return jsc.JSValueMakeUndefined(ctx);
     };
     defer allocator.free(copy);
-    g_lock.unlock();
+    g_lock.unlock(io);
     for (copy) |sub| {
         var args = [_]jsc.JSValueRef{ message, name_val };
         _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(sub.ref), this_obj, 2, &args, null);
@@ -304,13 +313,14 @@ fn channelHasSubscribersCallback(
     _: [*]jsc.JSValueRef,
 ) callconv(.c) jsc.JSValueRef {
     const allocator = ensureChannels() orelse return jsc.JSValueMakeBoolean(ctx, false);
+    const io = libs_io.getProcessIo() orelse return jsc.JSValueMakeBoolean(ctx, false);
     const name = getChannelNameFromThis(allocator, ctx, this_obj) orelse return jsc.JSValueMakeBoolean(ctx, false);
     defer allocator.free(name);
-    g_lock.lock();
+    g_lock.lock(io) catch return jsc.JSValueMakeBoolean(ctx, false);
     const has = if (g_channels) |*channels| blk: {
         break :blk if (channels.get(name)) |state| state.subscribers.items.len > 0 else false;
     } else false;
-    g_lock.unlock();
+    g_lock.unlock(io);
     return jsc.JSValueMakeBoolean(ctx, has);
 }
 
