@@ -6,10 +6,12 @@
 const std = @import("std");
 const jsc = @import("jsc");
 const globals = @import("../../../globals.zig");
-const errors = @import("../../../../errors.zig");
+const errors = @import("errors");
+const libs_process = @import("libs_process");
 const node_builtin = @import("../../node/builtin.zig");
 const shu_builtin = @import("../builtin.zig");
 const pkg_resolver = @import("../../../../package/resolver.zig");
+const libs_io = @import("libs_io");
 
 /// 单次 run 的模块缓存：resolved_path -> 已保护的 exports 值（避免 GC）；allocator 由 initCache(allocator) 调用方传入，put/clear 等由各回调的 globals.current_allocator 或参数提供（§1.1 不持全局 allocator）
 var g_cache: ?*std.StringHashMap(CacheEntry) = null;
@@ -198,15 +200,16 @@ pub fn resolveSpecifierForPackageJson(allocator: std.mem.Allocator, base_path: [
     if (specifier[0] == '.' or std.fs.path.isAbsolute(specifier)) {
         return std.fs.path.resolve(allocator, &.{ parent_dir, specifier }) catch return null;
     }
-    // 裸说明符：从 parent_dir 向上查找 node_modules/<specifier> 目录
+    // 裸说明符：从 parent_dir 向上查找 node_modules/<specifier> 目录。Zig 0.16：libs_io.openDirAbsolute、dir.close(io)、openDir(io, name, .{})。
+    const io = libs_process.getProcessIo() orelse return null;
     var dir = allocator.dupe(u8, parent_dir) catch return null;
     defer allocator.free(dir);
     while (true) {
         const nm_path = std.fs.path.join(allocator, &.{ dir, "node_modules", specifier }) catch return null;
         defer allocator.free(nm_path);
-        var dir_handle = std.fs.openDirAbsolute(dir, .{}) catch break;
-        defer dir_handle.close();
-        var nm_handle = dir_handle.openDir("node_modules", .{}) catch {
+        var dir_handle = libs_io.openDirAbsolute(dir, .{}) catch break;
+        defer dir_handle.close(io);
+        var nm_handle = dir_handle.openDir(io, "node_modules", .{}) catch {
             const parent = std.fs.path.dirname(dir) orelse break;
             if (std.mem.eql(u8, parent, dir)) break;
             const new_dir = allocator.dupe(u8, parent) catch break;
@@ -214,8 +217,8 @@ pub fn resolveSpecifierForPackageJson(allocator: std.mem.Allocator, base_path: [
             dir = new_dir;
             continue;
         };
-        defer nm_handle.close();
-        var sub = nm_handle.openDir(specifier, .{}) catch {
+        defer nm_handle.close(io);
+        var sub = nm_handle.openDir(io, specifier, .{}) catch {
             const parent = std.fs.path.dirname(dir) orelse break;
             if (std.mem.eql(u8, parent, dir)) break;
             const new_dir = allocator.dupe(u8, parent) catch break;
@@ -223,7 +226,7 @@ pub fn resolveSpecifierForPackageJson(allocator: std.mem.Allocator, base_path: [
             dir = new_dir;
             continue;
         };
-        sub.close();
+        sub.close(io);
         return std.fs.path.resolve(allocator, &.{nm_path}) catch return null;
     }
     return null;
@@ -261,14 +264,17 @@ fn resolveId(allocator: std.mem.Allocator, parent_dir: []const u8, id: []const u
 }
 
 fn readFileContent(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-    const file = std.fs.openFileAbsolute(path, .{}) catch |e| {
+    const io = libs_process.getProcessIo() orelse return error.ProcessIoNotSet;
+    const file = libs_io.openFileAbsolute(path, .{}) catch |e| {
         var msg_buf: [512]u8 = undefined;
         const msg = std.fmt.bufPrintZ(&msg_buf, "Cannot find module: {s}", .{path}) catch "Cannot find module";
         errors.reportToStderr(.{ .code = .file_not_found, .message = msg }) catch {};
         return e;
     };
-    defer file.close();
-    return file.readToEndAlloc(allocator, std.math.maxInt(usize));
+    defer file.close(io);
+    var read_buf: [4096]u8 = undefined;
+    var file_reader = file.reader(io, read_buf[0..]);
+    return file_reader.interface.allocRemaining(allocator, std.Io.Limit.unlimited);
 }
 
 /// 创建供模块使用的 require 函数，并设置 __parentPath = parent_dir；同时挂载 .resolve(request) 方法，与 node:module 兼容
