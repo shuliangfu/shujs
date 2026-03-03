@@ -51,10 +51,6 @@ const cli_help = @import("cli/help.zig");
 
 /// CLI 入口：解析子命令与全局选项，分发到各子命令（含文档「还可实现的命令」占位）
 pub fn main() !void {
-    // 进程级 libcurl 初始化只做一次，避免 install/fetch 等路径每次请求都 curl_global_init（SSL/协议表开销大且非线程安全）
-    const io_core = @import("io_core");
-    io_core.http.ensureCurlGlobalInit();
-
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
