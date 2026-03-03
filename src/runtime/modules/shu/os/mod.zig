@@ -64,11 +64,11 @@ fn homedirCallback(
 ) callconv(.c) jsc.JSValueRef {
     const allocator = globals.current_allocator orelse return jsc.JSValueMakeString(ctx, jsc.JSStringCreateWithUTF8CString(""));
     const home = if (builtin.os.tag == .windows)
-        std.posix.getenv("USERPROFILE") orelse std.posix.getenv("HOMEPATH")
+        std.c.getenv("USERPROFILE") orelse std.c.getenv("HOMEPATH")
     else
-        std.posix.getenv("HOME");
+        std.c.getenv("HOME");
     const s = home orelse "/";
-    const z = allocator.dupeZ(u8, s) catch return jsc.JSValueMakeString(ctx, jsc.JSStringCreateWithUTF8CString("/"));
+    const z = allocator.dupeZ(u8, std.mem.span(s)) catch return jsc.JSValueMakeString(ctx, jsc.JSStringCreateWithUTF8CString("/"));
     defer allocator.free(z);
     const ref = jsc.JSStringCreateWithUTF8CString(z.ptr);
     return jsc.JSValueMakeString(ctx, ref);
@@ -85,12 +85,12 @@ fn tmpdirCallback(
 ) callconv(.c) jsc.JSValueRef {
     const allocator = globals.current_allocator orelse return jsc.JSValueMakeString(ctx, jsc.JSStringCreateWithUTF8CString("/tmp"));
     const tmp = if (builtin.os.tag == .windows) blk: {
-        const t = std.posix.getenv("TEMP") orelse std.posix.getenv("TMP") orelse "C:\\Windows\\Temp";
+        const t = std.c.getenv("TEMP") orelse std.c.getenv("TMP") orelse "C:\\Windows\\Temp";
         break :blk t;
     } else blk: {
-        break :blk std.posix.getenv("TMPDIR") orelse "/tmp";
+        break :blk std.c.getenv("TMPDIR") orelse "/tmp";
     };
-    const z = allocator.dupeZ(u8, tmp) catch return jsc.JSValueMakeString(ctx, jsc.JSStringCreateWithUTF8CString("/tmp"));
+    const z = allocator.dupeZ(u8, std.mem.span(tmp)) catch return jsc.JSValueMakeString(ctx, jsc.JSStringCreateWithUTF8CString("/tmp"));
     defer allocator.free(z);
     const ref = jsc.JSStringCreateWithUTF8CString(z.ptr);
     return jsc.JSValueMakeString(ctx, ref);
