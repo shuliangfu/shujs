@@ -66,8 +66,8 @@ pub const Completion = struct {
     buffer_ptr: [*]const u8,
     len: usize,
     err: ?SendFileError = null,
-    /// 新连接时由 backend 填入，调用方负责关闭
-    client_stream: ?std.net.Stream = null,
+    /// 新连接时由 backend 填入，调用方负责关闭。Zig 0.16：std.net → std.Io.net
+    client_stream: ?std.Io.net.Stream = null,
     /// 完成类型：accept / recv / send / file_read / file_write
     tag: CompletionTag = .accept,
     /// recv 完成时：数据所在池块索引，用毕须调用 HighPerfIO.releaseChunk；accept/send 时为 null
