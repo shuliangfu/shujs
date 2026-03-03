@@ -1,26 +1,33 @@
 // Node 式 fork IPC：length-prefix 协议（4 字节大端长度 + 消息体）
 // 父子进程通过 stdin/stdout 收发 JSON 字符串
+// 0.16：使用 std.Io + File.reader/File.writer 的 readVec/writeVec
 
 const std = @import("std");
 
 /// 单条消息最大长度（避免恶意子进程发巨大包）
 const max_message_len: u32 = 1024 * 1024;
 
-/// 将一条消息按协议写入 stream（4 字节大端长度 + body）；stream 需实现 writeAll(buf) !void
-pub fn writeMessage(stream: anytype, msg: []const u8) !void {
+/// 将一条消息按协议写入 file（4 字节大端长度 + body）。调用方需传入 io（如 libs_process.getProcessIo()）。
+pub fn writeMessage(io: std.Io, file: std.Io.File, msg: []const u8) !void {
     if (msg.len > max_message_len) return error.MessageTooLong;
     var len_buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &len_buf, @intCast(msg.len), .big);
-    try stream.writeAll(&len_buf);
-    try stream.writeAll(msg);
+    var wbuf: [512]u8 = undefined;
+    var w = file.writer(io, &wbuf);
+    _ = try std.Io.Writer.writeVec(&w.interface, &.{&len_buf});
+    _ = try std.Io.Writer.writeVec(&w.interface, &.{msg});
+    try w.interface.flush();
 }
 
-/// 从 stream 读一条消息；stream 需实现 read(buf) !usize；返回的切片由调用方 free；EOF 或错误时返回 null
-pub fn readMessage(allocator: std.mem.Allocator, stream: anytype) !?[]u8 {
+/// 从 file 读一条消息；返回的切片由调用方 free；EOF 或错误时返回 null。调用方需传入 io。
+pub fn readMessage(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File) !?[]u8 {
+    var rbuf: [512]u8 = undefined;
+    var r = file.reader(io, &rbuf);
     var len_buf: [4]u8 = undefined;
     var got: usize = 0;
     while (got < 4) {
-        const n = stream.read(len_buf[got..]) catch return null;
+        var dest: [1][]u8 = .{len_buf[got..]};
+        const n = std.Io.Reader.readVec(&r.interface, &dest) catch return null;
         if (n == 0) return null;
         got += n;
     }
@@ -30,7 +37,8 @@ pub fn readMessage(allocator: std.mem.Allocator, stream: anytype) !?[]u8 {
     errdefer allocator.free(buf);
     got = 0;
     while (got < len) {
-        const n = stream.read(buf[got..]) catch {
+        var dest: [1][]u8 = .{buf[got..]};
+        const n = std.Io.Reader.readVec(&r.interface, &dest) catch {
             allocator.free(buf);
             return null;
         };
