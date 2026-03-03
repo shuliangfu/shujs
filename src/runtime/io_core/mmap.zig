@@ -120,30 +120,42 @@ pub fn mapFileReadWrite(path: []const u8) !MappedFileWritable {
 
 const posix = std.posix;
 
+/// Zig 0.16：std.fs.openFileAbsolute 已迁移，此处用 posix.openat 取得 fd 供 mmap。Darwin 上 posix.O 来自 std.c 无 RDONLY 成员，用数值。
 fn mapFileReadOnlyPosix(path: []const u8) !MappedFile {
-    const file = std.fs.openFileAbsolute(path, .{ .mode = .read_only }) catch |e| switch (e) {
+    if (path.len >= std.Io.Dir.max_path_bytes) return error.NameTooLong;
+    var path_z: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
+    const o_rdonly: posix.O = switch (builtin.os.tag) {
+        .linux => posix.O.RDONLY,
+        else => @bitCast(@as(u32, 0)), // O_RDONLY on Darwin/BSD；posix.O 为 packed struct(u32)
+    };
+    const fd = posix.openat(posix.AT.FDCWD, path_z[0..path.len], o_rdonly, 0) catch |e| switch (e) {
         error.FileNotFound => return error.FileNotFound,
         error.AccessDenied => return error.AccessDenied,
         else => return e,
     };
-    defer file.close();
-    const stat = file.stat() catch return error.FileRead;
-    if (stat.kind != .file) return error.NotAFile;
-    const size = stat.size;
+    defer _ = std.c.close(fd);
+    var stat: std.c.Stat = undefined;
+    if (std.c.fstat(fd, &stat) != 0) return error.FileRead;
+    const mode = if (builtin.os.tag == .linux) stat.st_mode else stat.mode;
+    if (mode & std.c.S.IFMT != std.c.S.IFREG) return error.NotAFile;
+    const size = if (builtin.os.tag == .linux) stat.st_size else stat.size;
     if (size == 0) {
         const empty: [0]u8 = .{};
         return .{ .ptr = @alignCast(empty[0..].ptr), .len = 0, .mapping_handle = null };
     }
     const len: usize = @intCast(size);
+    const prot_read: posix.PROT = if (builtin.os.tag == .linux) posix.PROT.READ else @bitCast(@as(c_int, 1)); // Darwin: PROT_READ=1
     const ptr = if (builtin.os.tag == .linux)
-        try mapFileLinux(file.handle, len, false)
+        try mapFileLinux(fd, len, false)
     else
         try posix.mmap(
             null,
             len,
-            posix.PROT.READ,
+            prot_read,
             .{ .TYPE = .PRIVATE },
-            file.handle,
+            fd,
             0,
         );
     adviseSequential(@ptrCast(ptr.ptr), ptr.len);
@@ -153,31 +165,42 @@ fn mapFileReadOnlyPosix(path: []const u8) !MappedFile {
     return .{ .ptr = @ptrCast(ptr.ptr), .len = ptr.len, .mapping_handle = null };
 }
 
-/// 可写映射：PROT_READ | PROT_WRITE + MAP_SHARED，写入会持久化到文件
+/// 可写映射：PROT_READ | PROT_WRITE + MAP_SHARED，写入会持久化到文件。Zig 0.16 用 posix.openat；Darwin 用数值 O_RDWR。
 fn mapFileReadWritePosix(path: []const u8) !MappedFileWritable {
-    const file = std.fs.openFileAbsolute(path, .{ .mode = .read_write }) catch |e| switch (e) {
+    if (path.len >= std.Io.Dir.max_path_bytes) return error.NameTooLong;
+    var path_z: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
+    const o_rdwr: posix.O = switch (builtin.os.tag) {
+        .linux => posix.O.RDWR,
+        else => @bitCast(@as(u32, 2)), // O_RDWR on Darwin/BSD；posix.O 为 packed struct(u32)
+    };
+    const fd = posix.openat(posix.AT.FDCWD, path_z[0..path.len], o_rdwr, 0) catch |e| switch (e) {
         error.FileNotFound => return error.FileNotFound,
         error.AccessDenied => return error.AccessDenied,
         else => return e,
     };
-    defer file.close();
-    const stat = file.stat() catch return error.FileRead;
-    if (stat.kind != .file) return error.NotAFile;
-    const size = stat.size;
-    if (size == 0) {
+    defer _ = std.c.close(fd);
+    var stat: std.c.Stat = undefined;
+    if (std.c.fstat(fd, &stat) != 0) return error.FileRead;
+    const mode_rw = if (builtin.os.tag == .linux) stat.st_mode else stat.mode;
+    if (mode_rw & std.c.S.IFMT != std.c.S.IFREG) return error.NotAFile;
+    const size_rw = if (builtin.os.tag == .linux) stat.st_size else stat.size;
+    if (size_rw == 0) {
         var empty: [0]u8 = .{};
         return .{ .ptr = @alignCast(empty[0..].ptr), .len = 0, .mapping_handle = null };
     }
-    const len: usize = @intCast(size);
+    const len: usize = @intCast(size_rw);
+    const prot_rw: posix.PROT = if (builtin.os.tag == .linux) posix.PROT.READ | posix.PROT.WRITE else @bitCast(@as(c_int, 1 | 2)); // Darwin: PROT_READ=1, PROT_WRITE=2
     const ptr = if (builtin.os.tag == .linux)
-        try mapFileLinux(file.handle, len, true)
+        try mapFileLinux(fd, len, true)
     else
         try posix.mmap(
             null,
             len,
-            posix.PROT.READ | posix.PROT.WRITE,
+            prot_rw,
             .{ .TYPE = .SHARED },
-            file.handle,
+            fd,
             0,
         );
     adviseSequential(@ptrCast(ptr.ptr), ptr.len);
