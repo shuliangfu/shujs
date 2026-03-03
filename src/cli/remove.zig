@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const args = @import("args.zig");
+const version = @import("version.zig");
 const manifest = @import("../package/manifest.zig");
 const pkg_install = @import("../package/install.zig");
 
@@ -10,18 +11,19 @@ const pkg_install = @import("../package/install.zig");
 pub fn remove(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional: []const []const u8) !void {
     _ = parsed;
     if (positional.len == 0) {
-        try printToStdout("shu remove: no package name given. Usage: shu remove <name> [name...]\n", .{});
+        try printToStdout("shu remove: no package name given. Usage: shu remove <name> [name...]  e.g. shu remove <name>  shu remove <name> <name>...\n", .{});
         return;
     }
+    try version.printCommandHeader("remove");
     var cwd_buf: [1024]u8 = undefined;
     const cwd = std.posix.getcwd(&cwd_buf) catch return error.CwdFailed;
     const cwd_owned = allocator.dupe(u8, cwd) catch return error.OutOfMemory;
     defer allocator.free(cwd_owned);
 
     for (positional) |name| {
-        manifest.removePackageDependency(allocator, cwd_owned, name) catch |e| {
+        const removed = manifest.removePackageDependency(allocator, cwd_owned, name) catch |e| {
             if (e == error.ManifestNotFound) {
-                try printToStdout("shu remove: no package.json or package.jsonc in current directory\n", .{});
+                try printToStdout("shu remove: no manifest (package.json or deno.json) in current directory\n", .{});
                 return e;
             }
             if (e == error.InvalidPackageJson) {
@@ -30,12 +32,16 @@ pub fn remove(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional:
             }
             return e;
         };
+        if (removed) {
+            try printToStdout("Removed {s}\n", .{name});
+        }
     }
 
-    pkg_install.install(allocator, cwd_owned, null, null) catch |e| {
+    pkg_install.install(allocator, cwd_owned, null, null, null) catch |e| {
         if (e == error.NoManifest) {}
         return e;
     };
+    try printToStdout("\n", .{});
 }
 
 fn printToStdout(comptime fmt: []const u8, fargs: anytype) !void {
