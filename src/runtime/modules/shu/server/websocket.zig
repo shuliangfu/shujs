@@ -71,8 +71,24 @@ pub fn computeAcceptKey(key: []const u8) ![28]u8 {
     return out;
 }
 
-/// 发送 101 Switching Protocols 与 Sec-WebSocket-Accept，完成握手
+/// 发送 101 Switching Protocols 与 Sec-WebSocket-Accept，完成握手。0.16：*std.Io.net.Stream 用 writer+writeVec
 pub fn sendHandshake(stream: anytype, accept_key: [28]u8) !void {
+    if (@TypeOf(stream) == *std.Io.net.Stream) {
+        const libs_process = @import("libs_process");
+        const io = libs_process.getProcessIo() orelse return error.NoProcessIo;
+        var wbuf: [512]u8 = undefined;
+        var w = stream.writer(io, &wbuf);
+        _ = std.Io.Writer.writeVec(&w.interface, &.{
+            "HTTP/1.1 101 Switching Protocols\r\n",
+            "Upgrade: websocket\r\n",
+            "Connection: Upgrade\r\n",
+            "Sec-WebSocket-Accept: ",
+            &accept_key,
+            "\r\n\r\n",
+        }) catch return;
+        try w.interface.flush();
+        return;
+    }
     try stream.writeAll("HTTP/1.1 101 Switching Protocols\r\n");
     try stream.writeAll("Upgrade: websocket\r\n");
     try stream.writeAll("Connection: Upgrade\r\n");
