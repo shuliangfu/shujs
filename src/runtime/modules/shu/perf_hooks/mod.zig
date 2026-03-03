@@ -54,6 +54,8 @@
 const std = @import("std");
 const jsc = @import("jsc");
 const common = @import("../../../common.zig");
+const errors = @import("errors");
+const libs_process = @import("libs_process");
 const globals = @import("../../../globals.zig");
 
 /// 条目类型：mark、measure、function（timerify 产生）
@@ -81,7 +83,14 @@ const PERF_ENTRIES_INIT_CAP = 64;
 pub fn initPerfStore(allocator: std.mem.Allocator) void {
     if (g_perf_init) return;
     g_perf_alloc = allocator;
-    const ns = std.time.nanoTimestamp();
+    const io = libs_process.getProcessIo() orelse {
+        g_time_origin = 0;
+        g_marks = std.StringHashMap(f64).init(g_perf_alloc);
+        g_entries = std.ArrayList(PerfEntry).initCapacity(g_perf_alloc, PERF_ENTRIES_INIT_CAP) catch unreachable;
+        g_perf_init = true;
+        return;
+    };
+    const ns = std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds;
     g_time_origin = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
     g_marks = std.StringHashMap(f64).init(g_perf_alloc);
     g_entries = std.ArrayList(PerfEntry).initCapacity(g_perf_alloc, PERF_ENTRIES_INIT_CAP) catch unreachable;
@@ -91,7 +100,14 @@ pub fn initPerfStore(allocator: std.mem.Allocator) void {
 fn ensurePerfStore() void {
     if (g_perf_init) return;
     g_perf_alloc = globals.current_allocator orelse std.heap.page_allocator;
-    const ns = std.time.nanoTimestamp();
+    const io = libs_process.getProcessIo() orelse {
+        g_time_origin = 0;
+        g_marks = std.StringHashMap(f64).init(g_perf_alloc);
+        g_entries = std.ArrayList(PerfEntry).initCapacity(g_perf_alloc, PERF_ENTRIES_INIT_CAP) catch unreachable;
+        g_perf_init = true;
+        return;
+    };
+    const ns = std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds;
     g_time_origin = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
     g_marks = std.StringHashMap(f64).init(g_perf_alloc);
     g_entries = std.ArrayList(PerfEntry).initCapacity(g_perf_alloc, PERF_ENTRIES_INIT_CAP) catch unreachable;
@@ -100,7 +116,8 @@ fn ensurePerfStore() void {
 
 /// 将当前时间以毫秒返回（高精度，单调）
 fn nowMs() f64 {
-    const ns = std.time.nanoTimestamp();
+    const io = libs_process.getProcessIo() orelse return 0;
+    const ns = std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds;
     return @as(f64, @floatFromInt(ns)) / 1_000_000.0;
 }
 
