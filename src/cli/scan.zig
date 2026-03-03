@@ -13,7 +13,7 @@
 //!   - 目录遍历经 io_core（openDirAbsolute 等）；不分配多余内存，路径在递归中按需拼接。
 
 const std = @import("std");
-const io_core = @import("io_core");
+const libs_io = @import("libs_io");
 
 /// 默认排除的目录名（lint/fmt 全项目扫描、test 在 tests/ 下扫描时均跳过这些目录）。
 /// 与 deno/npm 惯例一致：依赖、构建产物、缓存、版本控制、覆盖率等。
@@ -53,7 +53,7 @@ pub fn hasExtension(path: []const u8, extensions: []const []const u8) bool {
 
 /// 递归收集 root_abs 目录下所有相对路径文件，扩展名在 extensions 中且不进入排除目录。
 /// 返回的 ArrayList 中每项为相对 root_abs 的路径，由调用方 deinit(allocator) 并 free 各 item。
-/// 使用 io_core 做目录打开与遍历（§3.0）。
+/// 使用 io_core 做目录打开与遍历（§3.0）。Zig 0.16：dir.close(io)、iter.next(io) 需传入 io。
 fn collectFilesRecursiveImpl(
     allocator: std.mem.Allocator,
     root_abs: []const u8,
@@ -61,11 +61,12 @@ fn collectFilesRecursiveImpl(
     prefix: []const u8,
     extensions: []const []const u8,
     list: *std.ArrayList([]const u8),
+    io: std.Io,
 ) !void {
-    var dir = io_core.openDirAbsolute(dir_abs, .{ .iterate = true }) catch return;
-    defer dir.close();
+    var dir = libs_io.openDirAbsolute(dir_abs, .{ .iterate = true }) catch return;
+    defer dir.close(io);
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(io)) |entry| {
         const name = entry.name;
         if (name.len == 0 or name[0] == '.') {
             // 跳过 "." ".." 及以 . 开头的隐藏目录（如 .git 已由 isExcludedDir 覆盖，此处可跳过 . 与 ..）
@@ -80,9 +81,9 @@ fn collectFilesRecursiveImpl(
         switch (entry.kind) {
             .directory => {
                 if (isExcludedDir(name)) continue;
-                const sub_abs = try io_core.pathJoin(allocator, &.{ dir_abs, name });
+                const sub_abs = try libs_io.pathJoin(allocator, &.{ dir_abs, name });
                 defer allocator.free(sub_abs);
-                try collectFilesRecursiveImpl(allocator, root_abs, sub_abs, rel, extensions, list);
+                try collectFilesRecursiveImpl(allocator, root_abs, sub_abs, rel, extensions, list, io);
             },
             .file => {
                 if (hasExtension(name, extensions)) {
@@ -96,14 +97,15 @@ fn collectFilesRecursiveImpl(
 }
 
 /// 从根目录 root_abs 递归收集所有扩展名在 extensions 中的文件相对路径。
-/// 返回的 ArrayList 由调用方 deinit(allocator) 并 free 各 item。
+/// 返回的 ArrayList 由调用方 deinit(allocator) 并 free 各 item。io 用于目录遍历（0.16）。
 pub fn collectFilesRecursive(
     allocator: std.mem.Allocator,
     root_abs: []const u8,
     extensions: []const []const u8,
+    io: std.Io,
 ) !std.ArrayList([]const u8) {
     var list = try std.ArrayList([]const u8).initCapacity(allocator, 64);
-    try collectFilesRecursiveImpl(allocator, root_abs, root_abs, "", extensions, &list);
+    try collectFilesRecursiveImpl(allocator, root_abs, root_abs, "", extensions, &list, io);
     return list;
 }
 
