@@ -3,22 +3,25 @@
 
 const std = @import("std");
 const jsc = @import("jsc");
+const errors = @import("errors");
+const libs_process = @import("libs_process");
 const ipc = @import("ipc.zig");
 const common = @import("../../../common.zig");
 const system_allocator = @import("allocator.zig");
 
-/// 子进程侧状态：stdin 读线程 + 消息队列
+/// 子进程侧状态：stdin 读线程 + 消息队列。0.16：Io.Mutex
 pub const ForkChildState = struct {
     queue: std.ArrayList([]u8),
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex,
     allocator: std.mem.Allocator,
     reader_thread: std.Thread,
 
-    /// 释放队列与线程；调用方在进程退出前调用
+    /// 释放队列与线程；调用方在进程退出前调用。0.16：mutex 需 io
     pub fn deinit(self: *ForkChildState) void {
         self.reader_thread.join();
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        const io = libs_process.getProcessIo() orelse return;
+        self.mutex.lock(io) catch return;
+        defer self.mutex.unlock(io);
         for (self.queue.items) |s| self.allocator.free(s);
         self.queue.deinit(self.allocator);
     }
@@ -26,33 +29,35 @@ pub const ForkChildState = struct {
 
 /// 从 stdin 读消息并推入 queue 的线程
 fn forkChildReaderThread(state: *ForkChildState) void {
-    var stdin_file = std.fs.File.stdin();
+    const io = libs_process.getProcessIo() orelse return;
+    const stdin_file = std.Io.File.stdin();
     while (true) {
-        const msg = ipc.readMessage(state.allocator, &stdin_file) catch break;
+        const msg = ipc.readMessage(state.allocator, io, stdin_file) catch break;
         const m = msg orelse break;
-        state.mutex.lock();
+        state.mutex.lock(io) catch break;
         state.queue.append(state.allocator, m) catch {
             state.allocator.free(m);
-            state.mutex.unlock();
+            state.mutex.unlock(io);
             break;
         };
-        state.mutex.unlock();
+        state.mutex.unlock(io);
     }
 }
 
-/// 全局子进程状态（仅当 is_forked 时非 null）
+/// 全局子进程状态（仅当 is_forked 时非 null）。0.16：Io.Mutex
 var fork_child_state: ?*ForkChildState = null;
-var fork_child_mutex: std.Thread.Mutex = .{};
+var fork_child_mutex: std.Io.Mutex = .{ .state = std.atomic.Value(std.Io.Mutex.State).init(.unlocked) };
 
 /// 启动子进程侧 IPC（在 process 注册前、is_forked 时调用）；allocator 需在进程存活期内有效
 pub fn start(allocator: std.mem.Allocator) !*ForkChildState {
-    fork_child_mutex.lock();
-    defer fork_child_mutex.unlock();
+    const io = libs_process.getProcessIo() orelse return error.NoProcessIo;
+    fork_child_mutex.lock(io) catch return error.NoProcessIo;
+    defer fork_child_mutex.unlock(io);
     if (fork_child_state != null) return fork_child_state.?;
     var state = try allocator.create(ForkChildState);
     state.* = .{
         .queue = std.ArrayList([]u8).empty,
-        .mutex = .{},
+        .mutex = .{ .state = std.atomic.Value(std.Io.Mutex.State).init(.unlocked) },
         .allocator = allocator,
         .reader_thread = undefined,
     };
@@ -63,8 +68,9 @@ pub fn start(allocator: std.mem.Allocator) !*ForkChildState {
 
 /// 获取当前子进程状态（子进程内 process.send/receiveSync 用）
 pub fn getState() ?*ForkChildState {
-    fork_child_mutex.lock();
-    defer fork_child_mutex.unlock();
+    const io = libs_process.getProcessIo() orelse return null;
+    fork_child_mutex.lock(io) catch return null;
+    defer fork_child_mutex.unlock(io);
     return fork_child_state;
 }
 
@@ -104,8 +110,9 @@ fn processSendCallback(
     const n = jsc.JSStringGetUTF8CString(msg_js, buf.ptr, max_sz);
     if (n == 0) return jsc.JSValueMakeUndefined(ctx);
     const msg = buf[0 .. n - 1];
-    const stdout_file = std.fs.File.stdout();
-    ipc.writeMessage(stdout_file, msg) catch return jsc.JSValueMakeUndefined(ctx);
+    const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
+    const stdout_file = std.Io.File.stdout();
+    ipc.writeMessage(io, stdout_file, msg) catch return jsc.JSValueMakeUndefined(ctx);
     return jsc.JSValueMakeUndefined(ctx);
 }
 
@@ -118,8 +125,9 @@ fn processReceiveSyncCallback(
     _: [*]jsc.JSValueRef,
 ) callconv(.c) jsc.JSValueRef {
     const state = getState() orelse return jsc.JSValueMakeUndefined(ctx);
-    state.mutex.lock();
-    defer state.mutex.unlock();
+    const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
+    state.mutex.lock(io) catch return jsc.JSValueMakeUndefined(ctx);
+    defer state.mutex.unlock(io);
     if (state.queue.items.len == 0) return jsc.JSValueMakeUndefined(ctx);
     const msg = state.queue.orderedRemove(0);
     defer state.allocator.free(msg);
