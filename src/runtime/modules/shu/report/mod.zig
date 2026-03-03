@@ -10,22 +10,30 @@
 
 const std = @import("std");
 const jsc = @import("jsc");
-const io_core = @import("io_core");
+const libs_io = @import("libs_io");
+const errors = @import("errors");
+const libs_process = @import("libs_process");
 const common = @import("../../../common.zig");
 const globals = @import("../../../globals.zig");
 
-/// 超过此长度写文件时用 io_core.mapFileReadWrite，减少大报告时的多次 write 与拷贝
+/// 超过此长度写文件时用 libs_io.mapFileReadWrite，减少大报告时的多次 write 与拷贝
 const REPORT_MAP_THRESHOLD = 64 * 1024;
 
-/// 生成简单诊断报告字符串（不含真实堆栈；与 Node report 格式近似）；返回的切片由调用方 free
+/// 生成简单诊断报告字符串（不含真实堆栈；与 Node report 格式近似）；返回的切片由调用方 free。Zig 0.16：用 bufPrint + appendSlice 替代 writer.print。
 fn buildReportString(allocator: std.mem.Allocator) []const u8 {
     var list = std.ArrayList(u8).initCapacity(allocator, 2048) catch return "";
-    const w = list.writer(allocator);
-    w.print("--- Shu diagnostic report ---\n", .{}) catch return "";
-    w.print("Time: {d}\n", .{std.time.timestamp()}) catch return "";
+    var buf: [512]u8 = undefined;
+    list.appendSlice(allocator, "--- Shu diagnostic report ---\n") catch return "";
+    const t: i64 = if (libs_process.getProcessIo()) |io| blk: {
+        const now = std.Io.Clock.Timestamp.now(io, .real);
+        break :blk @as(i64, @intCast(@divTrunc(now.raw.nanoseconds, 1_000_000_000)));
+    } else 0;
+    const s1 = std.fmt.bufPrint(&buf, "Time: {d}\n", .{t}) catch return "";
+    list.appendSlice(allocator, s1) catch return "";
     if (globals.current_run_options) |opts| {
-        w.print("Entry: {s}\nCwd: {s}\n", .{ opts.entry_path, opts.cwd }) catch return "";
-        w.print("Permissions: read={} write={} net={} env={} run={} hrtime={} ffi={}\n", .{
+        const s2 = std.fmt.bufPrint(&buf, "Entry: {s}\nCwd: {s}\n", .{ opts.entry_path, opts.cwd }) catch return "";
+        list.appendSlice(allocator, s2) catch return "";
+        const s3 = std.fmt.bufPrint(&buf, "Permissions: read={} write={} net={} env={} run={} hrtime={} ffi={}\n", .{
             opts.permissions.allow_read,
             opts.permissions.allow_write,
             opts.permissions.allow_net,
@@ -34,10 +42,11 @@ fn buildReportString(allocator: std.mem.Allocator) []const u8 {
             opts.permissions.allow_hrtime,
             opts.permissions.allow_ffi,
         }) catch return "";
+        list.appendSlice(allocator, s3) catch return "";
     } else {
-        w.print("(no run context)\n", .{}) catch return "";
+        list.appendSlice(allocator, "(no run context)\n") catch return "";
     }
-    w.print("--- End report ---\n", .{}) catch return "";
+    list.appendSlice(allocator, "--- End report ---\n") catch return "";
     return list.toOwnedSlice(allocator) catch "";
 }
 
@@ -61,7 +70,7 @@ fn getReportCallback(
     return jsc.JSValueMakeString(ctx, str_ref);
 }
 
-/// writeReport([filename][, err])：无 filename 时写 stdout，否则写文件；大报告（≥REPORT_MAP_THRESHOLD）走 io_core.mapFileReadWrite 零拷贝
+/// writeReport([filename][, err])：无 filename 时写 stdout，否则写文件；大报告（≥REPORT_MAP_THRESHOLD）走 libs_io.mapFileReadWrite 零拷贝
 fn writeReportCallback(
     ctx: jsc.JSContextRef,
     _: jsc.JSObjectRef,
@@ -86,33 +95,29 @@ fn writeReportCallback(
             else
                 path;
             defer if (resolved.ptr != path.ptr) allocator.free(resolved);
+            const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
             if (report.len >= REPORT_MAP_THRESHOLD) {
-                var file = std.fs.createFileAbsolute(resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
-                file.seekTo(report.len - 1) catch {
-                    file.close();
-                    return jsc.JSValueMakeUndefined(ctx);
-                };
-                file.writeAll(&.{0}) catch {
-                    file.close();
-                    return jsc.JSValueMakeUndefined(ctx);
-                };
-                file.close();
-                var mapped = io_core.mapFileReadWrite(resolved) catch {
-                    var fallback = std.fs.createFileAbsolute(resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
-                    defer fallback.close();
-                    fallback.writeAll(report) catch return jsc.JSValueMakeUndefined(ctx);
+                var file = libs_io.createFileAbsolute(resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
+                defer file.close(io);
+                const zero: [1]u8 = .{0};
+                file.writePositionalAll(io, zero[0..], report.len - 1) catch return jsc.JSValueMakeUndefined(ctx);
+                var mapped = libs_io.mapFileReadWrite(resolved) catch {
+                    var fallback = libs_io.createFileAbsolute(resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
+                    defer fallback.close(io);
+                    fallback.writeStreamingAll(io, report) catch return jsc.JSValueMakeUndefined(ctx);
                     return jsc.JSValueMakeUndefined(ctx);
                 };
                 defer mapped.deinit();
                 @memcpy(mapped.slice()[0..report.len], report);
                 return jsc.JSValueMakeUndefined(ctx);
             }
-            const file = std.fs.createFileAbsolute(resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
-            defer file.close();
-            file.writeAll(report) catch return jsc.JSValueMakeUndefined(ctx);
+            const file = libs_io.createFileAbsolute(resolved, .{}) catch return jsc.JSValueMakeUndefined(ctx);
+            defer file.close(io);
+            file.writeStreamingAll(io, report) catch return jsc.JSValueMakeUndefined(ctx);
         }
     } else {
-        std.fs.File.stdout().writeAll(report) catch return jsc.JSValueMakeUndefined(ctx);
+        const stdout_io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
+        std.Io.File.stdout().writeStreamingAll(stdout_io, report) catch return jsc.JSValueMakeUndefined(ctx);
     }
     return jsc.JSValueMakeUndefined(ctx);
 }
