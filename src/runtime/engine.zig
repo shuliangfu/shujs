@@ -30,10 +30,10 @@ const engine_globals = @import("globals.zig");
 const timer_state = @import("modules/shu/timers/state.zig");
 const bindings = @import("bindings/mod.zig");
 const require_mod = @import("modules/shu/require/mod.zig");
-const io_core = @import("io_core");
+const libs_io = @import("libs_io");
 const esm_loader = @import("modules/shu/esm_loader/mod.zig");
-// 拉入 io_core 参与构建（高性能 I/O 工具层，供 server 等后续接入）
-const _ = io_core;
+// 拉入 libs_io 参与构建（高性能 I/O 工具层，供 server 等后续接入）
+const _ = libs_io;
 
 /// 引擎句柄；在具备 JSC 的平台下持有 group 与 global context
 pub const Engine = struct {
