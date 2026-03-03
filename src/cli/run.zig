@@ -39,7 +39,7 @@ pub fn run(allocator: std.mem.Allocator, parsed: args_mod.ParsedArgs, positional
     defer allocator.free(cwd_str);
     // 存在 package.json/jsonc 或 deno.json/jsonc 时自动安装依赖（Deno 风格）；皆无则跳过（install 需 package 才真正安装，仅 deno 时会 NoManifest）
     if (hasAnyManifest(cwd_str)) {
-        pkg_install.install(allocator, cwd_str, null, null) catch |e| {
+        pkg_install.install(allocator, cwd_str, null, null, null) catch |e| {
             if (e != error.NoManifest) return e;
         };
     }
