@@ -134,7 +134,7 @@ fn npmResolveWorker(ctx: *const NpmResolveWorkerCtx) void {
     }
 }
 
-/// 优化 B：npm 安装阶段并发 worker 数；每 worker 独立 CurlClient + 临时文件，查缓存→下载→解压一条龙。16 以压榨网络/磁盘并发，registry 限流时仍可回退为 8。
+/// 优化 B：npm 安装阶段并发 worker 数；每 worker 独立 std.http.Client + 临时文件，查缓存→下载→解压一条龙。16 以压榨网络/磁盘并发，registry 限流时仍可回退为 8。
 const NPM_INSTALL_MAX_WORKERS = 16;
 
 /// JSR 安装阶段并发 worker 数；每个 worker 调用 downloadPackageToDir 向共享 JsrDownloadPool 投递一批文件任务，多包并行拉取。与 npm 对齐用 16 以压榨网络。
@@ -143,7 +143,14 @@ const JSR_INSTALL_MAX_WORKERS = 16;
 /// 单条 JSR 安装任务：name/version/pkg_dest 指向 arena 或 install_order，worker 只读。
 const JsrInstallTask = struct { name: []const u8, version: []const u8, pkg_dest: []const u8 };
 
-/// JSR 安装 worker 上下文：tasks/results 在 join 前有效；next_index 原子取任务下标；pool 共享。
+/// 主线程与 worker 共享：最近完成的一包名，供 onProgress 第二行显示；主线程轮询时加锁读出。
+const LastCompletedName = struct {
+    buf: [64]u8 = undefined,
+    len: usize = 0,
+    mutex: std.Thread.Mutex = .{},
+};
+
+/// JSR 安装 worker 上下文：tasks/results 在 join 前有效；next_index 原子取任务下标；pool 共享。install_completed_count 非 null 时每完成一包递增；last_completed_name 非 null 时写入最近完成包名。
 const JsrInstallWorkerCtx = struct {
     tasks: []const JsrInstallTask,
     results: [*]?anyerror,
@@ -154,6 +161,8 @@ const JsrInstallWorkerCtx = struct {
     first_error_mutex: *std.Thread.Mutex,
     error_detail: ?*InstallErrorDetail,
     main_allocator: std.mem.Allocator,
+    install_completed_count: ?*std.atomic.Value(usize) = null,
+    last_completed_name: ?*LastCompletedName = null,
 };
 
 /// JSR 安装 worker：循环取任务并调用 downloadPackageToDir；与 npm 一致，网络类失败（超时、CurlFailed 等）时重试
@@ -166,7 +175,7 @@ fn jsrInstallWorker(ctx: *const JsrInstallWorkerCtx) void {
         var last_err: anyerror = undefined;
         var ok = false;
         for (0..INSTALL_NETWORK_RETRIES) |ri| {
-            if (ri > 0) std.Thread.sleep(INSTALL_NETWORK_RETRY_DELAY_NS);
+            if (ri > 0) std.Thread.sleep(INSTALL_NETWORK_RETRY_DELAYS_NS[ri - 1]);
             jsr.downloadPackageToDir(ctx.allocator, ctx.pool, task.name, task.version, task.pkg_dest) catch |e| {
                 last_err = e;
                 continue;
@@ -187,6 +196,8 @@ fn jsrInstallWorker(ctx: *const JsrInstallWorkerCtx) void {
                 }
             }
         }
+        if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
+        if (ctx.last_completed_name) |ln| setLastCompletedName(ln, task.name);
     }
 }
 
@@ -199,7 +210,19 @@ const NpmInstallTask = struct {
     registry_host: []const u8,
 };
 
-/// npm 安装 worker 上下文：tasks/results 在 join 前有效；next_index 原子取任务下标；resolved_tarball_urls 只读；first_error 与 error_detail 由首次失败者写入（mutex 保护）。first_extract_failure_logged 保证首次解压失败时无条件打印一次诊断。
+/// 写最近完成包名到共享缓冲，供主线程 onProgress 第二行显示；name 过长则截断。
+fn setLastCompletedName(ln: *LastCompletedName, name: []const u8) void {
+    ln.mutex.lock();
+    defer ln.mutex.unlock();
+    const n = @min(name.len, ln.buf.len - 1);
+    if (n > 0) {
+        @memcpy(ln.buf[0..n], name[0..n]);
+        ln.buf[n] = 0;
+    }
+    ln.len = n;
+}
+
+/// npm 安装 worker 上下文：tasks/results 在 join 前有效；next_index 原子取任务下标；resolved_tarball_urls 只读；first_error 与 error_detail 由首次失败者写入（mutex 保护）。first_extract_failure_logged 保证首次解压失败时无条件打印一次诊断。install_completed_count 非 null 时每完成一包递增；last_completed_name 非 null 时写入最近完成包名。
 const NpmInstallWorkerCtx = struct {
     tasks: []const NpmInstallTask,
     results: [*]?anyerror,
@@ -212,15 +235,15 @@ const NpmInstallWorkerCtx = struct {
     error_detail: ?*InstallErrorDetail,
     main_allocator: std.mem.Allocator,
     worker_id: usize,
+    install_completed_count: ?*std.atomic.Value(usize) = null,
+    last_completed_name: ?*LastCompletedName = null,
 };
 
-/// npm 安装 worker：每 worker 持有一个 std.http.Client（Zig 路径）、一个 CurlClient（回退）和独立临时文件路径；取任务后查缓存→未命中则下载（先 Zig 再 Curl）→写缓存→解压；失败写 results[i] 并在 mutex 下写 first_error/error_detail。
+/// npm 安装 worker：每 worker 持有一个 std.http.Client（Zig 路径）和独立临时文件路径；取任务后查缓存→未命中则下载（Zig client）→写缓存→解压；失败写 results[i] 并在 mutex 下写 first_error/error_detail。
 fn npmInstallWorker(ctx: *const NpmInstallWorkerCtx) void {
     const page = std.heap.page_allocator;
     var zig_client = std.http.Client{ .allocator = page };
     defer zig_client.deinit();
-    var curl = io_core.http.CurlClient.init();
-    defer curl.deinit();
     const temp_tgz = std.fmt.allocPrint(page, "{s}/.tmp-download-{d}.tgz", .{ ctx.cache_root, ctx.worker_id }) catch return;
     defer page.free(temp_tgz);
     while (true) {
@@ -250,6 +273,8 @@ fn npmInstallWorker(ctx: *const NpmInstallWorkerCtx) void {
                     ctx.results[i] = e;
                     setFirstError(ctx, e, task.name, task.version);
                 };
+                if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
+                if (ctx.last_completed_name) |ln| setLastCompletedName(ln, task.name);
                 break :retry_extract;
             }
             const turl_opt = ctx.resolved_tarball_urls.get(task.name);
@@ -257,6 +282,7 @@ fn npmInstallWorker(ctx: *const NpmInstallWorkerCtx) void {
                 const u = registry.buildTarballUrl(page, task.registry_url, task.name, task.version) catch |e| {
                     ctx.results[i] = e;
                     setFirstError(ctx, e, task.name, task.version);
+                    if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
                     break :retry_extract;
                 };
                 break :blk u;
@@ -265,14 +291,10 @@ fn npmInstallWorker(ctx: *const NpmInstallWorkerCtx) void {
             var download_ok = false;
             var last_dl_err: anyerror = undefined;
             for (0..INSTALL_NETWORK_RETRIES) |ri| {
-                if (ri > 0) std.Thread.sleep(INSTALL_NETWORK_RETRY_DELAY_NS);
-                // 先走 Zig client 验证 tarball 下载；失败则回退到 CurlClient
+                if (ri > 0) std.Thread.sleep(INSTALL_NETWORK_RETRY_DELAYS_NS[ri - 1]);
                 registry.downloadToPathWithClient(&zig_client, page, turl, temp_tgz) catch |e| {
                     last_dl_err = e;
-                    registry.downloadToPathWithCurlClient(@constCast(&curl), page, turl, temp_tgz) catch |e2| {
-                        last_dl_err = e2;
-                        continue;
-                    };
+                    continue;
                 };
                 download_ok = true;
                 break;
@@ -280,6 +302,8 @@ fn npmInstallWorker(ctx: *const NpmInstallWorkerCtx) void {
             if (!download_ok) {
                 ctx.results[i] = last_dl_err;
                 setFirstError(ctx, last_dl_err, task.name, task.version);
+                if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
+                if (ctx.last_completed_name) |ln| setLastCompletedName(ln, task.name);
                 break :retry_extract;
             }
             // 仅一个 worker 创建缓存目录，避免多线程同时解压到同一目录导致竞态（只写出 node_modules、无 package.json）
@@ -298,6 +322,7 @@ fn npmInstallWorker(ctx: *const NpmInstallWorkerCtx) void {
                                 ctx.results[i] = sym_err;
                                 setFirstError(ctx, sym_err, task.name, task.version);
                             };
+                            if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
                             break :retry_extract;
                         }
                         std.Thread.sleep(100_000_000); // 100ms
@@ -320,6 +345,8 @@ fn npmInstallWorker(ctx: *const NpmInstallWorkerCtx) void {
                 }
                 ctx.results[i] = e;
                 setFirstError(ctx, if (e == error.ReadFailed) error.TarballExtractFailed else e, task.name, task.version);
+                if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
+                if (ctx.last_completed_name) |ln| setLastCompletedName(ln, task.name);
                 break :retry_extract;
             };
             io_core.deleteFileAbsolute(temp_tgz) catch {};
@@ -351,6 +378,8 @@ fn npmInstallWorker(ctx: *const NpmInstallWorkerCtx) void {
                 io_core.deleteTreeAbsolute(cache_dir_path) catch {};
                 ctx.results[i] = error.TarballExtractFailed;
                 setFirstError(ctx, error.TarballExtractFailed, task.name, task.version);
+                if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
+                if (ctx.last_completed_name) |ln| setLastCompletedName(ln, task.name);
                 break :retry_extract;
             };
             if (io_core.pathDirname(task.pkg_dest)) |parent_dest| io_core.makePathAbsolute(parent_dest) catch {};
@@ -360,6 +389,8 @@ fn npmInstallWorker(ctx: *const NpmInstallWorkerCtx) void {
                 ctx.results[i] = e;
                 setFirstError(ctx, e, task.name, task.version);
             };
+            if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
+            if (ctx.last_completed_name) |ln| setLastCompletedName(ln, task.name);
             break :retry_extract;
         }
     }
@@ -381,8 +412,8 @@ fn setFirstError(ctx: *const NpmInstallWorkerCtx, err: anyerror, name: []const u
 
 /// 安装阶段网络请求（resolve/tgz/JSR）失败时的重试次数；瞬断常见于 169/261 附近，重试可提高成功率。
 const INSTALL_NETWORK_RETRIES = 3;
-/// 每次重试前等待的纳秒数（0.5 秒），在瞬断恢复与总耗时之间折中。
-const INSTALL_NETWORK_RETRY_DELAY_NS = 500_000_000;
+/// 第 2、3 次重试前等待的纳秒数（指数退避 0.5s、1s），在瞬断恢复与总耗时之间折中。
+const INSTALL_NETWORK_RETRY_DELAYS_NS = [_]u64{ 500_000_000, 1_000_000_000 };
 
 /// 解析阶段 JSR 单条 worker：每 worker 持有一个 Client 复用连接，每 JSR_RESOLVE_CLIENT_REUSE_LIMIT 次请求重建 Client 避免长连接异常；结果写入 results[i]。
 /// 当前用 page_allocator，主线程合并后释放；后续可考虑 per-worker Arena（§1.2）。
@@ -449,14 +480,18 @@ pub const InstallErrorDetail = struct {
     version: ?[]const u8 = null,
 };
 
-/// 安装进度回调：onResolving 本次要解析的数量；onStart(new_count) 本次新安装数量，进度条用；onPackage(..., newly_installed)；onDone(total_count, new_count)。
+/// 安装进度回调：onResolving 本次要解析的数量；onResolvingComplete() 解析阶段曾输出过 onResolving 时在 onStart 前调用一次，供 CLI 在 Resolving 与 Installing 间输出空行；onStart(new_count) 本次新安装数量，进度条用；onProgress(current, total, last_completed_name) 下载/解压过程中由主线程轮询调用，last_completed_name 为最近完成的一包名（可选）；onPackage(..., newly_installed)；onDone(total_count, new_count)。
 /// onPackageAdded(name, version)：add 流程下 install 结束后对 added_names 中在 resolved 的包各调用一次，用于打印「+ name@version」。
 /// onResolveFailure()：解析阶段某个包失败时、在写 stderr 诊断前调用一次，便于 CLI 先换行/刷新进度行，避免错误信息被后续进度覆盖。
 pub const InstallReporter = struct {
     ctx: ?*anyopaque = null,
     onResolving: ?*const fn (?*anyopaque, []const u8, usize, usize) void = null,
+    /// 解析阶段曾输出过 onResolving 时，在 onStart 前调用一次（跳过解析时不调用），供 CLI 在 Resolving 与 Installing 间输出空行。
+    onResolvingComplete: ?*const fn (?*anyopaque) void = null,
     onResolveFailure: ?*const fn (?*anyopaque) void = null,
     onStart: ?*const fn (?*anyopaque, usize) void = null,
+    /// 下载阶段主线程轮询调用，更新进度条与第二行文案；total 与 onStart 一致；last_completed_name 为最近完成的一包名（主线程从共享缓冲读出，可为 null）。
+    onProgress: ?*const fn (?*anyopaque, usize, usize, ?[]const u8) void = null,
     onPackage: ?*const fn (?*anyopaque, usize, usize, []const u8, []const u8, bool) void = null,
     onDone: ?*const fn (?*anyopaque, usize, usize) void = null,
     onPackageAdded: ?*const fn (?*anyopaque, []const u8, []const u8) void = null,
@@ -628,6 +663,7 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
         _ = jsr_packages.put(try a.dupe(u8, parsed.name), {}) catch {};
     }
     var resolution_idx: usize = 0;
+    var resolving_emitted = false; // 本轮是否输出过 onResolving，用于 onResolvingComplete 仅在有 Resolving 输出时调用
     var npm_resolve_client = std.http.Client{ .allocator = allocator };
     defer npm_resolve_client.deinit();
     // 优化 C：lockfile 已包含全部直接依赖及传递闭包时跳过整段解析
@@ -784,7 +820,10 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                 for (npm_indices.items, npm_results, 0..) |pi, res, ni| {
                     const item = to_process.items[pi];
                     if (reporter) |r| {
-                        if (r.onResolving) |cb| cb(r.ctx, item.display_name orelse item.name, pi + 1, to_process.items.len);
+                        if (r.onResolving) |cb| {
+                            resolving_emitted = true;
+                            cb(r.ctx, item.display_name orelse item.name, pi + 1, to_process.items.len);
+                        }
                     }
                     var from_probe = false;
                     const res_opt: ?registry.TarballAndDepsResult = if (pi == npm_indices.items[0] and first_npm_probe_result != null and !first_probe_consumed) blk: {
@@ -1193,7 +1232,10 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                                         _ = jsr_packages.put(jsr_key, {}) catch a.free(jsr_key);
                                     } else |_| {}
                                     if (reporter) |r| {
-                                        if (r.onResolving) |cb| cb(r.ctx, item.display_name orelse item.name, wave_end, to_process.items.len);
+                                        if (r.onResolving) |cb| {
+                                            resolving_emitted = true;
+                                            cb(r.ctx, item.display_name orelse item.name, wave_end, to_process.items.len);
+                                        }
                                     }
                                 }
                             }
@@ -1228,6 +1270,21 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
         const name = e.key_ptr.*;
         if (resolved.contains(name)) install_order.append(allocator, name) catch return error.OutOfMemory;
     }
+    // 仅通过 imports 添加的 JSR/npm（未出现在 dependencies/devDependencies）也加入安装顺序，否则第二遍不会 onPackage，进度条与 "+ 包名" 不显示
+    var add_imp = m.imports.iterator();
+    while (add_imp.next()) |entry| {
+        const value = entry.value_ptr.*;
+        if (!std.mem.startsWith(u8, value, "jsr:") and !std.mem.startsWith(u8, value, "npm:")) continue;
+        const name = if (std.mem.startsWith(u8, value, "jsr:"))
+            resolver.jsrSpecToScopeName(a, value) catch continue
+        else blk: {
+            const rest = value["npm:".len..];
+            const last_at = std.mem.lastIndexOfScalar(u8, rest, '@') orelse continue;
+            break :blk rest[0..last_at];
+        };
+        if (m.dependencies.contains(name) or m.dev_dependencies.contains(name)) continue;
+        if (resolved.contains(name)) install_order.append(allocator, name) catch return error.OutOfMemory;
+    }
 
     const total_count = install_order.items.len;
     // 本次需要新安装的数量：目标目录尚不存在的包（npm 与 JSR 均在安装阶段统一下载）
@@ -1244,6 +1301,7 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
         };
         d.close();
     }
+    if (resolving_emitted) if (reporter) |r| if (r.onResolvingComplete) |cb| cb(r.ctx);
     if (reporter) |r| {
         if (r.onStart) |cb| {
             // add 流程：进度条与统计只按「本次添加的包」数量，不按全量依赖数
@@ -1350,6 +1408,12 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
         npm_task_idx.* = npm_tasks.items.len - 1;
         pkg_dest_to_npm_idx.put(pkg_dest, npm_tasks.items.len - 1) catch {};
     }
+    // 下载阶段进度：主线程轮询 install_completed_count 并调用 onProgress；last_completed_name 由 worker 写入、主线程读出传 onProgress 第二行显示。
+    const total_work_items = jsr_tasks.items.len + npm_tasks.items.len;
+    var install_completed_count = std.atomic.Value(usize).init(0);
+    var last_completed_name = LastCompletedName{};
+    const want_progress = total_work_items > 0 and reporter != null and reporter.?.onProgress != null;
+
     // JSR 任务并行执行（多 worker 向共享 JsrDownloadPool 投递，池内并发拉取+写盘）
     const jsr_results = allocator.alloc(?anyerror, jsr_tasks.items.len) catch return error.OutOfMemory;
     defer allocator.free(jsr_results);
@@ -1372,6 +1436,8 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
             .first_error_mutex = &jsr_err_mutex,
             .error_detail = error_detail,
             .main_allocator = allocator,
+            .install_completed_count = if (want_progress) &install_completed_count else null,
+            .last_completed_name = if (want_progress) &last_completed_name else null,
         };
         var j: usize = 0;
         while (j < n_jsr_workers) : (j += 1) {
@@ -1382,6 +1448,19 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                 for (jsr_threads.items) |th| th.join();
                 return e;
             };
+        }
+        while (want_progress and install_completed_count.load(.monotonic) < jsr_tasks.items.len) {
+            const cur = install_completed_count.load(.monotonic);
+            var name_buf: [64]u8 = undefined;
+            var name_slice: ?[]const u8 = null;
+            last_completed_name.mutex.lock();
+            if (last_completed_name.len > 0) {
+                @memcpy(name_buf[0..last_completed_name.len], last_completed_name.buf[0..last_completed_name.len]);
+                name_slice = name_buf[0..last_completed_name.len];
+            }
+            last_completed_name.mutex.unlock();
+            if (reporter.?.onProgress) |onProg| onProg(reporter.?.ctx, cur, total_work_items, name_slice);
+            std.Thread.sleep(80_000_000); // 80ms
         }
         for (jsr_threads.items) |th| th.join();
         if (jsr_first_err) |e| first_error = map_install_err(e);
@@ -1413,6 +1492,8 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
             .error_detail = error_detail,
             .main_allocator = allocator,
             .worker_id = 0,
+            .install_completed_count = if (want_progress) &install_completed_count else null,
+            .last_completed_name = if (want_progress) &last_completed_name else null,
         };
         for (0..n_workers) |t| {
             worker_ctxs[t] = base_ctx;
@@ -1424,6 +1505,19 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                 for (threads.items) |th| th.join();
                 return e;
             };
+        }
+        while (want_progress and install_completed_count.load(.monotonic) < total_work_items) {
+            const cur = install_completed_count.load(.monotonic);
+            var name_buf: [64]u8 = undefined;
+            var name_slice: ?[]const u8 = null;
+            last_completed_name.mutex.lock();
+            if (last_completed_name.len > 0) {
+                @memcpy(name_buf[0..last_completed_name.len], last_completed_name.buf[0..last_completed_name.len]);
+                name_slice = name_buf[0..last_completed_name.len];
+            }
+            last_completed_name.mutex.unlock();
+            if (reporter.?.onProgress) |onProg| onProg(reporter.?.ctx, cur, total_work_items, name_slice);
+            std.Thread.sleep(80_000_000); // 80ms
         }
         for (threads.items) |th| th.join();
         if (npm_first_err) |e| first_error = map_install_err(e);
