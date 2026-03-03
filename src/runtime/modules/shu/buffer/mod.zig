@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const jsc = @import("jsc");
-const io_core = @import("io_core");
+const libs_io = @import("libs_io");
 const common = @import("../../../common.zig");
 const globals = @import("../../../globals.zig");
 
@@ -14,8 +14,8 @@ const BUFFER_POOL_CHUNK_SIZE: usize = 64 * 1024;
 /// 池总大小（4MB），约 64 块
 const BUFFER_POOL_SIZE: usize = 4 * 1024 * 1024;
 
-var g_buffer_pool: ?io_core.api.BufferPool = null;
-var g_chunk_allocator: ?io_core.api.ChunkAllocator = null;
+var g_buffer_pool: ?libs_io.api.BufferPool = null;
+var g_chunk_allocator: ?libs_io.api.ChunkAllocator = null;
 var g_buffer_pool_initialized: bool = false;
 
 /// §1.1 显式 allocator 收敛：getExports 时注入，from/alloc/concat 优先使用；未注入时回退 current_allocator
@@ -24,7 +24,7 @@ threadlocal var g_buffer_allocator: ?std.mem.Allocator = null;
 /// 池块归还上下文：JSC 回收时 release 回 ChunkAllocator
 const PoolChunkContext = struct {
     allocator: std.mem.Allocator,
-    chunk_allocator: *io_core.api.ChunkAllocator,
+    chunk_allocator: *libs_io.api.ChunkAllocator,
     chunk_index: usize,
 };
 fn poolChunkDeallocator(bytes: *anyopaque, deallocator_context: ?*anyopaque) callconv(.c) void {
@@ -91,9 +91,9 @@ fn allocCallback(
 
     if (size == BUFFER_POOL_CHUNK_SIZE) {
         if (!g_buffer_pool_initialized) {
-            g_buffer_pool = io_core.api.BufferPool.allocAligned(allocator, BUFFER_POOL_SIZE) catch null;
+            g_buffer_pool = libs_io.api.BufferPool.allocAligned(allocator, BUFFER_POOL_SIZE) catch null;
             if (g_buffer_pool) |*pool| {
-                g_chunk_allocator = io_core.api.ChunkAllocator.init(allocator, pool, BUFFER_POOL_CHUNK_SIZE) catch blk: {
+                g_chunk_allocator = libs_io.api.ChunkAllocator.init(allocator, pool, BUFFER_POOL_CHUNK_SIZE) catch blk: {
                     pool.deinit();
                     g_buffer_pool = null;
                     break :blk null;
