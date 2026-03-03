@@ -1,6 +1,6 @@
 // Zig 构建配置，定义编译目标与依赖
 // 参考：SHU_RUNTIME_ANALYSIS.md 6.1 顶层目录与模块
-// Zig 0.15+ 使用 root_module，需先 addModule 再 addExecutable
+// Zig 0.16.0-dev：使用 root_module，需先 addModule 再 addExecutable
 // 跨平台 JSC：macOS 用系统框架；Linux/Windows 可选 -Djsc_prefix=<dir> 链接 WebKit JSC
 
 const std = @import("std");
@@ -22,10 +22,10 @@ pub fn build(b: *std.Build) void {
             else => "deps/install-linux",
         };
         const path_to_try = if (jsc_prefix_opt) |p| if (p.len > 0) p else default_path else default_path;
-        const dir = std.fs.cwd().openDir(path_to_try, .{}) catch null;
+        // Zig 0.16.0-dev：std.fs.cwd() 已移除，改用 std.Io.Dir.cwd().openDir(io, path, .{})
+        const dir = std.Io.Dir.cwd().openDir(b.graph.io, path_to_try, .{}) catch null;
         if (dir) |d| {
-            var d_mut = d;
-            d_mut.close();
+            d.close(b.graph.io);
             have_webkit_jsc = true;
             jsc_prefix_used = path_to_try;
         }
@@ -61,6 +61,23 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     root_module.addImport("build_options", build_options_module);
+
+    // 进程级状态（io / environ），main 设置，CLI、io、runtime 等共用
+    const libs_process_module = b.createModule(.{
+        .root_source_file = b.path("src/libs/process.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    root_module.addImport("libs_process", libs_process_module);
+
+    // 统一错误码与 reportToStderr，CLI、package、runtime 等共用；依赖 libs_process
+    const errors_module = b.createModule(.{
+        .root_source_file = b.path("src/errors.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    errors_module.addImport("libs_process", libs_process_module);
+    root_module.addImport("errors", errors_module);
 
     // TLS 模块：-Dtls 时提供 TlsContext/TlsStream，供 server/net/tls 使用；实现位于 shu/lib/tls
     const shu_lib_tls = "src/runtime/modules/shu/lib/tls";
@@ -101,13 +118,14 @@ pub fn build(b: *std.Build) void {
     iocp_module.addImport("build_options", build_options_module);
     root_module.addImport("iocp", iocp_module);
 
-    // 高性能 I/O 核心：统一 API，按平台分派（sendFile、HighPerfIO、RingBuffer 等），参考 docs/HIGH_PERF_IO_TOOL_ANALYSIS.md
+    // 高性能 I/O 核心：统一 API，按平台分派；实现已迁至 libs/io.zig（原 io_core/mod.zig）
     const io_core_module = b.createModule(.{
-        .root_source_file = b.path("src/runtime/io_core/mod.zig"),
+        .root_source_file = b.path("src/libs/io.zig"),
         .target = target,
         .optimize = optimize,
     });
-    root_module.addImport("io_core", io_core_module);
+    io_core_module.addImport("libs_process", libs_process_module);
+    root_module.addImport("libs_io", io_core_module);
 
     // 仅解压 API（gzip/deflate/br），无 jsc 依赖，供 io_core/http raw_body 自动解压与 package/registry 等使用；根为 zlib/decode.zig
     const shu_zlib_module = b.createModule(.{
@@ -147,16 +165,16 @@ pub fn build(b: *std.Build) void {
 
     // TLS：-Dtls 时加入 lib/tls/tls.c 并链接 OpenSSL；tls.c 需能找到 tls.h
     if (have_tls) {
-        exe.addCSourceFiles(.{ .files = &[_][]const u8{"src/runtime/modules/shu/lib/tls/tls.c"}, .flags = &.{} });
+        exe.root_module.addCSourceFiles(.{ .files = &[_][]const u8{"src/runtime/modules/shu/lib/tls/tls.c"}, .flags = &.{} });
         exe.root_module.addIncludePath(.{ .cwd_relative = "src/runtime/modules/shu/lib/tls" });
-        exe.linkSystemLibrary("ssl");
-        exe.linkSystemLibrary("crypto");
+        exe.root_module.linkSystemLibrary("ssl", .{});
+        exe.root_module.linkSystemLibrary("crypto", .{});
     }
 
     // Brotli（br）压缩与解压：deps/brotli 编码端 + 解码端 C 源，供 server 响应压缩与 npm tarball br 解压
     const brotli_include = "deps/brotli/c/include";
     exe.root_module.addIncludePath(.{ .cwd_relative = brotli_include });
-    exe.linkLibC();
+    exe.root_module.link_libc = true;
     const brotli_sources = [_][]const u8{
         "deps/brotli/c/common/constants.c",
         "deps/brotli/c/common/context.c",
@@ -191,7 +209,7 @@ pub fn build(b: *std.Build) void {
         "deps/brotli/c/dec/huffman.c",
         "deps/brotli/c/dec/state.c",
     };
-    exe.addCSourceFiles(.{ .files = &brotli_sources, .flags = &.{} });
+    exe.root_module.addCSourceFiles(.{ .files = &brotli_sources, .flags = &.{} });
     switch (target.result.os.tag) {
         .linux => exe.root_module.addCMacro("OS_LINUX", "1"),
         .freebsd => exe.root_module.addCMacro("OS_FREEBSD", "1"),
@@ -200,14 +218,14 @@ pub fn build(b: *std.Build) void {
     }
 
     // macOS：链接系统 JavaScriptCore 框架
-    if (is_macos) exe.linkFramework("JavaScriptCore");
+    if (is_macos) exe.root_module.linkFramework("JavaScriptCore", .{});
 
     // Linux/Windows：若 have_webkit_jsc 则链接 jsc_prefix_used（即 -Djsc_prefix 或默认 deps/webkit/install）
     if (have_webkit_jsc) {
         const prefix = jsc_prefix_used;
         exe.root_module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{prefix}) });
-        exe.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{prefix}) });
-        exe.linkSystemLibrary("JavaScriptCore"); // 或按实际库名调整，如 jsc
+        exe.root_module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{prefix}) });
+        exe.root_module.linkSystemLibrary("JavaScriptCore", .{}); // 或按实际库名调整，如 jsc
     } else if (!is_macos) {
         const fail_step = b.addSystemCommand(&.{
             "sh",
@@ -230,7 +248,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     test_module.addImport("hpack_huffman", hpack_huffman_module);
-    test_module.addImport("io_core", io_core_module);
+    test_module.addImport("libs_io", io_core_module);
     const test_exe = b.addTest(.{
         .root_module = test_module,
     });
