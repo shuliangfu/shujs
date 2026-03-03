@@ -15,6 +15,8 @@ const state_mod = @import("state.zig");
 const conn_state = @import("conn_state.zig");
 const shu_zlib = @import("../zlib/mod.zig");
 
+const errors = @import("errors");
+const libs_process = @import("libs_process");
 const ServerState = state_mod.ServerState;
 const PlainConnState = conn_state.PlainConnState;
 const MuxStepResult = conn_state.MuxStepResult;
@@ -73,7 +75,11 @@ pub fn stepPlainConn(
                 if (conn.read_len < 24) return .continue_;
             } else {
                 if (conn.read_len < 24) {
-                    const n = conn.stream.read(conn.read_buf[conn.read_len..]) catch |e| {
+                    const io = libs_process.getProcessIo() orelse return .remove_and_close;
+                    var io_buf: [4096]u8 = undefined;
+                    var r = conn.stream.reader(io, &io_buf);
+                    var dest = [1][]u8{conn.read_buf[conn.read_len..]};
+                    const n = std.Io.Reader.readVec(&r.interface, &dest) catch |e| {
                         if (e == error.WouldBlock) return .continue_;
                         return .remove_and_close;
                     };
@@ -94,7 +100,11 @@ pub fn stepPlainConn(
         },
         .reading_headers => {
             if (iocp_opts == null) {
-                const n = conn.stream.read(conn.read_buf[conn.read_len..]) catch return .remove_and_close;
+                const io = libs_process.getProcessIo() orelse return .remove_and_close;
+                var io_buf: [4096]u8 = undefined;
+                var r = conn.stream.reader(io, &io_buf);
+                var dest = [1][]u8{conn.read_buf[conn.read_len..]};
+                const n = std.Io.Reader.readVec(&r.interface, &dest) catch return .remove_and_close;
                 if (n == 0 and conn.read_len == 0) return .remove_and_close;
                 if (n > 0) conn.read_len += n;
             }
@@ -214,7 +224,11 @@ pub fn stepPlainConn(
         .reading_body => {
             const want = conn.body_len_want;
             if (iocp_opts == null) {
-                const n = conn.stream.read(conn.read_buf[conn.read_len..]) catch return .remove_and_close;
+                const io = libs_process.getProcessIo() orelse return .remove_and_close;
+                var io_buf: [4096]u8 = undefined;
+                var r = conn.stream.reader(io, &io_buf);
+                var dest = [1][]u8{conn.read_buf[conn.read_len..]};
+                const n = std.Io.Reader.readVec(&r.interface, &dest) catch return .remove_and_close;
                 if (n > 0) conn.read_len += n;
             }
             const have = conn.read_len -| conn.body_start;
@@ -228,7 +242,11 @@ pub fn stepPlainConn(
         },
         .reading_chunked_body => {
             if (iocp_opts == null) {
-                const n = conn.stream.read(conn.read_buf[conn.read_len..]) catch return .remove_and_close;
+                const io = libs_process.getProcessIo() orelse return .remove_and_close;
+                var io_buf: [4096]u8 = undefined;
+                var r = conn.stream.reader(io, &io_buf);
+                var dest = [1][]u8{conn.read_buf[conn.read_len..]};
+                const n = std.Io.Reader.readVec(&r.interface, &dest) catch return .remove_and_close;
                 if (n == 0 and conn.read_len == 0) return .remove_and_close;
                 if (n > 0) conn.read_len += n;
             }
@@ -349,7 +367,11 @@ pub fn stepPlainConn(
                 } else return .remove_and_close;
             } else {
                 if (iocp_opts != null and iocp_opts.?.tag == .from_write) {} else {
-                    const n = conn.stream.write(slice) catch return .remove_and_close;
+                    const io = libs_process.getProcessIo() orelse return .remove_and_close;
+                    var wbuf: [8192]u8 = undefined;
+                    var w = conn.stream.writer(io, &wbuf);
+                    const n = std.Io.Writer.writeVec(&w.interface, &.{slice}) catch return .remove_and_close;
+                    w.interface.flush() catch return .remove_and_close;
                     conn.write_off += n;
                 }
             }
@@ -364,10 +386,14 @@ pub fn stepPlainConn(
             }
             if (iocp_opts != null and iocp_opts.?.tag == .from_write) {} else {
                 const to_write = slice[0..@min(slice.len, state.config.ws_max_write_per_tick)];
-                const n = conn.stream.write(to_write) catch |e| {
+                const io = libs_process.getProcessIo() orelse return .remove_and_close;
+                var wbuf: [8192]u8 = undefined;
+                var w = conn.stream.writer(io, &wbuf);
+                const n = std.Io.Writer.writeVec(&w.interface, &.{to_write}) catch |e| {
                     if (e == error.WouldBlock) return .continue_;
                     return .remove_and_close;
                 };
+                w.interface.flush() catch return .remove_and_close;
                 conn.write_off += n;
             }
             return .continue_;
@@ -375,7 +401,11 @@ pub fn stepPlainConn(
         .ws_frames => {
             const ws_buf = conn.ws_read_buf orelse return .remove_and_close;
             if (iocp_opts == null) {
-                const n = conn.stream.read(ws_buf[conn.ws_read_len..]) catch |e| {
+                const io = libs_process.getProcessIo() orelse return .remove_and_close;
+                var io_buf: [4096]u8 = undefined;
+                var r = conn.stream.reader(io, &io_buf);
+                var dest = [1][]u8{ws_buf[conn.ws_read_len..]};
+                const n = std.Io.Reader.readVec(&r.interface, &dest) catch |e| {
                     if (e == error.WouldBlock) return .continue_;
                     return .remove_and_close;
                 };
@@ -413,10 +443,14 @@ pub fn stepPlainConn(
             const write_slice = conn.write_buf.items[conn.write_off..];
             if (write_slice.len > 0 and iocp_opts == null) {
                 const to_write = write_slice[0..@min(write_slice.len, state.config.ws_max_write_per_tick)];
-                const n = conn.stream.write(to_write) catch |e| {
+                const io = libs_process.getProcessIo() orelse return .remove_and_close;
+                var wbuf: [8192]u8 = undefined;
+                var w = conn.stream.writer(io, &wbuf);
+                const n = std.Io.Writer.writeVec(&w.interface, &.{to_write}) catch |e| {
                     if (e == error.WouldBlock) return .continue_;
                     return .remove_and_close;
                 };
+                w.interface.flush() catch return .remove_and_close;
                 conn.write_off += n;
             }
             if (result.parse_error or result.close_requested) {
@@ -436,7 +470,11 @@ pub fn stepPlainConn(
                 return .continue_;
             }
             if (iocp_opts != null and iocp_opts.?.tag == .from_write) {} else {
-                const n = conn.stream.write(slice) catch return .remove_and_close;
+                const io = libs_process.getProcessIo() orelse return .remove_and_close;
+                var wbuf: [8192]u8 = undefined;
+                var w = conn.stream.writer(io, &wbuf);
+                const n = std.Io.Writer.writeVec(&w.interface, &.{slice}) catch return .remove_and_close;
+                w.interface.flush() catch return .remove_and_close;
                 conn.write_off += n;
             }
             return .continue_;
@@ -444,7 +482,11 @@ pub fn stepPlainConn(
         .h2c_wait_preface => {
             if (conn.read_len < 24) {
                 if (iocp_opts != null) return .continue_;
-                const n = conn.stream.read(conn.read_buf[conn.read_len..]) catch return .remove_and_close;
+                const io = libs_process.getProcessIo() orelse return .remove_and_close;
+                var io_buf: [4096]u8 = undefined;
+                var r = conn.stream.reader(io, &io_buf);
+                var dest = [1][]u8{conn.read_buf[conn.read_len..]};
+                const n = std.Io.Reader.readVec(&r.interface, &dest) catch return .remove_and_close;
                 if (n == 0 and conn.read_len == 0) return .remove_and_close;
                 if (n > 0) conn.read_len += n;
                 return .continue_;
@@ -468,14 +510,22 @@ pub fn stepPlainConn(
                 return .continue_;
             }
             if (iocp_opts != null and iocp_opts.?.tag == .from_write) {} else {
-                const n = conn.stream.write(slice) catch return .remove_and_close;
+                const io = libs_process.getProcessIo() orelse return .remove_and_close;
+                var wbuf: [8192]u8 = undefined;
+                var w = conn.stream.writer(io, &wbuf);
+                const n = std.Io.Writer.writeVec(&w.interface, &.{slice}) catch return .remove_and_close;
+                w.interface.flush() catch return .remove_and_close;
                 conn.write_off += n;
             }
             return .continue_;
         },
         .h2_frames => {
             if (iocp_opts == null) {
-                const n = conn.stream.read(conn.read_buf[conn.read_len..]) catch return .remove_and_close;
+                const io = libs_process.getProcessIo() orelse return .remove_and_close;
+                var io_buf: [4096]u8 = undefined;
+                var r = conn.stream.reader(io, &io_buf);
+                var dest = [1][]u8{conn.read_buf[conn.read_len..]};
+                const n = std.Io.Reader.readVec(&r.interface, &dest) catch return .remove_and_close;
                 if (n == 0 and conn.read_len == 0) return .remove_and_close;
                 if (n > 0) conn.read_len += n;
             }
@@ -597,7 +647,11 @@ pub fn stepPlainConn(
             if (conn.read_len > 0) @memcpy(conn.read_buf[0..conn.read_len], conn.read_buf[f.consumed..][0..conn.read_len]);
             const write_slice = conn.write_buf.items[conn.write_off..];
             if (write_slice.len > 0 and iocp_opts == null) {
-                const n = conn.stream.write(write_slice) catch return .remove_and_close;
+                const io = libs_process.getProcessIo() orelse return .remove_and_close;
+                var wbuf: [8192]u8 = undefined;
+                var w = conn.stream.writer(io, &wbuf);
+                const n = std.Io.Writer.writeVec(&w.interface, &.{write_slice}) catch return .remove_and_close;
+                w.interface.flush() catch return .remove_and_close;
                 conn.write_off += n;
             }
             return .continue_;
