@@ -44,7 +44,7 @@ pub const ParseResult = struct {
     positional: []const []const u8,
 };
 
-/// 判断是否为全局选项（--xxx 或 -A、-h），用于向前扫描以分离位置参数
+/// 判断是否为全局选项（--xxx 或 -A、-h），用于向前扫描以分离位置参数。--dev/-D 仅由 add/install 子命令解析。
 fn isGlobalOption(arg: []const u8) bool {
     if (arg.len < 2 or arg[0] != '-') return false;
     if (arg[1] == '-') return true; // --anything
