@@ -2,7 +2,7 @@
 //! 参考：https://jsr.io/docs/api
 //!
 //! ## 性能与 Deno 对齐
-//! - **文件下载**：每 worker 持有一个 io_core.http.CurlClient，用 fetchUrlForJsrMetaWithCurlClient 复用同一条 libcurl 连接（Keep-Alive），避免 Zig std.http.Client 多连接复用时 body 读为 0 的问题。
+//! - **文件下载**：每 worker 持有一个 std.http.Client，用 fetchUrlForJsrMetaWithClient 复用同 host 连接（Zig 路径、Keep-Alive）。
 //! - **线程池**：全局 JSR 下载线程池，首次使用时初始化，任务入队由固定 worker 消费，避免每包 spawn/join。
 //! - **内存**：单包下载内用 ArenaAllocator，解析与 task 列表一次 deinit，减少碎片。
 //! - **流水线**：写盘与下一任务拉取由不同 worker 并行，整体上网络与磁盘重叠。
@@ -63,10 +63,10 @@ pub const JsrDownloadPool = struct {
     writer_thread: std.Thread,
     shutdown: std.atomic.Value(bool) = .{ .raw = false },
 
-    /// 每 worker 持有一个 CurlClient，复用同 host 连接（libcurl Keep-Alive），避免 Zig Client 多连接复用时 body 读为 0。
+    /// 每 worker 持有一个 std.http.Client，复用同 host 连接（Zig 路径、Keep-Alive）。
     fn worker(pool: *JsrDownloadPool) void {
-        var curl_client = io_core.http.CurlClient.init();
-        defer curl_client.deinit();
+        var zig_client = std.http.Client{ .allocator = pool.allocator };
+        defer zig_client.deinit();
         while (true) {
             pool.mutex.lock();
             while (pool.head >= pool.queue.items.len and pool.shutdown.load(.monotonic) == false) {
@@ -83,7 +83,7 @@ pub const JsrDownloadPool = struct {
                 pool.head = 0;
             }
             pool.mutex.unlock();
-            const content = registry.fetchUrlForJsrMetaWithCurlClient(&curl_client, pool.allocator, task.url, JSR_FETCH_MAX_BYTES) catch |e| {
+            const content = registry.fetchUrlForJsrMetaWithClient(&zig_client, pool.allocator, task.url, JSR_FETCH_MAX_BYTES) catch |e| {
                 task.job.done_mutex.lock();
                 if (task.job.first_error == null) task.job.first_error = e;
                 _ = task.job.remaining.fetchSub(1, .monotonic);
@@ -498,7 +498,7 @@ const JsrFileTask = struct { url: []const u8, dest_path: []const u8 };
 
 /// 将指定版本的 JSR 包按 jsr.io 原生 API 下载到 dest_dir：先拉 version_meta.json 得到 manifest，再并行 GET 所有文件（多线程）。scope_name 为 @scope/name。
 /// pool 非 null 时使用传入的池（调用方负责在适当时机 deinit）；为 null 时使用全局 getOrCreatePool(allocator)。
-/// 单包内解析与 task 列表使用 ArenaAllocator，结束时一次 deinit，减少碎片化分配。首包 version_meta 用 CurlClient 拉取，避免 Zig 路径 ReadFailed。
+/// 单包内解析与 task 列表使用 ArenaAllocator，结束时一次 deinit，减少碎片化分配。首包 version_meta 用 std.http.Client（Zig 路径）拉取。
 pub fn downloadPackageToDir(allocator: std.mem.Allocator, pool: ?*JsrDownloadPool, scope_name: []const u8, version: []const u8, dest_dir: []const u8) !void {
     io_core.makePathAbsolute(dest_dir) catch {};
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -507,9 +507,9 @@ pub fn downloadPackageToDir(allocator: std.mem.Allocator, pool: ?*JsrDownloadPoo
 
     const sn = try scopeNameFromAtScopeName(a, scope_name);
     const version_meta_url = try std.fmt.allocPrint(a, "{s}/@{s}/{s}/{s}_meta.json", .{ JSR_META_BASE, sn.scope, sn.name, version });
-    var curl = io_core.http.CurlClient.init();
-    defer curl.deinit();
-    const body = registry.fetchUrlForJsrMetaWithCurlClient(&curl, a, version_meta_url, JSR_FETCH_MAX_BYTES) catch |e| return e;
+    var zig_client = std.http.Client{ .allocator = a };
+    defer zig_client.deinit();
+    const body = registry.fetchUrlForJsrMetaWithClient(&zig_client, a, version_meta_url, JSR_FETCH_MAX_BYTES) catch |e| return e;
     const trimmed = std.mem.trim(u8, body, " \t\r\n");
     const json_start = std.mem.indexOfScalar(u8, trimmed, '{') orelse {
         debugLogJsrResponse(version_meta_url, trimmed);
