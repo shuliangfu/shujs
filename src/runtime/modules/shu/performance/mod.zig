@@ -2,6 +2,8 @@
 
 const std = @import("std");
 const jsc = @import("jsc");
+const errors = @import("errors");
+const libs_process = @import("libs_process");
 
 /// 向全局注册 performance 对象及 performance.now()；allocator 统一传入（§1.1），本模块暂不使用
 pub fn register(ctx: jsc.JSGlobalContextRef, allocator: ?std.mem.Allocator) void {
@@ -32,7 +34,8 @@ fn performanceNowCallback(
     _: [*]const jsc.JSValueRef,
     _: [*]jsc.JSValueRef,
 ) callconv(.c) jsc.JSValueRef {
-    const ns = std.time.nanoTimestamp();
+    const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeNumber(ctx, 0);
+    const ns = std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds;
     const ms = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
     return jsc.JSValueMakeNumber(ctx, ms);
 }
