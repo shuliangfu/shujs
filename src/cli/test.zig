@@ -13,6 +13,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const args = @import("args.zig");
+const version = @import("version.zig");
 const io_core = @import("io_core");
 const manifest = @import("../package/manifest.zig");
 const scan = @import("scan.zig");
@@ -21,6 +22,7 @@ const scan = @import("scan.zig");
 pub fn runTest(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional: []const []const u8) !void {
     _ = positional;
     _ = parsed;
+    try version.printCommandHeader("test");
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
     const cwd = io_core.realpath(".", &cwd_buf) catch {
         try printStderr("shu test: cannot get current directory\n", .{});
@@ -44,6 +46,7 @@ pub fn runTest(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional
             try printStderr("shu test: script failed\n", .{});
             return e;
         };
+        try printToStdout("\n", .{});
         return;
     }
 
@@ -68,6 +71,7 @@ fn runDefaultTests(allocator: std.mem.Allocator, cwd_owned: []const u8) !void {
     }
     if (list.items.len == 0) {
         try printStderr("shu test: no test files found under tests/\n", .{});
+        try printToStdout("\n", .{});
         return;
     }
 
@@ -101,6 +105,7 @@ fn runDefaultTests(allocator: std.mem.Allocator, cwd_owned: []const u8) !void {
         }
     }
     if (failed) return error.ScriptExitedNonZero;
+    try printToStdout("\n", .{});
 }
 
 /// 在 cwd 下用 shell 执行 cmd（/bin/sh -c cmd 或 cmd.exe /c cmd）；stdio 继承
@@ -127,6 +132,13 @@ fn runScriptInCwd(allocator: std.mem.Allocator, cwd: []const u8, cmd: []const u8
         .Signal, .Stopped => return error.ScriptSignalled,
         .Unknown => return error.ScriptExitedNonZero,
     }
+}
+
+fn printToStdout(comptime fmt_str: []const u8, fargs: anytype) !void {
+    var buf: [64]u8 = undefined;
+    var w = std.fs.File.stdout().writer(&buf);
+    try w.interface.print(fmt_str, fargs);
+    try w.interface.flush();
 }
 
 fn printStderr(comptime fmt_str: []const u8, fargs: anytype) !void {
