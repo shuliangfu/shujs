@@ -1,9 +1,11 @@
 // npm/JSR registry：解析版本、获取 tarball URL、下载 tarball 到缓存
 // 参考：docs/PACKAGE_DESIGN.md §7；与 cache.zig、install.zig 配合
-// 文件 I/O 经 io_core（§3.0）；网络请求统一经 io_core.http（Zig 路径）
+// 文件 I/O 经 io_core（§3.0）；网络请求统一经 libs_io.http（Zig 路径）
 
 const std = @import("std");
-const io_core = @import("io_core");
+const errors = @import("errors");
+const libs_io = @import("libs_io");
+const libs_process = @import("libs_process");
 const cache = @import("cache.zig");
 const npmrc = @import("npmrc.zig");
 
@@ -32,51 +34,52 @@ const REGISTRY_META_MAX_BYTES_DEFAULT = 2 * 1024 * 1024 * 1024;
 
 /// 返回当前生效的 registry 元数据最大字节数：若设置了 SHU_REGISTRY_META_MAX_BYTES 则解析该值（clamp 到 1MB～2GB），否则用 REGISTRY_META_MAX_BYTES_DEFAULT（2GB）。
 fn getRegistryMetaMaxBytes() usize {
-    const v = std.posix.getenv("SHU_REGISTRY_META_MAX_BYTES") orelse return REGISTRY_META_MAX_BYTES_DEFAULT;
-    const n = std.fmt.parseInt(usize, v, 10) catch return REGISTRY_META_MAX_BYTES_DEFAULT;
+    const v = std.c.getenv("SHU_REGISTRY_META_MAX_BYTES") orelse return REGISTRY_META_MAX_BYTES_DEFAULT;
+    const n = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return REGISTRY_META_MAX_BYTES_DEFAULT;
     return std.math.clamp(n, 1024 * 1024, REGISTRY_META_MAX_BYTES_DEFAULT);
 }
 
 /// JSR npm 兼容层 registry（JSR 包通过此地址解析版本与 tarball，与 Deno 一致）
 pub const JSR_NPM_REGISTRY = "https://npm.jsr.io";
 
-/// 当 SHU_DEBUG_REGISTRY 非空时向 stderr 打印缓存路径与读取结果，便于排查「有 ~/.shu/registry 仍走 pnpm」等问题。
+/// 当 SHU_DEBUG_REGISTRY 非空时向 stderr 打印缓存路径与读取结果，便于排查「有 ~/.shu/registry 仍走 pnpm」等问题。Zig 0.16 使用 std.Io.File.stderr() + Writer。
 fn debugLogRegistryCache(path: []const u8, ok: bool, url: ?[]const u8) void {
-    const env = std.posix.getenv("SHU_DEBUG_REGISTRY") orelse return;
-    if (env.len == 0) return;
+    const env = std.c.getenv("SHU_DEBUG_REGISTRY") orelse return;
+    if (std.mem.span(env).len == 0) return;
+    const io = libs_process.getProcessIo() orelse return;
     var buf: [512]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
+    var w = std.Io.File.Writer.init(std.Io.File.stderr(), io, &buf);
     if (url) |u|
         w.interface.print("[shu registry] cache path={s} read_ok={} url={s}\n", .{ path, ok, u }) catch return
     else
         w.interface.print("[shu registry] cache path={s} read_ok={} url=null\n", .{ path, ok }) catch return;
-    w.interface.flush() catch return;
+    w.flush() catch return;
 }
 
 /// 从 ~/.shu/registry 读取上次可用的 registry URL（一行，trim）；不存在或读失败返回 null。调用方 free 返回的切片。供 install 在存在缓存时优先使用，覆盖 .npmrc 的 registry。
 pub fn getCachedRegistry(allocator: std.mem.Allocator) ?[]const u8 {
     const shu_home = cache.getShuHome(allocator) catch {
-        if (std.posix.getenv("SHU_DEBUG_REGISTRY")) |e| {
-            if (e.len > 0) _ = std.posix.write(2, "[shu registry] getShuHome failed\n") catch {};
+        if (std.c.getenv("SHU_DEBUG_REGISTRY")) |e| {
+            if (std.mem.span(e).len > 0) {
+                const msg = "[shu registry] getShuHome failed\n";
+                _ = std.c.write(2, msg.ptr, msg.len);
+            }
         }
         return null;
     };
     defer allocator.free(shu_home);
-    const registry_path = io_core.pathJoin(allocator, &.{ shu_home, "registry" }) catch return null;
+    const registry_path = libs_io.pathJoin(allocator, &.{ shu_home, "registry" }) catch return null;
     defer allocator.free(registry_path);
-    var f = io_core.openFileAbsolute(registry_path, .{}) catch {
+    const io = libs_process.getProcessIo() orelse return null;
+    var f = libs_io.openFileAbsolute(registry_path, .{}) catch {
         debugLogRegistryCache(registry_path, false, null);
         return null;
     };
-    defer f.close();
-    var buf: [512]u8 = undefined;
-    var total: usize = 0;
-    while (total < buf.len) {
-        const n = f.read(buf[total..]) catch return null;
-        if (n == 0) break;
-        total += n;
-    }
-    const line = std.mem.trim(u8, buf[0..total], " \t\r\n");
+    defer f.close(io);
+    var file_reader = f.reader(io, &.{});
+    const content = file_reader.interface.allocRemaining(allocator, std.Io.Limit.limited(512)) catch return null;
+    defer allocator.free(content);
+    const line = std.mem.trim(u8, content, " \t\r\n");
     if (line.len == 0) {
         debugLogRegistryCache(registry_path, true, null);
         return null;
@@ -90,22 +93,23 @@ pub fn getCachedRegistry(allocator: std.mem.Allocator) ?[]const u8 {
 fn setCachedRegistry(allocator: std.mem.Allocator, url: []const u8) void {
     const shu_home = cache.getShuHome(allocator) catch return;
     defer allocator.free(shu_home);
-    io_core.makePathAbsolute(shu_home) catch return;
-    const registry_path = io_core.pathJoin(allocator, &.{ shu_home, "registry" }) catch return;
+    libs_io.makePathAbsolute(shu_home) catch return;
+    const registry_path = libs_io.pathJoin(allocator, &.{ shu_home, "registry" }) catch return;
     defer allocator.free(registry_path);
-    var f = io_core.createFileAbsolute(registry_path, .{}) catch return;
-    defer f.close();
-    f.writeAll(url) catch {};
-    f.writeAll("\n") catch {};
+    const io = libs_process.getProcessIo() orelse return;
+    var f = libs_io.createFileAbsolute(registry_path, .{}) catch return;
+    defer f.close(io);
+    f.writeStreamingAll(io, url) catch {};
+    f.writeStreamingAll(io, "\n") catch {};
 }
 
 /// 删除 ~/.shu/registry，使下次 getCachedRegistry 返回 null。当缓存的 URL 请求失败（如 DNS 不可达）时调用，避免反复使用不可用镜像。
 fn clearCachedRegistry(allocator: std.mem.Allocator) void {
     const shu_home = cache.getShuHome(allocator) catch return;
     defer allocator.free(shu_home);
-    const registry_path = io_core.pathJoin(allocator, &.{ shu_home, "registry" }) catch return;
+    const registry_path = libs_io.pathJoin(allocator, &.{ shu_home, "registry" }) catch return;
     defer allocator.free(registry_path);
-    io_core.deleteFileAbsolute(registry_path) catch {};
+    libs_io.deleteFileAbsolute(registry_path) catch {};
 }
 
 /// 单次探测结果：响应耗时（纳秒）与 body；主线程顺序探测时使用，避免多线程共享 allocator（GPA 非线程安全）导致全部失败。
@@ -128,6 +132,7 @@ fn probeRegistriesByPackageRequestAndSetCache(allocator: std.mem.Allocator, name
     defer for (&results) |*r| {
         if (r.body) |b| allocator.free(b);
     };
+    const io = libs_process.getProcessIo() orelse return error.ProcessIoNotSet;
     var last_probe_err: anyerror = error.EmptyRegistryResponse;
     for (REGISTRY_LIST, &results) |base, *res| {
         const url = buildRegistryUrl(allocator, base, name) catch |e| {
@@ -135,13 +140,14 @@ fn probeRegistriesByPackageRequestAndSetCache(allocator: std.mem.Allocator, name
             continue;
         };
         defer allocator.free(url);
-        const start = std.time.nanoTimestamp();
+        const start_ts = std.Io.Clock.Timestamp.now(io, .awake);
         const body = registryGet(allocator, url, getRegistryMetaMaxBytes(), PROBE_TIMEOUT_SEC) catch |e| {
             last_probe_err = e;
             continue;
         };
-        const end = std.time.nanoTimestamp();
-        res.elapsed_ns = if (end >= start) @intCast(end - start) else 0;
+        const dur = start_ts.untilNow(io);
+        const ns = dur.raw.nanoseconds;
+        res.elapsed_ns = @intCast(if (ns < 0) 0 else ns);
         res.body = body;
     }
     var best: ?usize = null;
@@ -196,17 +202,19 @@ pub fn probeRegistriesWithPingThenResolvePackage(
     // 探测改为 ping：对 REGISTRY_LIST 顺序请求 GET base/-/ping、记时，选响应延时最短的镜像写入缓存
     const ping_max_bytes = 1024;
     var ping_results: [REGISTRY_LIST.len]struct { elapsed_ns: u64 = 0, ok: bool = false } = undefined;
+    const io = libs_process.getProcessIo() orelse return error.ProcessIoNotSet;
     for (REGISTRY_LIST, &ping_results) |base, *res| {
         const trim_len = if (base.len > 0 and base[base.len - 1] == '/') base.len - 1 else base.len;
         const ping_url = std.mem.concat(allocator, u8, &.{ base[0..trim_len], "/-/ping" }) catch continue;
         defer allocator.free(ping_url);
-        const start = std.time.nanoTimestamp();
+        const start_ts = std.Io.Clock.Timestamp.now(io, .awake);
         const body = registryGet(allocator, ping_url, ping_max_bytes, PROBE_TIMEOUT_SEC) catch continue;
         defer allocator.free(body);
-        const end = std.time.nanoTimestamp();
+        const dur = start_ts.untilNow(io);
         const trimmed = std.mem.trim(u8, body, " \t\r\n");
         if (trimmed.len > 0) {
-            res.elapsed_ns = if (end >= start) @intCast(end - start) else 0;
+            const ns = dur.raw.nanoseconds;
+            res.elapsed_ns = @intCast(if (ns < 0) 0 else ns);
             res.ok = true;
         }
     }
@@ -306,17 +314,19 @@ pub fn resolveVersionAndTarball(
         // 无缓存或缓存的 URL 不可用：ping 探测、记时，选延时最短的镜像写入缓存后只对该 URL 发一次包请求；全部 ping 失败再退化为发包请求探测
         const ping_max_bytes = 1024;
         var ping_results: [REGISTRY_LIST.len]struct { elapsed_ns: u64 = 0, ok: bool = false } = undefined;
+        const io = libs_process.getProcessIo() orelse return error.ProcessIoNotSet;
         for (REGISTRY_LIST, &ping_results) |base, *res| {
             const trim_len = if (base.len > 0 and base[base.len - 1] == '/') base.len - 1 else base.len;
             const ping_url = std.mem.concat(allocator, u8, &.{ base[0..trim_len], "/-/ping" }) catch continue;
             defer allocator.free(ping_url);
-            const start = std.time.nanoTimestamp();
+            const start_ts = std.Io.Clock.Timestamp.now(io, .awake);
             const ping_body = registryGet(allocator, ping_url, ping_max_bytes, PROBE_TIMEOUT_SEC) catch continue;
             defer allocator.free(ping_body);
-            const end = std.time.nanoTimestamp();
+            const dur = start_ts.untilNow(io);
             const trimmed = std.mem.trim(u8, ping_body, " \t\r\n");
             if (trimmed.len > 0) {
-                res.elapsed_ns = if (end >= start) @intCast(end - start) else 0;
+                const ns = dur.raw.nanoseconds;
+                res.elapsed_ns = @intCast(if (ns < 0) 0 else ns);
                 res.ok = true;
             }
         }
@@ -430,12 +440,14 @@ pub fn resolveVersionTarballAndDeps(
         // 无缓存或缓存的 URL 不可用：复用统一探测逻辑，完成探测并写入缓存后返回
         return probeRegistriesWithPingThenResolvePackage(allocator, name, version_spec);
     }
-    if (std.posix.getenv("SHU_DEBUG_HTTP")) |env| {
-        if (env.len > 0) {
-            var buf_single: [256]u8 = undefined;
-            var w_single = std.fs.File.stderr().writer(&buf_single);
-            w_single.interface.print("[shu registry] single_url name={s} base={s}\n", .{ name, registry_base }) catch {};
-            w_single.interface.flush() catch {};
+    if (std.c.getenv("SHU_DEBUG_HTTP")) |env| {
+        if (std.mem.span(env).len > 0) {
+            if (libs_process.getProcessIo()) |io| {
+                var buf_single: [256]u8 = undefined;
+                var w_single = std.Io.File.Writer.init(std.Io.File.stderr(), io, &buf_single);
+                w_single.interface.print("[shu registry] single_url name={s} base={s}\n", .{ name, registry_base }) catch {};
+                w_single.flush() catch {};
+            }
         }
     }
     const url = try buildRegistryUrl(allocator, registry_base, name);
@@ -792,35 +804,38 @@ const REGISTRY_ACCEPT = "application/vnd.npm.install-v1+json; q=1.0, application
 
 /// 当 SHU_DEBUG_HTTP 非空时打印 VersionNotFound 时的 version_spec、是否含 versions、body 长度，便于排查精确版本 fallback 是否生效。
 fn debugLogRegistryVersionNotFound(version_spec: []const u8, had_versions: bool, body_len: usize) void {
-    const env = std.posix.getenv("SHU_DEBUG_HTTP") orelse return;
-    if (env.len == 0) return;
+    const env = std.c.getenv("SHU_DEBUG_HTTP") orelse return;
+    if (std.mem.span(env).len == 0) return;
+    const io = libs_process.getProcessIo() orelse return;
     var buf: [256]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
+    var w = std.Io.File.Writer.init(std.Io.File.stderr(), io, &buf);
     w.interface.print("[shu registry] VersionNotFound spec={s} had_versions={} body_len={d}\n", .{ version_spec, had_versions, body_len }) catch return;
-    w.interface.flush() catch return;
+    w.flush() catch return;
 }
 
 /// 当 SHU_DEBUG_REGISTRY 或 SHU_DEBUG_HTTP 非空时，向 stderr 打印 InvalidRegistryResponse 时的 body 长度与预览，便于排查 JSON 解析失败（截断、限流页等）。
 fn debugLogInvalidRegistryResponse(body_trimmed: []const u8) void {
-    const env = std.posix.getenv("SHU_DEBUG_REGISTRY") orelse std.posix.getenv("SHU_DEBUG_HTTP") orelse return;
-    if (env.len == 0) return;
+    const env = std.c.getenv("SHU_DEBUG_REGISTRY") orelse std.c.getenv("SHU_DEBUG_HTTP") orelse return;
+    if (std.mem.span(env).len == 0) return;
+    const io = libs_process.getProcessIo() orelse return;
     var buf: [1024]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
+    var w = std.Io.File.Writer.init(std.Io.File.stderr(), io, &buf);
     w.interface.print("[shu registry] InvalidRegistryResponse body_len={d}\n", .{body_trimmed.len}) catch return;
     const preview_len = @min(384, body_trimmed.len);
     if (preview_len > 0) {
         const preview = body_trimmed[0..preview_len];
         w.interface.print("[shu registry] body_preview: {s}\n", .{preview}) catch return;
     }
-    w.interface.flush() catch return;
+    w.flush() catch return;
 }
 
-/// 当环境变量 SHU_DEBUG_HTTP 非空时，向 stderr 打印 registry 请求的 URL、body 长度与内容预览，用于排查空 body 或非 JSON。Zig 0.15：stderr 用 std.fs.File.stderr().writer(&buf)。
+/// 当环境变量 SHU_DEBUG_HTTP 非空时，向 stderr 打印 registry 请求的 URL、body 长度与内容预览，用于排查空 body 或非 JSON。Zig 0.16 使用 std.Io.File.stderr() + Writer。
 fn debugLogRegistryResponse(url: []const u8, body_trimmed: []const u8) void {
-    const env = std.posix.getenv("SHU_DEBUG_HTTP") orelse return;
-    if (env.len == 0) return;
+    const env = std.c.getenv("SHU_DEBUG_HTTP") orelse return;
+    if (std.mem.span(env).len == 0) return;
+    const io = libs_process.getProcessIo() orelse return;
     var buf: [1024]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
+    var w = std.Io.File.Writer.init(std.Io.File.stderr(), io, &buf);
     w.interface.print("[shu registry debug] url={s}\n", .{url}) catch return;
     w.interface.print("[shu registry debug] body_len={d}\n", .{body_trimmed.len}) catch return;
     const preview_len = @min(512, body_trimmed.len);
@@ -830,30 +845,25 @@ fn debugLogRegistryResponse(url: []const u8, body_trimmed: []const u8) void {
     } else {
         w.interface.print("[shu registry debug] body_preview: (empty)\n", .{}) catch return;
     }
-    w.interface.flush() catch return;
+    w.flush() catch return;
 }
 
-/// 使用 io_core.http 发 GET，带 npm registry 的 Accept 与 User-Agent。accept_encoding = "identity" 避免服务端返回 br/gzip 导致解压失败。调用方 free 返回的切片。
+/// 使用 libs_io.http 发 GET，带 npm registry 的 Accept 与 User-Agent。timeout_sec 保留为 API 兼容，Zig 路径未实现超时，一律走 registryGetWithClient。
+/// 使用 accept_encoding = "identity" 避免 npm CDN 回 br 导致 Zig Head.parse 报错；JSR 单独用 gzip/deflate（fetchUrlForJsrMetaWithClient）。调用方 free 返回的切片。
 fn registryGet(allocator: std.mem.Allocator, url: []const u8, max_bytes: usize, timeout_sec: u32) ![]const u8 {
-    if (timeout_sec > 0) {
-        return io_core.http.get(allocator, url, .{
-            .accept = REGISTRY_ACCEPT,
-            .accept_encoding = "identity",
-            .max_bytes = max_bytes,
-            .timeout_sec = timeout_sec,
-            .user_agent = REGISTRY_USER_AGENT,
-        });
-    }
-    var client = std.http.Client{ .allocator = allocator };
+    _ = timeout_sec;
+    const io = libs_process.getProcessIo() orelse return error.ProcessIoNotSet;
+    var client = std.http.Client{ .allocator = allocator, .io = io };
     defer client.deinit();
     return registryGetWithClient(&client, allocator, url, max_bytes);
 }
 
-/// 与 registryGet 相同，但使用已有 Client 以复用连接；走 Zig 路径、无超时。accept_encoding = "identity" 避免解压失败。
+/// 与 registryGet 相同，但使用已有 Client 以复用连接；走 Zig 路径、无超时。identity 避免 npm CDN 回 br 导致解压失败。
 fn registryGetWithClient(client: *std.http.Client, allocator: std.mem.Allocator, url: []const u8, max_bytes: usize) ![]const u8 {
-    return io_core.http.getWithClient(client, allocator, url, .{
+    return libs_io.http.getWithClient(client, allocator, url, .{
         .accept = REGISTRY_ACCEPT,
         .accept_encoding = "identity",
+        // .accept_encoding = "gzip, deflate",
         .max_bytes = max_bytes,
         .timeout_sec = 0,
         .user_agent = REGISTRY_USER_AGENT,
@@ -869,7 +879,7 @@ pub fn fetchUrlWithAccept(allocator: std.mem.Allocator, url: []const u8, accept_
 
 /// 与 fetchUrlWithAccept 相同，但使用已有 Client 以复用连接；走 Zig 路径、无超时。
 pub fn fetchUrlWithAcceptWithClient(client: *std.http.Client, allocator: std.mem.Allocator, url: []const u8, accept_value: []const u8, max_bytes: usize) ![]const u8 {
-    return io_core.http.getWithClient(client, allocator, url, .{
+    return libs_io.http.getWithClient(client, allocator, url, .{
         .accept = accept_value,
         .max_bytes = max_bytes,
         .timeout_sec = 0,
@@ -879,7 +889,8 @@ pub fn fetchUrlWithAcceptWithClient(client: *std.http.Client, allocator: std.mem
 
 /// 使用 Zig 路径（一次性 std.http.Client）GET url，Accept application/json；供 JSR 元数据拉取。
 pub fn fetchUrlForJsrMeta(allocator: std.mem.Allocator, url: []const u8, max_bytes: usize) ![]const u8 {
-    var client = std.http.Client{ .allocator = allocator };
+    const io = libs_process.getProcessIo() orelse return error.ProcessIoNotSet;
+    var client = std.http.Client{ .allocator = allocator, .io = io };
     defer client.deinit();
     return fetchUrlForJsrMetaWithClient(&client, allocator, url, max_bytes);
 }
@@ -888,9 +899,8 @@ pub fn fetchUrlForJsrMeta(allocator: std.mem.Allocator, url: []const u8, max_byt
 /// JSR (jsr.io) 返回 Transfer-Encoding: chunked + Content-Encoding: gzip，npm 镜像多返回 Content-Length，故 JSR 易触发 Zig chunked 读 0 字节、npm 不报错。
 /// 使用 accept_encoding = "identity" 时 CDN 常回 Content-Length，走 content-length 路径可避免 chunked 导致的 ReadFailed；用 gzip 则需接受偶发 ReadFailed。
 pub fn fetchUrlForJsrMetaWithClient(client: *std.http.Client, allocator: std.mem.Allocator, url: []const u8, max_bytes: usize) ![]const u8 {
-    return io_core.http.getWithClient(client, allocator, url, .{
+    return libs_io.http.getWithClient(client, allocator, url, .{
         .accept = "application/json",
-        // .accept_encoding = "identity",
         .accept_encoding = "gzip, deflate",
         .max_bytes = max_bytes,
         .user_agent = REGISTRY_USER_AGENT,
@@ -899,11 +909,12 @@ pub fn fetchUrlForJsrMetaWithClient(client: *std.http.Client, allocator: std.mem
     });
 }
 
-/// 将 url 指向的资源下载到 dest_path（覆盖已有文件）；经 io_core.http GET（Zig 路径、一次性 Client），响应体最多 50MB。
+/// 将 url 指向的资源下载到 dest_path（覆盖已有文件）；经 libs_io.http GET（Zig 路径、一次性 Client），响应体最多 50MB。
 pub fn downloadToPath(allocator: std.mem.Allocator, url: []const u8, dest_path: []const u8) !void {
     if (std.mem.startsWith(u8, url, "http://")) return error.HttpNotSupported;
     if (!std.mem.startsWith(u8, url, "https://")) return error.InvalidUrl;
-    var client = std.http.Client{ .allocator = allocator };
+    const io = libs_process.getProcessIo() orelse return error.ProcessIoNotSet;
+    var client = std.http.Client{ .allocator = allocator, .io = io };
     defer client.deinit();
     try downloadToPathWithClient(&client, allocator, url, dest_path);
 }
@@ -912,16 +923,17 @@ pub fn downloadToPath(allocator: std.mem.Allocator, url: []const u8, dest_path: 
 pub fn downloadToPathWithClient(client: *std.http.Client, allocator: std.mem.Allocator, url: []const u8, dest_path: []const u8) !void {
     if (std.mem.startsWith(u8, url, "http://")) return error.HttpNotSupported;
     if (!std.mem.startsWith(u8, url, "https://")) return error.InvalidUrl;
-    const body = io_core.http.getWithClient(client, allocator, url, .{
+    const body = libs_io.http.getWithClient(client, allocator, url, .{
         .accept = "*/*",
         .max_bytes = 50 * 1024 * 1024,
         .user_agent = REGISTRY_USER_AGENT,
         .timeout_sec = 0,
     }) catch return error.NetworkError;
     defer allocator.free(body);
-    var file = try io_core.createFileAbsolute(dest_path, .{});
-    defer file.close();
-    try file.writeAll(body);
+    const io = libs_process.getProcessIo() orelse return error.ProcessIoNotSet;
+    var file = try libs_io.createFileAbsolute(dest_path, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, body);
 }
 
 /// 与 downloadToPath 相同；仅支持 https://，http:// 返回 error.HttpNotSupported。供 cli/install 等调用。
