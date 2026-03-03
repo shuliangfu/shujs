@@ -1,9 +1,8 @@
 // npm/JSR registry：解析版本、获取 tarball URL、下载 tarball 到缓存
 // 参考：docs/PACKAGE_DESIGN.md §7；与 cache.zig、install.zig 配合
-// 文件 I/O 经 io_core（§3.0）；网络优先 std.http.Client，DNS 失败时回退到系统 curl（与 Bun 同环境可用）
+// 文件 I/O 经 io_core（§3.0）；网络请求统一经 io_core.http（Zig + libcurl 双路径，支持超时）
 
 const std = @import("std");
-const builtin = @import("builtin");
 const io_core = @import("io_core");
 const cache = @import("cache.zig");
 const npmrc = @import("npmrc.zig");
@@ -11,7 +10,7 @@ const npmrc = @import("npmrc.zig");
 /// 默认 npm registry 根 URL（无末尾斜杠），与 REGISTRY_LIST[0] 一致
 pub const DEFAULT_REGISTRY = "https://registry.npmjs.org";
 
-/// 判断是否为默认 registry（含 .npmrc 中带尾斜杠的写法），以便走多镜像探测与 curl 回退
+/// 判断是否为默认 registry（含 .npmrc 中带尾斜杠的写法），以便走多镜像探测与 libcurl 回退
 fn isDefaultRegistry(registry_base: []const u8) bool {
     if (std.mem.eql(u8, registry_base, DEFAULT_REGISTRY)) return true;
     if (std.mem.eql(u8, registry_base, "https://registry.npmjs.org/")) return true;
@@ -26,16 +25,49 @@ pub const REGISTRY_LIST = [_][]const u8{
 };
 /// 全量探测时每个镜像的最大等待时间（秒），避免不可达镜像一直卡住
 const PROBE_TIMEOUT_SEC = 5;
-/// JSR npm 兼容层 registry
-pub const JSR_REGISTRY = "https://registry.npmjs.org";
+/// 无 client 时 registryGet 使用的超时（秒）；>0 使 request() 走 libcurl，避免 Zig 路径 ReadFailed 无重试
+const REGISTRY_GET_FALLBACK_TIMEOUT_SEC: u32 = 30;
+/// 单包 registry 元数据最大响应体字节数：默认 2GB，实际包元数据不会接近此值，相当于不限制。可通过环境变量 SHU_REGISTRY_META_MAX_BYTES 调低（如省内存）。
+const REGISTRY_META_MAX_BYTES_DEFAULT = 2 * 1024 * 1024 * 1024;
 
-/// 从 ~/.shu/registry 读取上次可用的 registry URL（一行，trim）；不存在或读失败返回 null。调用方 free 返回的切片。
-fn getCachedRegistry(allocator: std.mem.Allocator) ?[]const u8 {
-    const shu_home = cache.getShuHome(allocator) catch return null;
+/// 返回当前生效的 registry 元数据最大字节数：若设置了 SHU_REGISTRY_META_MAX_BYTES 则解析该值（clamp 到 1MB～2GB），否则用 REGISTRY_META_MAX_BYTES_DEFAULT（2GB）。
+fn getRegistryMetaMaxBytes() usize {
+    const v = std.posix.getenv("SHU_REGISTRY_META_MAX_BYTES") orelse return REGISTRY_META_MAX_BYTES_DEFAULT;
+    const n = std.fmt.parseInt(usize, v, 10) catch return REGISTRY_META_MAX_BYTES_DEFAULT;
+    return std.math.clamp(n, 1024 * 1024, REGISTRY_META_MAX_BYTES_DEFAULT);
+}
+
+/// JSR npm 兼容层 registry（JSR 包通过此地址解析版本与 tarball，与 Deno 一致）
+pub const JSR_NPM_REGISTRY = "https://npm.jsr.io";
+
+/// 当 SHU_DEBUG_REGISTRY 非空时向 stderr 打印缓存路径与读取结果，便于排查「有 ~/.shu/registry 仍走 pnpm」等问题。
+fn debugLogRegistryCache(path: []const u8, ok: bool, url: ?[]const u8) void {
+    const env = std.posix.getenv("SHU_DEBUG_REGISTRY") orelse return;
+    if (env.len == 0) return;
+    var buf: [512]u8 = undefined;
+    var w = std.fs.File.stderr().writer(&buf);
+    if (url) |u|
+        w.interface.print("[shu registry] cache path={s} read_ok={} url={s}\n", .{ path, ok, u }) catch return
+    else
+        w.interface.print("[shu registry] cache path={s} read_ok={} url=null\n", .{ path, ok }) catch return;
+    w.interface.flush() catch return;
+}
+
+/// 从 ~/.shu/registry 读取上次可用的 registry URL（一行，trim）；不存在或读失败返回 null。调用方 free 返回的切片。供 install 在存在缓存时优先使用，覆盖 .npmrc 的 registry。
+pub fn getCachedRegistry(allocator: std.mem.Allocator) ?[]const u8 {
+    const shu_home = cache.getShuHome(allocator) catch {
+        if (std.posix.getenv("SHU_DEBUG_REGISTRY")) |e| {
+            if (e.len > 0) _ = std.posix.write(2, "[shu registry] getShuHome failed\n") catch {};
+        }
+        return null;
+    };
     defer allocator.free(shu_home);
     const registry_path = io_core.pathJoin(allocator, &.{ shu_home, "registry" }) catch return null;
     defer allocator.free(registry_path);
-    var f = io_core.openFileAbsolute(registry_path, .{}) catch return null;
+    var f = io_core.openFileAbsolute(registry_path, .{}) catch {
+        debugLogRegistryCache(registry_path, false, null);
+        return null;
+    };
     defer f.close();
     var buf: [512]u8 = undefined;
     var total: usize = 0;
@@ -45,8 +77,13 @@ fn getCachedRegistry(allocator: std.mem.Allocator) ?[]const u8 {
         total += n;
     }
     const line = std.mem.trim(u8, buf[0..total], " \t\r\n");
-    if (line.len == 0) return null;
-    return allocator.dupe(u8, line) catch null;
+    if (line.len == 0) {
+        debugLogRegistryCache(registry_path, true, null);
+        return null;
+    }
+    const result = allocator.dupe(u8, line) catch return null;
+    debugLogRegistryCache(registry_path, true, result);
+    return result;
 }
 
 /// 将可用的 registry URL 写入 ~/.shu/registry（单行），供后续优先使用。会先创建 ~/.shu 目录。
@@ -62,20 +99,171 @@ fn setCachedRegistry(allocator: std.mem.Allocator, url: []const u8) void {
     f.writeAll("\n") catch {};
 }
 
+/// 删除 ~/.shu/registry，使下次 getCachedRegistry 返回 null。当缓存的 URL 请求失败（如 DNS 不可达）时调用，避免反复使用不可用镜像。
+fn clearCachedRegistry(allocator: std.mem.Allocator) void {
+    const shu_home = cache.getShuHome(allocator) catch return;
+    defer allocator.free(shu_home);
+    const registry_path = io_core.pathJoin(allocator, &.{ shu_home, "registry" }) catch return;
+    defer allocator.free(registry_path);
+    io_core.deleteFileAbsolute(registry_path) catch {};
+}
+
 /// 单次探测结果：响应耗时（纳秒）与 body；主线程顺序探测时使用，避免多线程共享 allocator（GPA 非线程安全）导致全部失败。
 const ProbeResult = struct {
     elapsed_ns: u64 = 0,
     body: ?[]const u8 = null,
 };
 
+/// resolveVersionTarballAndDeps / probeRegistriesWithPingThenResolvePackage 的返回类型；调用方须 free version、tarball_url 及 dependencies 的 key/value 并 deinit(dependencies)。
+pub const TarballAndDepsResult = struct {
+    version: []const u8,
+    tarball_url: []const u8,
+    dependencies: std.StringArrayHashMap([]const u8),
+};
+
+/// 用「包请求」探测镜像：对 REGISTRY_LIST 顺序发 GET /包名、记时，选响应最快且含 "versions" 的镜像写入缓存，返回该镜像的 body。调用方 free 返回的 body。供 ping 全部失败时兜底。全部不可达时返回 error.AllRegistriesUnreachable。
+fn probeRegistriesByPackageRequestAndSetCache(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+    var results: [REGISTRY_LIST.len]ProbeResult = undefined;
+    for (&results) |*r| r.* = .{ .elapsed_ns = 0, .body = null };
+    defer for (&results) |*r| {
+        if (r.body) |b| allocator.free(b);
+    };
+    var last_probe_err: anyerror = error.EmptyRegistryResponse;
+    for (REGISTRY_LIST, &results) |base, *res| {
+        const url = buildRegistryUrl(allocator, base, name) catch |e| {
+            last_probe_err = e;
+            continue;
+        };
+        defer allocator.free(url);
+        const start = std.time.nanoTimestamp();
+        const body = registryGet(allocator, url, getRegistryMetaMaxBytes(), PROBE_TIMEOUT_SEC) catch |e| {
+            last_probe_err = e;
+            continue;
+        };
+        const end = std.time.nanoTimestamp();
+        res.elapsed_ns = if (end >= start) @intCast(end - start) else 0;
+        res.body = body;
+    }
+    var best: ?usize = null;
+    var best_ns: u64 = std.math.maxInt(u64);
+    const versions_key = "\"versions\"";
+    for (results, 0..) |r, i| {
+        const body = r.body orelse continue;
+        const trimmed = std.mem.trim(u8, body, " \t\r\n");
+        if (trimmed.len == 0 or trimmed[0] != '{') continue;
+        if (std.mem.indexOf(u8, trimmed, versions_key) == null) continue;
+        if (r.elapsed_ns < best_ns) {
+            best_ns = r.elapsed_ns;
+            best = i;
+        }
+    }
+    if (best == null) {
+        for (results, 0..) |r, i| {
+            const body = r.body orelse continue;
+            const trimmed = std.mem.trim(u8, body, " \t\r\n");
+            if (trimmed.len == 0 or trimmed[0] != '{') continue;
+            if (r.elapsed_ns < best_ns) {
+                best_ns = r.elapsed_ns;
+                best = i;
+            }
+        }
+    }
+    if (best) |winner_i| {
+        setCachedRegistry(allocator, REGISTRY_LIST[winner_i]);
+        return allocator.dupe(u8, results[winner_i].body.?);
+    }
+    for (REGISTRY_LIST) |base| {
+        const url_curl = buildRegistryUrl(allocator, base, name) catch continue;
+        defer allocator.free(url_curl);
+        const body_curl = registryGet(allocator, url_curl, getRegistryMetaMaxBytes(), REGISTRY_GET_FALLBACK_TIMEOUT_SEC) catch continue;
+        defer allocator.free(body_curl);
+        const trimmed = std.mem.trim(u8, body_curl, " \t\r\n");
+        if (trimmed.len == 0 or trimmed[0] != '{') continue;
+        setCachedRegistry(allocator, base);
+        return allocator.dupe(u8, body_curl);
+    }
+    // 所有镜像均不可达，返回明确错误供上层提示用户配置 .npmrc 或使用 VPN
+    return error.AllRegistriesUnreachable;
+}
+
+/// 用「ping」探测镜像再解析包：无缓存时对 REGISTRY_LIST 顺序请求 GET base/-/ping、记时，选延时最短的镜像写入缓存，再只对缓存 URL 发一次包请求并返回解析结果；全部 ping 失败则退化为「包请求探测」。
+/// 供 install 在「无缓存时先完成探测再发后续请求」时调用；也供 resolveVersionTarballAndDeps 无缓存路径复用。调用方须 free 返回的 version、tarball_url，以及 dependencies 的 key/value 并 deinit(dependencies)。
+pub fn probeRegistriesWithPingThenResolvePackage(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    version_spec: []const u8,
+) !TarballAndDepsResult {
+    // 探测改为 ping：对 REGISTRY_LIST 顺序请求 GET base/-/ping、记时，选响应延时最短的镜像写入缓存
+    const ping_max_bytes = 1024;
+    var ping_results: [REGISTRY_LIST.len]struct { elapsed_ns: u64 = 0, ok: bool = false } = undefined;
+    for (REGISTRY_LIST, &ping_results) |base, *res| {
+        const trim_len = if (base.len > 0 and base[base.len - 1] == '/') base.len - 1 else base.len;
+        const ping_url = std.mem.concat(allocator, u8, &.{ base[0..trim_len], "/-/ping" }) catch continue;
+        defer allocator.free(ping_url);
+        const start = std.time.nanoTimestamp();
+        const body = registryGet(allocator, ping_url, ping_max_bytes, PROBE_TIMEOUT_SEC) catch continue;
+        defer allocator.free(body);
+        const end = std.time.nanoTimestamp();
+        const trimmed = std.mem.trim(u8, body, " \t\r\n");
+        if (trimmed.len > 0) {
+            res.elapsed_ns = if (end >= start) @intCast(end - start) else 0;
+            res.ok = true;
+        }
+    }
+    var best_i: ?usize = null;
+    var best_ns: u64 = std.math.maxInt(u64);
+    for (ping_results, 0..) |r, i| {
+        if (r.ok and r.elapsed_ns < best_ns) {
+            best_ns = r.elapsed_ns;
+            best_i = i;
+        }
+    }
+    if (best_i) |i| setCachedRegistry(allocator, REGISTRY_LIST[i]);
+    if (getCachedRegistry(allocator)) |cached| {
+        defer allocator.free(cached);
+        const url = buildRegistryUrl(allocator, cached, name) catch return error.OutOfMemory;
+        defer allocator.free(url);
+        const body = registryGet(allocator, url, getRegistryMetaMaxBytes(), REGISTRY_GET_FALLBACK_TIMEOUT_SEC) catch |e| return e;
+        defer allocator.free(body);
+        const body_trimmed = std.mem.trim(u8, body, " \t\r\n");
+        if (body_trimmed.len == 0 or body_trimmed[0] != '{') return error.EmptyRegistryResponse;
+        const cache_root = cache.getCacheRoot(allocator) catch null;
+        var registry_host: ?[]const u8 = null;
+        if (cache_root != null) registry_host = npmrc.hostFromRegistryUrl(allocator, DEFAULT_REGISTRY) catch null;
+        defer if (cache_root) |c| allocator.free(c);
+        defer if (registry_host) |h| allocator.free(h);
+        const parsed = try parseRegistryResponseWithDeps(allocator, body_trimmed, version_spec);
+        if (cache_root != null and registry_host != null) cache.putCachedMetadata(allocator, cache_root.?, registry_host.?, name, body) catch {};
+        return .{ .version = parsed.version, .tarball_url = parsed.tarball_url, .dependencies = parsed.dependencies };
+    }
+    // ping 全部失败时退化为原来的发包请求探测
+    const cache_root = cache.getCacheRoot(allocator) catch null;
+    var registry_host: ?[]const u8 = null;
+    if (cache_root != null) registry_host = npmrc.hostFromRegistryUrl(allocator, DEFAULT_REGISTRY) catch null;
+    defer if (cache_root) |c| allocator.free(c);
+    defer if (registry_host) |h| allocator.free(h);
+    const body = try probeRegistriesByPackageRequestAndSetCache(allocator, name);
+    defer allocator.free(body);
+    const body_trimmed = std.mem.trim(u8, body, " \t\r\n");
+    const parsed = try parseRegistryResponseWithDeps(allocator, body_trimmed, version_spec);
+    if (cache_root != null and registry_host != null) cache.putCachedMetadata(allocator, cache_root.?, registry_host.?, name, body) catch {};
+    return .{ .version = parsed.version, .tarball_url = parsed.tarball_url, .dependencies = parsed.dependencies };
+}
+
 /// 从 registry 获取包元数据（GET /<name>），解析出 dist-tags.latest 与 versions[].dist.tarball。
-/// 当 registry_base 为 DEFAULT_REGISTRY 时：先读 ~/.shu/registry 用缓存的 URL；若缓存不存在或缓存的 URL 不可用（请求失败或返回空/非 JSON），则对 REGISTRY_LIST 顺序探测（逐个请求、记时），选响应最快且返回有效 JSON 的镜像写入缓存并返回。顺序探测避免多线程共享 allocator 导致请求全部失败。非默认 registry 时仅使用传入的 registry_base。返回的 version 与 tarball_url 由调用方 free。
+/// 当 registry_base 为 DEFAULT_REGISTRY 时：先读 ~/.shu/registry 用缓存的 URL；
+/// 若缓存不存在或缓存的 URL 不可用，则对 REGISTRY_LIST 用 GET base/-/ping 探测、记时，选延时最短的镜像写入缓存后只对该 URL 发一次包请求；
+/// 全部 ping 失败再退化为发包请求探测、记时选最快。
+/// 非默认 registry 时仅使用传入的 registry_base。返回的 version 与 tarball_url 由调用方 free。
+/// client 非 null 时在单 URL 路径（缓存的 URL、非默认 registry）用其复用连接。
 pub fn resolveVersionAndTarball(
     allocator: std.mem.Allocator,
     registry_base: []const u8,
     name: []const u8,
     version_spec: []const u8,
+    client: ?*std.http.Client,
 ) !struct { version: []const u8, tarball_url: []const u8 } {
+    _ = client; // npm 元数据已统一走 registryGet（libcurl），保留参数以兼容调用方
     // 优先读元数据缓存，避免重复请求 registry
     const cache_root = cache.getCacheRoot(allocator) catch null;
     var registry_host: ?[]const u8 = null;
@@ -100,7 +288,10 @@ pub fn resolveVersionAndTarball(
             defer allocator.free(cached);
             const url = buildRegistryUrl(allocator, cached, name) catch break :try_cached;
             defer allocator.free(url);
-            const body = httpGet(allocator, url, 5 * 1024 * 1024) catch break :try_cached; // 访问不了则跳出，下面重新探测
+            const body = registryGet(allocator, url, getRegistryMetaMaxBytes(), REGISTRY_GET_FALLBACK_TIMEOUT_SEC) catch {
+                clearCachedRegistry(allocator);
+                break :try_cached;
+            };
             defer allocator.free(body);
             const body_trimmed = std.mem.trim(u8, body, " \t\r\n");
             if (body_trimmed.len == 0 or body_trimmed[0] != '{') break :try_cached;
@@ -109,82 +300,149 @@ pub fn resolveVersionAndTarball(
             if (cache_root != null and registry_host != null) cache.putCachedMetadata(allocator, cache_root.?, registry_host.?, name, body) catch {};
             return .{ .version = parsed.version, .tarball_url = parsed.tarball_url };
         }
-        // 无缓存或缓存的 URL 不可用：对 REGISTRY_LIST 全部发请求、记时，选响应时间最短的镜像写入缓存并返回；若 Zig httpGet 全部失败再回退到 curl 顺序试
-        var results: [REGISTRY_LIST.len]ProbeResult = undefined;
-        for (&results) |*r| r.* = .{ .elapsed_ns = 0, .body = null };
-        defer for (&results) |*r| {
-            if (r.body) |b| allocator.free(b);
-        };
-        var last_probe_err: anyerror = error.EmptyRegistryResponse;
-        for (REGISTRY_LIST, &results) |base, *res| {
-            const url = buildRegistryUrl(allocator, base, name) catch |e| {
-                last_probe_err = e;
-                continue;
-            };
-            defer allocator.free(url);
+        // 无缓存或缓存的 URL 不可用：ping 探测、记时，选延时最短的镜像写入缓存后只对该 URL 发一次包请求；全部 ping 失败再退化为发包请求探测
+        const ping_max_bytes = 1024;
+        var ping_results: [REGISTRY_LIST.len]struct { elapsed_ns: u64 = 0, ok: bool = false } = undefined;
+        for (REGISTRY_LIST, &ping_results) |base, *res| {
+            const trim_len = if (base.len > 0 and base[base.len - 1] == '/') base.len - 1 else base.len;
+            const ping_url = std.mem.concat(allocator, u8, &.{ base[0..trim_len], "/-/ping" }) catch continue;
+            defer allocator.free(ping_url);
             const start = std.time.nanoTimestamp();
-            const body = httpGetViaCurlWithTimeout(allocator, url, 5 * 1024 * 1024, PROBE_TIMEOUT_SEC) catch |e| {
-                last_probe_err = e;
-                continue;
-            };
+            const ping_body = registryGet(allocator, ping_url, ping_max_bytes, PROBE_TIMEOUT_SEC) catch continue;
+            defer allocator.free(ping_body);
             const end = std.time.nanoTimestamp();
-            res.elapsed_ns = if (end >= start) @intCast(end - start) else 0;
-            res.body = body;
+            const trimmed = std.mem.trim(u8, ping_body, " \t\r\n");
+            if (trimmed.len > 0) {
+                res.elapsed_ns = if (end >= start) @intCast(end - start) else 0;
+                res.ok = true;
+            }
         }
-        var best: ?usize = null;
+        var best_i: ?usize = null;
         var best_ns: u64 = std.math.maxInt(u64);
-        for (results, 0..) |r, i| {
-            const body = r.body orelse continue;
-            const trimmed = std.mem.trim(u8, body, " \t\r\n");
-            if (trimmed.len == 0 or trimmed[0] != '{') continue;
-            if (r.elapsed_ns < best_ns) {
+        for (ping_results, 0..) |r, i| {
+            if (r.ok and r.elapsed_ns < best_ns) {
                 best_ns = r.elapsed_ns;
-                best = i;
+                best_i = i;
             }
         }
-        const winner = best;
-        if (winner == null) {
-            for (REGISTRY_LIST) |base| {
-                const url_curl = buildRegistryUrl(allocator, base, name) catch continue;
-                defer allocator.free(url_curl);
-                const body_curl = httpGetViaCurl(allocator, url_curl, 5 * 1024 * 1024) catch continue;
-                defer allocator.free(body_curl);
-                const trimmed = std.mem.trim(u8, body_curl, " \t\r\n");
-                if (trimmed.len == 0 or trimmed[0] != '{') continue;
-                const parsed = parseRegistryResponse(allocator, trimmed, version_spec) catch continue;
-                setCachedRegistry(allocator, base);
-                if (cache_root != null and registry_host != null) cache.putCachedMetadata(allocator, cache_root.?, registry_host.?, name, body_curl) catch {};
-                return .{ .version = parsed.version, .tarball_url = parsed.tarball_url };
-            }
-            return last_probe_err;
+        if (best_i) |i| setCachedRegistry(allocator, REGISTRY_LIST[i]);
+        try_after_ping: {
+            const cached = getCachedRegistry(allocator) orelse break :try_after_ping;
+            defer allocator.free(cached);
+            const url = buildRegistryUrl(allocator, cached, name) catch break :try_after_ping;
+            defer allocator.free(url);
+            const body = registryGet(allocator, url, getRegistryMetaMaxBytes(), REGISTRY_GET_FALLBACK_TIMEOUT_SEC) catch {
+                clearCachedRegistry(allocator);
+                break :try_after_ping;
+            };
+            defer allocator.free(body);
+            const body_trimmed = std.mem.trim(u8, body, " \t\r\n");
+            if (body_trimmed.len == 0 or body_trimmed[0] != '{') break :try_after_ping;
+            const parsed = parseRegistryResponse(allocator, body_trimmed, version_spec) catch break :try_after_ping;
+            setCachedRegistry(allocator, cached);
+            if (cache_root != null and registry_host != null) cache.putCachedMetadata(allocator, cache_root.?, registry_host.?, name, body) catch {};
+            return .{ .version = parsed.version, .tarball_url = parsed.tarball_url };
         }
-        setCachedRegistry(allocator, REGISTRY_LIST[winner.?]);
-        const body_trimmed = std.mem.trim(u8, results[winner.?].body.?, " \t\r\n");
+        // ping 全部失败：退化为原来的发包请求探测
+        const body_probe = try probeRegistriesByPackageRequestAndSetCache(allocator, name);
+        defer allocator.free(body_probe);
+        const body_trimmed = std.mem.trim(u8, body_probe, " \t\r\n");
         const parsed = try parseRegistryResponse(allocator, body_trimmed, version_spec);
-        if (cache_root != null and registry_host != null) cache.putCachedMetadata(allocator, cache_root.?, registry_host.?, name, results[winner.?].body.?) catch {};
+        if (cache_root != null and registry_host != null) cache.putCachedMetadata(allocator, cache_root.?, registry_host.?, name, body_probe) catch {};
         return .{ .version = parsed.version, .tarball_url = parsed.tarball_url };
     }
     const url = try buildRegistryUrl(allocator, registry_base, name);
     defer allocator.free(url);
-    const body = httpGet(allocator, url, 5 * 1024 * 1024) catch blk: {
-        break :blk httpGetViaCurl(allocator, url, 5 * 1024 * 1024) catch |e| return e;
-    };
+    const body = registryGet(allocator, url, getRegistryMetaMaxBytes(), REGISTRY_GET_FALLBACK_TIMEOUT_SEC) catch |e| return e;
     defer allocator.free(body);
     const body_trimmed = std.mem.trim(u8, body, " \t\r\n");
-    if (body_trimmed.len == 0) return error.EmptyRegistryResponse;
-    if (body_trimmed[0] != '{') return error.RegistryReturnedNonJson;
+    if (body_trimmed.len == 0) {
+        debugLogRegistryResponse(url, body_trimmed);
+        return error.EmptyRegistryResponse;
+    }
+    if (body_trimmed[0] != '{') {
+        debugLogRegistryResponse(url, body_trimmed);
+        return error.RegistryReturnedNonJson;
+    }
     const parsed = try parseRegistryResponse(allocator, body_trimmed, version_spec);
     if (cache_root != null and registry_host != null) cache.putCachedMetadata(allocator, cache_root.?, registry_host.?, name, body) catch {};
     return .{ .version = parsed.version, .tarball_url = parsed.tarball_url };
 }
 
-/// 与 resolveVersionAndTarball 相同，但额外返回该版本的 dependencies（用于传递依赖）。调用方须 free version、tarball_url，并 free dependencies 的 key/value 且 deinit(dependencies)。
+/// 与 resolveVersionAndTarball 相同，但使用 CurlClient 做 GET（libcurl 路径、30s 超时）。供 install 阶段串行解析 npm 元数据，避免 Zig Client 路径的 ReadFailed。
+pub fn resolveVersionAndTarballWithCurlClient(
+    allocator: std.mem.Allocator,
+    registry_base: []const u8,
+    name: []const u8,
+    version_spec: []const u8,
+    curl_client: *io_core.http.CurlClient,
+) !struct { version: []const u8, tarball_url: []const u8 } {
+    const cache_root = cache.getCacheRoot(allocator) catch null;
+    var registry_host: ?[]const u8 = null;
+    if (cache_root != null) registry_host = npmrc.hostFromRegistryUrl(allocator, registry_base) catch null;
+    defer if (cache_root) |c| allocator.free(c);
+    defer if (registry_host) |h| allocator.free(h);
+    if (cache_root != null and registry_host != null) {
+        const cached_body = cache.getCachedMetadata(allocator, cache_root.?, registry_host.?, name);
+        if (cached_body) |b| {
+            defer allocator.free(b);
+            const body_trimmed = std.mem.trim(u8, b, " \t\r\n");
+            if (body_trimmed.len > 0 and body_trimmed[0] == '{') {
+                const parsed = parseRegistryResponse(allocator, body_trimmed, version_spec) catch null;
+                if (parsed) |p| return .{ .version = p.version, .tarball_url = p.tarball_url };
+            }
+        }
+    }
+    if (isDefaultRegistry(registry_base)) {
+        try_cached: {
+            const cached = getCachedRegistry(allocator) orelse break :try_cached;
+            defer allocator.free(cached);
+            const url = buildRegistryUrl(allocator, cached, name) catch break :try_cached;
+            defer allocator.free(url);
+            const body = registryGetWithCurlClient(curl_client, allocator, url, getRegistryMetaMaxBytes()) catch break :try_cached;
+            defer allocator.free(body);
+            const body_trimmed = std.mem.trim(u8, body, " \t\r\n");
+            if (body_trimmed.len == 0 or body_trimmed[0] != '{') break :try_cached;
+            const parsed = parseRegistryResponse(allocator, body_trimmed, version_spec) catch break :try_cached;
+            setCachedRegistry(allocator, cached);
+            if (cache_root != null and registry_host != null) cache.putCachedMetadata(allocator, cache_root.?, registry_host.?, name, body) catch {};
+            return .{ .version = parsed.version, .tarball_url = parsed.tarball_url };
+        }
+        const body_probe = try probeRegistriesByPackageRequestAndSetCache(allocator, name);
+        defer allocator.free(body_probe);
+        const body_trimmed = std.mem.trim(u8, body_probe, " \t\r\n");
+        const parsed = try parseRegistryResponse(allocator, body_trimmed, version_spec);
+        if (cache_root != null and registry_host != null) cache.putCachedMetadata(allocator, cache_root.?, registry_host.?, name, body_probe) catch {};
+        return .{ .version = parsed.version, .tarball_url = parsed.tarball_url };
+    }
+    const url = try buildRegistryUrl(allocator, registry_base, name);
+    defer allocator.free(url);
+    const body = registryGetWithCurlClient(curl_client, allocator, url, getRegistryMetaMaxBytes()) catch |e| return e;
+    defer allocator.free(body);
+    const body_trimmed = std.mem.trim(u8, body, " \t\r\n");
+    if (body_trimmed.len == 0) {
+        debugLogRegistryResponse(url, body_trimmed);
+        return error.EmptyRegistryResponse;
+    }
+    if (body_trimmed[0] != '{') {
+        debugLogRegistryResponse(url, body_trimmed);
+        return error.RegistryReturnedNonJson;
+    }
+    const parsed = try parseRegistryResponse(allocator, body_trimmed, version_spec);
+    if (cache_root != null and registry_host != null) cache.putCachedMetadata(allocator, cache_root.?, registry_host.?, name, body) catch {};
+    return .{ .version = parsed.version, .tarball_url = parsed.tarball_url };
+}
+
+/// 与 resolveVersionAndTarball 相同，但额外返回该版本的 dependencies（用于传递依赖）。client 非 null 时在单 URL 路径复用连接。
+/// 调用方须 free version、tarball_url，并 free dependencies 的 key/value 且 deinit(dependencies)。
 pub fn resolveVersionTarballAndDeps(
     allocator: std.mem.Allocator,
     registry_base: []const u8,
     name: []const u8,
     version_spec: []const u8,
-) !struct { version: []const u8, tarball_url: []const u8, dependencies: std.StringArrayHashMap([]const u8) } {
+    client: ?*std.http.Client,
+) !TarballAndDepsResult {
+    _ = client; // npm 元数据已统一走 registryGet（libcurl），保留参数以兼容调用方
     // 优先读元数据缓存，避免重复请求 registry
     const cache_root = cache.getCacheRoot(allocator) catch null;
     var registry_host: ?[]const u8 = null;
@@ -208,7 +466,10 @@ pub fn resolveVersionTarballAndDeps(
             defer allocator.free(cached);
             const url = buildRegistryUrl(allocator, cached, name) catch break :try_cached;
             defer allocator.free(url);
-            const body = httpGet(allocator, url, 5 * 1024 * 1024) catch break :try_cached;
+            const body = registryGet(allocator, url, getRegistryMetaMaxBytes(), REGISTRY_GET_FALLBACK_TIMEOUT_SEC) catch {
+                clearCachedRegistry(allocator);
+                break :try_cached;
+            };
             defer allocator.free(body);
             const body_trimmed = std.mem.trim(u8, body, " \t\r\n");
             if (body_trimmed.len == 0 or body_trimmed[0] != '{') break :try_cached;
@@ -217,69 +478,30 @@ pub fn resolveVersionTarballAndDeps(
             if (cache_root != null and registry_host != null) cache.putCachedMetadata(allocator, cache_root.?, registry_host.?, name, body) catch {};
             return .{ .version = parsed.version, .tarball_url = parsed.tarball_url, .dependencies = parsed.dependencies };
         }
-        // 与 resolveVersionAndTarball 一致：对 REGISTRY_LIST 全部请求、记时，选响应最短的镜像
-        var results: [REGISTRY_LIST.len]ProbeResult = undefined;
-        for (&results) |*r| r.* = .{ .elapsed_ns = 0, .body = null };
-        defer for (&results) |*r| {
-            if (r.body) |b| allocator.free(b);
-        };
-        var last_probe_err: anyerror = error.EmptyRegistryResponse;
-        for (REGISTRY_LIST, &results) |base, *res| {
-            const url = buildRegistryUrl(allocator, base, name) catch |e| {
-                last_probe_err = e;
-                continue;
-            };
-            defer allocator.free(url);
-            const start = std.time.nanoTimestamp();
-            const body = httpGetViaCurlWithTimeout(allocator, url, 5 * 1024 * 1024, PROBE_TIMEOUT_SEC) catch |e| {
-                last_probe_err = e;
-                continue;
-            };
-            const end = std.time.nanoTimestamp();
-            res.elapsed_ns = if (end >= start) @intCast(end - start) else 0;
-            res.body = body;
+        // 无缓存或缓存的 URL 不可用：复用统一探测逻辑，完成探测并写入缓存后返回
+        return probeRegistriesWithPingThenResolvePackage(allocator, name, version_spec);
+    }
+    if (std.posix.getenv("SHU_DEBUG_HTTP")) |env| {
+        if (env.len > 0) {
+            var buf_single: [256]u8 = undefined;
+            var w_single = std.fs.File.stderr().writer(&buf_single);
+            w_single.interface.print("[shu registry] single_url name={s} base={s}\n", .{ name, registry_base }) catch {};
+            w_single.interface.flush() catch {};
         }
-        var best: ?usize = null;
-        var best_ns: u64 = std.math.maxInt(u64);
-        for (results, 0..) |r, i| {
-            const body = r.body orelse continue;
-            const trimmed = std.mem.trim(u8, body, " \t\r\n");
-            if (trimmed.len == 0 or trimmed[0] != '{') continue;
-            if (r.elapsed_ns < best_ns) {
-                best_ns = r.elapsed_ns;
-                best = i;
-            }
-        }
-        if (best) |winner_i| {
-            setCachedRegistry(allocator, REGISTRY_LIST[winner_i]);
-            const body_trimmed = std.mem.trim(u8, results[winner_i].body.?, " \t\r\n");
-            const parsed = try parseRegistryResponseWithDeps(allocator, body_trimmed, version_spec);
-            if (cache_root != null and registry_host != null) cache.putCachedMetadata(allocator, cache_root.?, registry_host.?, name, results[winner_i].body.?) catch {};
-            return .{ .version = parsed.version, .tarball_url = parsed.tarball_url, .dependencies = parsed.dependencies };
-        }
-        for (REGISTRY_LIST) |base| {
-            const url_curl = buildRegistryUrl(allocator, base, name) catch continue;
-            defer allocator.free(url_curl);
-            const body_curl = httpGetViaCurl(allocator, url_curl, 5 * 1024 * 1024) catch continue;
-            defer allocator.free(body_curl);
-            const trimmed = std.mem.trim(u8, body_curl, " \t\r\n");
-            if (trimmed.len == 0 or trimmed[0] != '{') continue;
-            const parsed = parseRegistryResponseWithDeps(allocator, trimmed, version_spec) catch continue;
-            setCachedRegistry(allocator, base);
-            if (cache_root != null and registry_host != null) cache.putCachedMetadata(allocator, cache_root.?, registry_host.?, name, body_curl) catch {};
-            return .{ .version = parsed.version, .tarball_url = parsed.tarball_url, .dependencies = parsed.dependencies };
-        }
-        return error.AllRegistriesUnreachable;
     }
     const url = try buildRegistryUrl(allocator, registry_base, name);
     defer allocator.free(url);
-    const body = httpGet(allocator, url, 5 * 1024 * 1024) catch blk: {
-        break :blk httpGetViaCurl(allocator, url, 5 * 1024 * 1024) catch |e| return e;
-    };
+    const body = registryGet(allocator, url, getRegistryMetaMaxBytes(), REGISTRY_GET_FALLBACK_TIMEOUT_SEC) catch |e| return e;
     defer allocator.free(body);
     const body_trimmed = std.mem.trim(u8, body, " \t\r\n");
-    if (body_trimmed.len == 0) return error.EmptyRegistryResponse;
-    if (body_trimmed[0] != '{') return error.RegistryReturnedNonJson;
+    if (body_trimmed.len == 0) {
+        debugLogRegistryResponse(url, body_trimmed);
+        return error.EmptyRegistryResponse;
+    }
+    if (body_trimmed[0] != '{') {
+        debugLogRegistryResponse(url, body_trimmed);
+        return error.RegistryReturnedNonJson;
+    }
     const parsed = try parseRegistryResponseWithDeps(allocator, body_trimmed, version_spec);
     if (cache_root != null and registry_host != null) cache.putCachedMetadata(allocator, cache_root.?, registry_host.?, name, body) catch {};
     return .{ .version = parsed.version, .tarball_url = parsed.tarball_url, .dependencies = parsed.dependencies };
@@ -291,17 +513,25 @@ fn parseRegistryResponse(
     body_trimmed: []const u8,
     version_spec: []const u8,
 ) !struct { version: []const u8, tarball_url: []const u8 } {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body_trimmed, .{ .allocate = .alloc_always }) catch return error.InvalidRegistryResponse;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body_trimmed, .{ .allocate = .alloc_always }) catch {
+        debugLogInvalidRegistryResponse(body_trimmed);
+        return error.InvalidRegistryResponse;
+    };
     defer parsed.deinit();
     const root = parsed.value;
-    if (root != .object) return error.InvalidRegistryResponse;
+    if (root != .object) {
+        debugLogInvalidRegistryResponse(body_trimmed);
+        return error.InvalidRegistryResponse;
+    }
     const obj = root.object;
 
     const version = blk: {
         const exact = isExactVersion(version_spec);
         if (exact) {
+            var had_versions = false;
             if (obj.get("versions")) |v| {
                 if (v == .object) {
+                    had_versions = true;
                     if (v.object.get(version_spec)) |ver_entry| {
                         if (ver_entry == .object) {
                             if (ver_entry.object.get("dist")) |dist| {
@@ -315,8 +545,12 @@ fn parseRegistryResponse(
                             }
                         }
                     }
+                    // 精确版本不存在：先选比请求版本稍新的最小版本（>=version_spec），没有再选比请求版本稍旧的最大版本（<version_spec），都没有则安装失败
+                    if (minSatisfyingVersion(allocator, v.object, version_spec, true)) |chosen| break :blk chosen;
+                    if (maxVersionLessThan(allocator, v.object, version_spec, true)) |chosen| break :blk chosen;
                 }
             }
+            debugLogRegistryVersionNotFound(version_spec, had_versions, body_trimmed.len);
             return error.VersionNotFound;
         }
         if (obj.get("versions")) |v| {
@@ -436,14 +670,16 @@ fn isExactVersion(spec: []const u8) bool {
     return true;
 }
 
-/// 解析 "major.minor.patch" 或 "major.minor.patch-pre" 为数字；不合法返回 null。
+/// 解析 "major.minor.patch" 或 "major.minor.patch-pre" 为数字；可选前导 "v"/"V" 会跳过。不合法返回 null。
 fn parseVersionParts(s: []const u8) ?struct { major: u32, minor: u32, patch: u32 } {
+    var rest = s;
+    if (rest.len > 0 and (rest[0] == 'v' or rest[0] == 'V')) rest = rest[1..];
     var i: usize = 0;
     var part: u32 = 0;
     var parts: [3]u32 = .{ 0, 0, 0 };
     var idx: usize = 0;
-    while (i < s.len and idx < 3) : (i += 1) {
-        const c = s[i];
+    while (i < rest.len and idx < 3) : (i += 1) {
+        const c = rest[i];
         if (c == '.' or c == '-' or c == '+') {
             if (idx < 3) parts[idx] = part;
             idx += 1;
@@ -510,6 +746,77 @@ fn maxSatisfyingVersion(allocator: std.mem.Allocator, versions_obj: std.json.Obj
     return best;
 }
 
+/// 从 registry 的 versions 对象中选出满足 ">=version_spec" 的最小版本（比请求版本稍新）；stable_only 为 true 时仅考虑稳定版。返回的切片由调用方 free，无满足版本返回 null。
+fn minSatisfyingVersion(allocator: std.mem.Allocator, versions_obj: std.json.ObjectMap, version_spec: []const u8, stable_only: bool) ?[]const u8 {
+    const spec = std.fmt.allocPrint(allocator, ">={s}", .{version_spec}) catch return null;
+    defer allocator.free(spec);
+    var best: ?[]const u8 = null;
+    var it = versions_obj.iterator();
+    while (it.next()) |entry| {
+        const ver = entry.key_ptr.*;
+        if (stable_only and !isStableVersion(ver)) continue;
+        if (!satisfiesRange(ver, spec)) continue;
+        if (best) |b| {
+            if (compareVersion(ver, b) < 0) {
+                allocator.free(b);
+                best = allocator.dupe(u8, ver) catch continue;
+            }
+        } else {
+            best = allocator.dupe(u8, ver) catch continue;
+        }
+    }
+    return best;
+}
+
+/// 从 registry 的 versions 对象中选出严格小于 version_spec 的最大版本（比请求版本稍旧）；stable_only 为 true 时仅考虑稳定版。返回的切片由调用方 free，无满足版本返回 null。
+fn maxVersionLessThan(allocator: std.mem.Allocator, versions_obj: std.json.ObjectMap, version_spec: []const u8, stable_only: bool) ?[]const u8 {
+    var best: ?[]const u8 = null;
+    var it = versions_obj.iterator();
+    while (it.next()) |entry| {
+        const ver = entry.key_ptr.*;
+        if (stable_only and !isStableVersion(ver)) continue;
+        if (compareVersion(ver, version_spec) >= 0) continue;
+        if (best) |b| {
+            if (compareVersion(ver, b) > 0) {
+                allocator.free(b);
+                best = allocator.dupe(u8, ver) catch continue;
+            }
+        } else {
+            best = allocator.dupe(u8, ver) catch continue;
+        }
+    }
+    return best;
+}
+
+/// 根据 registry_base、包名、版本构造 npm tarball 的 URL；与 npm 约定一致，无需请求元数据。
+/// 格式：{registry_base}/{name}/-/{tarball_filename}.tgz；scoped 包 @scope/name 的 tarball 文件名为 name-version.tgz（仅取 / 后一段），与 registry.npmjs.org 一致。调用方 free 返回值。
+pub fn buildTarballUrl(allocator: std.mem.Allocator, registry_base: []const u8, name: []const u8, version: []const u8) ![]const u8 {
+    var base = registry_base;
+    if (base.len > 0 and base[base.len - 1] == '/') base = base[0 .. base.len - 1];
+    const tarball_name = if (std.mem.indexOf(u8, name, "/")) |slash_pos|
+        try allocator.dupe(u8, name[slash_pos + 1 ..])
+    else
+        try allocator.dupe(u8, name);
+    defer allocator.free(tarball_name);
+    const suffix = try std.fmt.allocPrint(allocator, "-{s}.tgz", .{version});
+    defer allocator.free(suffix);
+    const encoded_name = if (std.mem.indexOf(u8, name, "/")) |_|
+        try std.mem.replaceOwned(u8, allocator, name, "/", "%2F")
+    else
+        try allocator.dupe(u8, name);
+    defer allocator.free(encoded_name);
+    const cap = base.len + 1 + encoded_name.len + "/-/".len + tarball_name.len + suffix.len;
+    var list = std.ArrayList(u8).initCapacity(allocator, cap) catch return error.OutOfMemory;
+    defer list.deinit(allocator);
+    try list.appendSlice(allocator, base);
+    try list.append(allocator, '/');
+    try list.appendSlice(allocator, encoded_name);
+    try list.appendSlice(allocator, "/-/");
+    try list.appendSlice(allocator, tarball_name);
+    try list.appendSlice(allocator, suffix);
+    return list.toOwnedSlice(allocator);
+}
+
 /// 构建 GET 包元数据的 URL：registry_base 无末尾斜杠，name 可为 @scope/pkg。
 /// 与 Bun 一致：部分 registry（如 AWS CodeArtifact）只认 path 里 / 编码为 %2F，故对 name 中的 / 做编码。
 fn buildRegistryUrl(allocator: std.mem.Allocator, registry_base: []const u8, name: []const u8) ![]const u8 {
@@ -521,8 +828,7 @@ fn buildRegistryUrl(allocator: std.mem.Allocator, registry_base: []const u8, nam
     var list = std.ArrayList(u8).initCapacity(allocator, registry_base.len + 1 + encoded_name.len + 1) catch return error.OutOfMemory;
     defer list.deinit(allocator);
     try list.appendSlice(allocator, registry_base);
-    if (registry_base.len > 0 and registry_base[registry_base.len - 1] == '/') {}
-    else try list.append(allocator, '/');
+    if (registry_base.len > 0 and registry_base[registry_base.len - 1] == '/') {} else try list.append(allocator, '/');
     try list.appendSlice(allocator, encoded_name);
     return list.toOwnedSlice(allocator);
 }
@@ -532,171 +838,181 @@ const REGISTRY_USER_AGENT = "shu/1.0 (registry client)";
 /// npm 官方与部分镜像（如 JFrog）要求的 Accept，与 Bun 一致：https://github.com/oven-sh/bun/blob/main/src/install/NetworkTask.zig
 const REGISTRY_ACCEPT = "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*";
 
-/// 同步 GET url，将响应体读入内存（最多 max_bytes）；自动处理 Content-Encoding: gzip 与重定向（最多 5 次）。调用方 free 返回的切片。
-/// 连接/发送/接收失败时返回真实错误（如 ConnectionRefused、CertificateBundleLoadFailure），便于排查。
-fn httpGet(allocator: std.mem.Allocator, url: []const u8, max_bytes: usize) ![]const u8 {
-    const uri = std.Uri.parse(url) catch return error.InvalidUrl;
-    var client = std.http.Client{ .allocator = allocator };
-    defer client.deinit();
-    const accept_header = std.http.Header{ .name = "Accept", .value = REGISTRY_ACCEPT };
-    var req = client.request(.GET, uri, .{
-        .redirect_behavior = std.http.Client.Request.RedirectBehavior.init(5),
-        .headers = .{
-            .user_agent = .{ .override = REGISTRY_USER_AGENT },
-            .accept_encoding = .{ .override = "gzip, deflate" },
-        },
-        .extra_headers = &.{ accept_header },
-    }) catch |e| return e;
-    defer req.deinit();
-    req.sendBodiless() catch |e| return e;
-    var redirect_buf: [8 * 1024]u8 = undefined;
-    var response = req.receiveHead(&redirect_buf) catch |e| return e;
-    const status = @intFromEnum(response.head.status);
-    if (status < 200 or status >= 300) return error.BadStatus;
-    var transfer_buf: [64]u8 = undefined;
-    var decompress: std.http.Decompress = undefined;
-    const decompress_buf = allocator.alloc(u8, std.compress.flate.max_window_len) catch return error.ResponseTooLarge;
-    defer allocator.free(decompress_buf);
-    const reader = response.readerDecompressing(&transfer_buf, &decompress, decompress_buf);
-    return io_core.readReaderUpTo(allocator, reader, max_bytes);
+/// 当 SHU_DEBUG_HTTP 非空时打印 VersionNotFound 时的 version_spec、是否含 versions、body 长度，便于排查精确版本 fallback 是否生效。
+fn debugLogRegistryVersionNotFound(version_spec: []const u8, had_versions: bool, body_len: usize) void {
+    const env = std.posix.getenv("SHU_DEBUG_HTTP") orelse return;
+    if (env.len == 0) return;
+    var buf: [256]u8 = undefined;
+    var w = std.fs.File.stderr().writer(&buf);
+    w.interface.print("[shu registry] VersionNotFound spec={s} had_versions={} body_len={d}\n", .{ version_spec, had_versions, body_len }) catch return;
+    w.interface.flush() catch return;
 }
 
-/// 使用指定可执行路径的 curl 发 GET，带 Accept/User-Agent，返回 stdout；调用方 free。内部用。
-fn httpGetViaCurlWithExe(allocator: std.mem.Allocator, curl_exe: []const u8, url: []const u8, max_bytes: usize) ![]const u8 {
-    return httpGetViaCurlWithExeTimeout(allocator, curl_exe, url, max_bytes, 0);
+/// 当 SHU_DEBUG_REGISTRY 或 SHU_DEBUG_HTTP 非空时，向 stderr 打印 InvalidRegistryResponse 时的 body 长度与预览，便于排查 JSON 解析失败（截断、限流页等）。
+fn debugLogInvalidRegistryResponse(body_trimmed: []const u8) void {
+    const env = std.posix.getenv("SHU_DEBUG_REGISTRY") orelse std.posix.getenv("SHU_DEBUG_HTTP") orelse return;
+    if (env.len == 0) return;
+    var buf: [1024]u8 = undefined;
+    var w = std.fs.File.stderr().writer(&buf);
+    w.interface.print("[shu registry] InvalidRegistryResponse body_len={d}\n", .{body_trimmed.len}) catch return;
+    const preview_len = @min(384, body_trimmed.len);
+    if (preview_len > 0) {
+        const preview = body_trimmed[0..preview_len];
+        w.interface.print("[shu registry] body_preview: {s}\n", .{preview}) catch return;
+    }
+    w.interface.flush() catch return;
 }
 
-/// 同上，但支持超时：timeout_sec > 0 时追加 curl -m timeout_sec，避免不可达镜像卡住。用于全量探测。
-fn httpGetViaCurlWithExeTimeout(allocator: std.mem.Allocator, curl_exe: []const u8, url: []const u8, max_bytes: usize, timeout_sec: u32) ![]const u8 {
-    const accept_hdr = std.fmt.allocPrint(allocator, "Accept: {s}", .{REGISTRY_ACCEPT}) catch return error.OutOfMemory;
-    defer allocator.free(accept_hdr);
-    const ua_hdr = std.fmt.allocPrint(allocator, "User-Agent: {s}", .{REGISTRY_USER_AGENT}) catch return error.OutOfMemory;
-    defer allocator.free(ua_hdr);
-    const result = if (timeout_sec > 0) blk: {
-        var timeout_buf: [16]u8 = undefined;
-        const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_sec}) catch return error.OutOfMemory;
-        break :blk std.process.Child.run(.{
-            .allocator = allocator,
-            .argv = &.{ curl_exe, "-sL", "-m", timeout_str, "-H", accept_hdr, "-H", ua_hdr, url },
-            .max_output_bytes = max_bytes,
-        }) catch return error.CurlFailed;
-    } else std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ curl_exe, "-sL", "-H", accept_hdr, "-H", ua_hdr, url },
-        .max_output_bytes = max_bytes,
-    }) catch return error.CurlFailed;
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    if (result.term != .Exited or result.term.Exited != 0) return error.CurlFailed;
-    return allocator.dupe(u8, result.stdout);
+/// 当环境变量 SHU_DEBUG_HTTP 非空时，向 stderr 打印 registry 请求的 URL、body 长度与内容预览，用于排查空 body 或非 JSON。Zig 0.15：stderr 用 std.fs.File.stderr().writer(&buf)。
+fn debugLogRegistryResponse(url: []const u8, body_trimmed: []const u8) void {
+    const env = std.posix.getenv("SHU_DEBUG_HTTP") orelse return;
+    if (env.len == 0) return;
+    var buf: [1024]u8 = undefined;
+    var w = std.fs.File.stderr().writer(&buf);
+    w.interface.print("[shu registry debug] url={s}\n", .{url}) catch return;
+    w.interface.print("[shu registry debug] body_len={d}\n", .{body_trimmed.len}) catch return;
+    const preview_len = @min(512, body_trimmed.len);
+    if (preview_len > 0) {
+        const preview = body_trimmed[0..preview_len];
+        w.interface.print("[shu registry debug] body_preview (first {d} bytes):\n{s}\n", .{ preview_len, preview }) catch return;
+    } else {
+        w.interface.print("[shu registry debug] body_preview: (empty)\n", .{}) catch return;
+    }
+    w.interface.flush() catch return;
 }
 
-/// 使用系统 curl 请求 url，将 stdout 读入内存（最多 max_bytes）。用于 Zig 的 HTTP 失败时回退，与 Bun 同终端下可复用系统解析器。npm 要求 Accept: application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*
-/// 返回的切片由调用方 free。curl 未找到或非 0 退出时返回 error.CurlFailed。macOS 上会先试 PATH 中的 curl，失败再试 /usr/bin/curl。
-fn httpGetViaCurl(allocator: std.mem.Allocator, url: []const u8, max_bytes: usize) ![]const u8 {
-    return httpGetViaCurlWithExe(allocator, "curl", url, max_bytes) catch |e| {
-        if (e == error.CurlFailed and (builtin.os.tag == .macos or builtin.os.tag == .freebsd))
-            return httpGetViaCurlWithExe(allocator, "/usr/bin/curl", url, max_bytes);
-        return e;
-    };
+/// 使用 io_core.http 发 GET，带 npm registry 的 Accept 与 User-Agent；timeout_sec > 0 时走 libcurl 超时。accept_encoding = "identity" 避免服务端返回 br/gzip 导致 Zig 路径解压失败或 br 不被支持。调用方 free 返回的切片。
+fn registryGet(allocator: std.mem.Allocator, url: []const u8, max_bytes: usize, timeout_sec: u32) ![]const u8 {
+    return io_core.http.get(allocator, url, .{
+        .accept = REGISTRY_ACCEPT,
+        .accept_encoding = "identity",
+        .max_bytes = max_bytes,
+        .timeout_sec = timeout_sec,
+        .user_agent = REGISTRY_USER_AGENT,
+    });
 }
 
-/// 使用系统 curl 发 GET，带 timeout_sec 超时（-m），用于全量探测时避免单镜像卡住。调用方 free 返回的切片。
-fn httpGetViaCurlWithTimeout(allocator: std.mem.Allocator, url: []const u8, max_bytes: usize, timeout_sec: u32) ![]const u8 {
-    return httpGetViaCurlWithExeTimeout(allocator, "curl", url, max_bytes, timeout_sec) catch |e| {
-        if (e == error.CurlFailed and (builtin.os.tag == .macos or builtin.os.tag == .freebsd))
-            return httpGetViaCurlWithExeTimeout(allocator, "/usr/bin/curl", url, max_bytes, timeout_sec);
-        return e;
-    };
+/// 与 registryGet 相同，但使用已有 Client 以复用连接；走 Zig 路径、无超时。accept_encoding = "identity" 避免解压失败。
+fn registryGetWithClient(client: *std.http.Client, allocator: std.mem.Allocator, url: []const u8, max_bytes: usize) ![]const u8 {
+    return io_core.http.getWithClient(client, allocator, url, .{
+        .accept = REGISTRY_ACCEPT,
+        .accept_encoding = "identity",
+        .max_bytes = max_bytes,
+        .timeout_sec = 0,
+        .user_agent = REGISTRY_USER_AGENT,
+    });
 }
 
-/// 使用指定可执行路径的 curl 下载 url 到 dest_path。内部用。
-fn downloadToPathViaCurlWithExe(allocator: std.mem.Allocator, curl_exe: []const u8, url: []const u8, dest_path: []const u8) !void {
-    var full_argv: [5][]const u8 = .{ curl_exe, "-sL", "-o", dest_path, url };
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &full_argv,
-        .max_output_bytes = 64 * 1024,
-    }) catch return error.CurlFailed;
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    if (result.term != .Exited or result.term.Exited != 0) return error.CurlFailed;
+/// 与 registryGet 相同，但使用已有 CurlClient 以复用连接；走 libcurl 路径、30s 超时。供 install 阶段 npm 元数据解析。accept_encoding = "identity" 避免解压失败。
+fn registryGetWithCurlClient(curl_client: *io_core.http.CurlClient, allocator: std.mem.Allocator, url: []const u8, max_bytes: usize) ![]const u8 {
+    return io_core.http.getWithCurlClient(curl_client, allocator, url, .{
+        .accept = REGISTRY_ACCEPT,
+        .accept_encoding = "identity",
+        .max_bytes = max_bytes,
+        .timeout_sec = 30,
+        .user_agent = REGISTRY_USER_AGENT,
+    });
 }
 
-/// 使用系统 curl 将 url 下载到 dest_path（覆盖已有文件）。用于 Zig 的 downloadToPath 失败（如 ReadFailed）时回退。macOS 上会先试 PATH 中的 curl，失败再试 /usr/bin/curl。
-fn downloadToPathViaCurl(allocator: std.mem.Allocator, url: []const u8, dest_path: []const u8) !void {
-    downloadToPathViaCurlWithExe(allocator, "curl", url, dest_path) catch |e| {
-        if (e == error.CurlFailed and (builtin.os.tag == .macos or builtin.os.tag == .freebsd))
-            return downloadToPathViaCurlWithExe(allocator, "/usr/bin/curl", url, dest_path);
-        return e;
-    };
+/// 使用自定义 Accept 头 GET url（供 JSR 等非 npm registry 使用，如 application/json）。统一经 io_core.http。调用方 free 返回的切片。
+pub fn fetchUrlWithAccept(allocator: std.mem.Allocator, url: []const u8, accept_value: []const u8, max_bytes: usize) ![]const u8 {
+    return io_core.http.get(allocator, url, .{
+        .accept = accept_value,
+        .max_bytes = max_bytes,
+        .user_agent = REGISTRY_USER_AGENT,
+    });
 }
 
-/// 将 https:// URL 指向的资源下载到 dest_path（覆盖已有文件）；仅支持 https://，http:// 返回 error.HttpNotSupported。响应体最多 50MB。
-pub fn downloadUrlToPath(allocator: std.mem.Allocator, url: []const u8, dest_path: []const u8) !void {
+/// 与 fetchUrlWithAccept 相同，但使用已有 Client 以复用连接；走 Zig 路径、无超时。
+pub fn fetchUrlWithAcceptWithClient(client: *std.http.Client, allocator: std.mem.Allocator, url: []const u8, accept_value: []const u8, max_bytes: usize) ![]const u8 {
+    return io_core.http.getWithClient(client, allocator, url, .{
+        .accept = accept_value,
+        .max_bytes = max_bytes,
+        .timeout_sec = 0,
+        .user_agent = REGISTRY_USER_AGENT,
+    });
+}
+
+/// 此处不设 accept_encoding（走 libcurl 时保持 gzip）；若发 identity 而 CDN 仍回 gzip，libcurl 不解压会致 JsrMetaParseError。
+pub fn fetchUrlForJsrMeta(allocator: std.mem.Allocator, url: []const u8, max_bytes: usize) ![]const u8 {
+    return io_core.http.get(allocator, url, .{
+        .accept = "application/json",
+        .max_bytes = max_bytes,
+        .user_agent = REGISTRY_USER_AGENT,
+        .timeout_sec = 30,
+        .extra_headers = &.{.{ .name = "Sec-Fetch-Dest", .value = "empty" }},
+    });
+}
+
+/// 与 fetchUrlForJsrMeta 相同，但使用已有 std.http.Client 以复用连接（Keep-Alive）；走 Zig 路径、无超时。供 JSR 下载 worker 多请求复用同一连接。
+/// 不设 accept_encoding（曾用 identity 避免 ReadFailed，但部分环境仍回 gzip 且未带正确 Content-Encoding，导致 JsrMetaParseError；改回默认 gzip，依赖既有 ReadFailed 重试）。
+pub fn fetchUrlForJsrMetaWithClient(client: *std.http.Client, allocator: std.mem.Allocator, url: []const u8, max_bytes: usize) ![]const u8 {
+    return io_core.http.getWithClient(client, allocator, url, .{
+        .accept = "application/json",
+        .max_bytes = max_bytes,
+        .user_agent = REGISTRY_USER_AGENT,
+        .timeout_sec = 0,
+        .extra_headers = &.{.{ .name = "Sec-Fetch-Dest", .value = "empty" }},
+    });
+}
+
+/// 与 fetchUrlForJsrMeta 相同，但使用已有 io_core.http.CurlClient 以复用连接（libcurl Keep-Alive）；走 libcurl 路径，30s 超时。供 JSR 下载 worker 多请求复用同一连接，避免 Zig Client 复用下 body 读为 0。
+pub fn fetchUrlForJsrMetaWithCurlClient(curl_client: *io_core.http.CurlClient, allocator: std.mem.Allocator, url: []const u8, max_bytes: usize) ![]const u8 {
+    return io_core.http.getWithCurlClient(curl_client, allocator, url, .{
+        .accept = "application/json",
+        .max_bytes = max_bytes,
+        .user_agent = REGISTRY_USER_AGENT,
+        .timeout_sec = 30,
+        .extra_headers = &.{.{ .name = "Sec-Fetch-Dest", .value = "empty" }},
+    });
+}
+
+/// 将 url 指向的资源下载到 dest_path（覆盖已有文件）；经 io_core.http GET，响应体最多 50MB，60s 超时。
+pub fn downloadToPath(allocator: std.mem.Allocator, url: []const u8, dest_path: []const u8) !void {
     if (std.mem.startsWith(u8, url, "http://")) return error.HttpNotSupported;
     if (!std.mem.startsWith(u8, url, "https://")) return error.InvalidUrl;
-    const uri = std.Uri.parse(url) catch return error.InvalidUrl;
-    var client = std.http.Client{ .allocator = allocator };
-    defer client.deinit();
-    var req = client.request(.GET, uri, .{
-        .headers = .{
-            .user_agent = .{ .override = REGISTRY_USER_AGENT },
-            .accept_encoding = .{ .override = "gzip, deflate" },
-        },
+    const body = io_core.http.get(allocator, url, .{
+        .accept = "*/*",
+        .max_bytes = 50 * 1024 * 1024,
+        .user_agent = REGISTRY_USER_AGENT,
+        .timeout_sec = 60,
     }) catch return error.NetworkError;
-    defer req.deinit();
-    req.sendBodiless() catch return error.NetworkError;
-    var redirect_buf: [8 * 1024]u8 = undefined;
-    var response = req.receiveHead(&redirect_buf) catch return error.NetworkError;
-    const status = @intFromEnum(response.head.status);
-    if (status < 200 or status >= 300) return error.BadStatus;
-    var transfer_buf: [8192]u8 = undefined;
-    var decompress: std.http.Decompress = undefined;
-    const decompress_buf = allocator.alloc(u8, std.compress.flate.max_window_len) catch return error.ResponseTooLarge;
-    defer allocator.free(decompress_buf);
-    const reader = response.readerDecompressing(&transfer_buf, &decompress, decompress_buf);
-    const body = io_core.readReaderUpTo(allocator, reader, 50 * 1024 * 1024) catch return error.ResponseTooLarge;
     defer allocator.free(body);
     var file = try io_core.createFileAbsolute(dest_path, .{});
     defer file.close();
     try file.writeAll(body);
 }
 
-/// 将 url 指向的 tarball 下载到 dest_path（覆盖已有文件）；用于先写临时文件再 putCachedTarball。响应体最多 50MB；自动处理 gzip。
-/// 优先用系统 curl（与元数据一致，终端下常可用），失败再用 Zig HTTP。
-pub fn downloadToPath(allocator: std.mem.Allocator, url: []const u8, dest_path: []const u8) !void {
-    downloadToPathViaCurl(allocator, url, dest_path) catch |e| {
-        downloadToPathZig(allocator, url, dest_path) catch return e;
-        return;
-    };
-}
-
-/// Zig 标准库 HTTP 下载到文件；内部用，失败时由 downloadToPath 尝试 curl 回退。
-fn downloadToPathZig(allocator: std.mem.Allocator, url: []const u8, dest_path: []const u8) anyerror!void {
-    const uri = std.Uri.parse(url) catch return error.InvalidUrl;
-    var client = std.http.Client{ .allocator = allocator };
-    defer client.deinit();
-    var req = client.request(.GET, uri, .{
-        .headers = .{
-            .user_agent = .{ .override = REGISTRY_USER_AGENT },
-            .accept_encoding = .{ .override = "gzip, deflate" },
-        },
+/// 与 downloadToPath 相同，但使用已有 std.http.Client 以复用连接；走 Zig 路径、无超时。供 install 阶段连续下载多个 npm tgz 时复用同一连接。
+pub fn downloadToPathWithClient(client: *std.http.Client, allocator: std.mem.Allocator, url: []const u8, dest_path: []const u8) !void {
+    if (std.mem.startsWith(u8, url, "http://")) return error.HttpNotSupported;
+    if (!std.mem.startsWith(u8, url, "https://")) return error.InvalidUrl;
+    const body = io_core.http.getWithClient(client, allocator, url, .{
+        .accept = "*/*",
+        .max_bytes = 50 * 1024 * 1024,
+        .user_agent = REGISTRY_USER_AGENT,
+        .timeout_sec = 0,
     }) catch return error.NetworkError;
-    defer req.deinit();
-    req.sendBodiless() catch return error.NetworkError;
-    var redirect_buf: [8 * 1024]u8 = undefined;
-    var response = req.receiveHead(&redirect_buf) catch return error.NetworkError;
-    const status = @intFromEnum(response.head.status);
-    if (status < 200 or status >= 300) return error.BadStatus;
-    var transfer_buf: [8192]u8 = undefined;
-    var decompress: std.http.Decompress = undefined;
-    const decompress_buf = allocator.alloc(u8, std.compress.flate.max_window_len) catch return error.ResponseTooLarge;
-    defer allocator.free(decompress_buf);
-    const reader = response.readerDecompressing(&transfer_buf, &decompress, decompress_buf);
-    const body = io_core.readReaderUpTo(allocator, reader, 50 * 1024 * 1024) catch return error.ResponseTooLarge;
     defer allocator.free(body);
     var file = try io_core.createFileAbsolute(dest_path, .{});
     defer file.close();
     try file.writeAll(body);
+}
+
+/// 与 downloadToPath 相同，但使用已有 CurlClient 以复用连接（libcurl）；走 libcurl 路径。压缩/解压由 http.zig 内部处理。
+pub fn downloadToPathWithCurlClient(curl_client: *io_core.http.CurlClient, allocator: std.mem.Allocator, url: []const u8, dest_path: []const u8) !void {
+    if (std.mem.startsWith(u8, url, "http://")) return error.HttpNotSupported;
+    if (!std.mem.startsWith(u8, url, "https://")) return error.InvalidUrl;
+    const body = io_core.http.getTarballWithCurlClient(curl_client, allocator, url, .{
+        .user_agent = REGISTRY_USER_AGENT,
+    }) catch return error.NetworkError;
+    defer allocator.free(body);
+    var file = try io_core.createFileAbsolute(dest_path, .{});
+    defer file.close();
+    try file.writeAll(body);
+}
+
+/// 与 downloadToPath 相同；仅支持 https://，http:// 返回 error.HttpNotSupported。供 cli/install 等调用。
+pub fn downloadUrlToPath(allocator: std.mem.Allocator, url: []const u8, dest_path: []const u8) !void {
+    return downloadToPath(allocator, url, dest_path);
 }
