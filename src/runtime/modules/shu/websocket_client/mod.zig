@@ -3,7 +3,8 @@
 
 const std = @import("std");
 const jsc = @import("jsc");
-const errors = @import("../../../../errors.zig");
+const errors = @import("errors");
+const libs_process = @import("libs_process");
 const globals = @import("../../../globals.zig");
 const common = @import("../../../common.zig");
 const run_options = @import("../../../run_options.zig");
@@ -15,7 +16,7 @@ const WS_CLIENT_WRITE_BUF_SIZE = 64 * 1024;
 
 /// 单条 WebSocket 客户端连接状态（Zig 侧）
 pub const ClientState = struct {
-    stream: std.net.Stream,
+    stream: std.Io.net.Stream,
     allocator: std.mem.Allocator,
     /// 读缓冲：未消费的字节；有效数据为 items[read_off..]
     read_buf: std.ArrayList(u8),
@@ -24,7 +25,7 @@ pub const ClientState = struct {
     write_buf: []u8,
 
     /// 连接并完成握手后构造
-    pub fn init(allocator: std.mem.Allocator, stream: std.net.Stream) !ClientState {
+    pub fn init(allocator: std.mem.Allocator, stream: std.Io.net.Stream) !ClientState {
         var read_buf = try std.ArrayList(u8).initCapacity(allocator, 4096);
         const write_buf = allocator.alloc(u8, WS_CLIENT_WRITE_BUF_SIZE) catch {
             read_buf.deinit(allocator);
@@ -38,19 +39,24 @@ pub const ClientState = struct {
         };
     }
 
-    /// 释放 read_buf、write_buf，关闭 stream
+    /// 释放 read_buf、write_buf，关闭 stream。0.16：stream.close(io)
     pub fn deinit(self: *ClientState) void {
         self.read_buf.deinit(self.allocator);
         self.allocator.free(self.write_buf);
-        self.stream.close();
+        const io = libs_process.getProcessIo() orelse return;
+        self.stream.close(io);
     }
 
-    /// 发送一帧（text 或 binary，带 mask）
+    /// 发送一帧（text 或 binary，带 mask）。0.16：io.randomSecure、stream.writer(io).writeVec
     pub fn sendFrame(self: *ClientState, opcode: ws_proto.Opcode, payload: []const u8) !void {
+        const io = libs_process.getProcessIo() orelse return error.NoProcessIo;
         var key: [4]u8 = undefined;
-        std.crypto.random.bytes(&key);
+        io.randomSecure(&key) catch return error.NoProcessIo;
         const n = try ws_proto.buildFrameMasked(self.write_buf, opcode, payload, key);
-        try self.stream.writeAll(self.write_buf[0..n]);
+        var wbuf: [4096]u8 = undefined;
+        var w = self.stream.writer(io, &wbuf);
+        _ = try std.Io.Writer.writeVec(&w.interface, &.{self.write_buf[0..n]});
+        try w.interface.flush();
     }
 
     /// 发送 close 帧：payload 为 2 字节大端 code + 可选 UTF-8 reason（RFC 6455）
@@ -80,9 +86,13 @@ pub const ClientState = struct {
                     },
                     .close => return null,
                     .ping => {
+                        const io = libs_process.getProcessIo() orelse return error.NoProcessIo;
                         var pong_buf: [128]u8 = undefined;
                         const len = ws_proto.buildFrame(&pong_buf, .pong, parsed.payload) catch 2;
-                        try self.stream.writeAll(pong_buf[0..len]);
+                        var wbuf: [256]u8 = undefined;
+                        var w = self.stream.writer(io, &wbuf);
+                        _ = try std.Io.Writer.writeVec(&w.interface, &.{pong_buf[0..len]});
+                        try w.interface.flush();
                         self.read_off += consumed;
                         continue;
                     },
@@ -93,8 +103,12 @@ pub const ClientState = struct {
                 }
             }
             self.compactIfNeeded();
+            const io = libs_process.getProcessIo() orelse return error.NoProcessIo;
             var buf: [4096]u8 = undefined;
-            const n = self.stream.read(&buf) catch return error.ConnectionClosed;
+            var rbuf: [4096]u8 = undefined;
+            var r = self.stream.reader(io, &rbuf);
+            var dest: [1][]u8 = .{buf[0..]};
+            const n = std.Io.Reader.readVec(&r.interface, &dest) catch return error.ConnectionClosed;
             if (n == 0) return null;
             self.read_buf.appendSlice(self.allocator, buf[0..n]) catch return error.OutOfMemory;
         }
@@ -139,19 +153,21 @@ fn parseWsUrl(allocator: std.mem.Allocator, url: []const u8) !struct { host: []c
     return .{ .host = host, .port = port, .path = path };
 }
 
-/// 生成 Sec-WebSocket-Key：16 字节随机数 base64
+/// 生成 Sec-WebSocket-Key：16 字节随机数 base64。0.16：用 io.randomSecure
 fn generateKey(allocator: std.mem.Allocator) ![]const u8 {
+    const io = libs_process.getProcessIo() orelse return error.NoProcessIo;
     var bytes: [16]u8 = undefined;
-    std.crypto.random.bytes(&bytes);
+    io.randomSecure(&bytes) catch return error.NoProcessIo;
     const out = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(16));
     _ = std.base64.standard.Encoder.encode(out, &bytes);
     return out;
 }
 
 /// TCP 连接 + HTTP Upgrade 握手；仅 ws://，校验 101 与 Sec-WebSocket-Accept
-fn connectAndHandshake(allocator: std.mem.Allocator, host: []const u8, port: u16, path: []const u8) !std.net.Stream {
-    const addr = try std.net.Address.resolveIp(host, port);
-    var stream = try std.net.tcpConnectToAddress(addr);
+fn connectAndHandshake(allocator: std.mem.Allocator, host: []const u8, port: u16, path: []const u8) !std.Io.net.Stream {
+    const io = libs_process.getProcessIo() orelse return error.NoProcessIo;
+    const addr = try std.Io.net.IpAddress.resolve(io, host, port);
+    var stream = try std.Io.net.IpAddress.connect(addr, io, .{ .mode = .stream });
     const key_b64 = try generateKey(allocator);
     defer allocator.free(key_b64);
     var req_buf: [2048]u8 = undefined;
@@ -159,12 +175,18 @@ fn connectAndHandshake(allocator: std.mem.Allocator, host: []const u8, port: u16
     const req_len = (std.fmt.bufPrint(&req_buf,
         \\GET {s} HTTP/1.1\r\nHost: {s}:{d}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {s}\r\nSec-WebSocket-Version: 13\r\n\r\n
     , .{ path_safe, host, port, key_b64 }) catch return error.BufferTooSmall).len;
-    try stream.writeAll(req_buf[0..req_len]);
+    var wbuf: [4096]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    _ = try std.Io.Writer.writeVec(&w.interface, &.{req_buf[0..req_len]});
+    try w.interface.flush();
     var resp_buf: [4096]u8 = undefined;
     var total: usize = 0;
+    var rbuf: [4096]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
     while (total < 4 or resp_buf[total - 4] != '\r' or resp_buf[total - 3] != '\n' or resp_buf[total - 2] != '\r' or resp_buf[total - 1] != '\n') {
         if (total >= resp_buf.len) return error.ResponseTooLong;
-        const n = stream.read(resp_buf[total..]) catch return error.ConnectionClosed;
+        var dest: [1][]u8 = .{resp_buf[total..]};
+        const n = std.Io.Reader.readVec(&r.interface, &dest) catch return error.ConnectionClosed;
         if (n == 0) return error.ConnectionClosed;
         total += n;
     }
@@ -248,12 +270,13 @@ fn websocketConstructorCallback(
         errors.reportToStderr(.{ .code = .unknown, .message = msg }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     };
+    const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
     var state = allocator.create(ClientState) catch {
-        stream.close();
+        stream.close(io);
         return jsc.JSValueMakeUndefined(ctx);
     };
     state.* = ClientState.init(allocator, stream) catch {
-        stream.close();
+        stream.close(io);
         allocator.destroy(state);
         errors.reportToStderr(.{ .code = .unknown, .message = "WebSocket: init failed" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
