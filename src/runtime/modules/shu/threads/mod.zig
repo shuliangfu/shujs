@@ -9,6 +9,7 @@ const globals = @import("../../../globals.zig");
 const common = @import("../../../common.zig");
 const run_options = @import("../../../run_options.zig");
 const thread_worker = @import("worker.zig");
+const libs_io = @import("libs_io");
 const strip_types = @import("../../../../transpiler/strip_types.zig");
 const jsx = @import("../../../../transpiler/jsx.zig");
 const run_mod = @import("../system/run.zig");
@@ -59,9 +60,12 @@ fn threadWorkerEntry(args: *WorkerArgs) void {
     defer args.allocator.free(args.cwd);
     defer args.allocator.destroy(args);
 
-    const file = std.fs.openFileAbsolute(args.entry_path, .{}) catch return;
-    defer file.close();
-    const raw = file.readToEndAlloc(args.allocator, std.math.maxInt(usize)) catch return;
+    const io = libs_io.getProcessIo() orelse return;
+    const file = libs_io.openFileAbsolute(args.entry_path, .{}) catch return;
+    defer file.close(io);
+    var read_buf: [4096]u8 = undefined;
+    var file_reader = file.reader(io, read_buf[0..]);
+    const raw = file_reader.interface.allocRemaining(args.allocator, std.Io.Limit.unlimited) catch return;
     defer args.allocator.free(raw);
 
     var stripped_to_free: ?[]const u8 = null;
@@ -109,7 +113,7 @@ const ThreadHandle = struct {
 };
 
 var thread_registry: std.AutoArrayHashMap(u32, *ThreadHandle) = undefined;
-var thread_registry_mutex: std.Thread.Mutex = .{};
+var thread_registry_mutex: std.Io.Mutex = .{ .state = std.atomic.Value(std.Io.Mutex.State).init(.unlocked) };
 var thread_next_id: u32 = 1;
 var thread_registry_ready: bool = false;
 
@@ -146,6 +150,7 @@ fn spawnCallback(
     if (argumentCount == 0) return jsc.JSValueMakeUndefined(ctx);
     const opts = globals.current_run_options orelse return jsc.JSValueMakeUndefined(ctx);
     const allocator = globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
+    const io = libs_io.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
 
     const script_path = getArgString(allocator, ctx, arguments, argumentCount, 0) orelse return jsc.JSValueMakeUndefined(ctx);
     defer allocator.free(script_path);
@@ -174,13 +179,13 @@ fn spawnCallback(
     channel.* = .{
         .to_worker = std.ArrayList([]u8).empty,
         .to_main = std.ArrayList([]u8).empty,
-        .mutex = .{},
+        .mutex = .{ .state = std.atomic.Value(std.Io.Mutex.State).init(.unlocked) },
         .allocator = allocator,
     };
     errdefer allocator.destroy(channel);
 
     const worker_args = allocator.create(WorkerArgs) catch {
-        channel.deinit();
+        channel.deinit(io);
         allocator.destroy(channel);
         allocator.free(entry_path_owned);
         allocator.free(cwd_owned);
@@ -196,7 +201,7 @@ fn spawnCallback(
 
     const thread = std.Thread.spawn(.{}, threadWorkerEntry, .{worker_args}) catch {
         allocator.destroy(worker_args);
-        channel.deinit();
+        channel.deinit(io);
         allocator.destroy(channel);
         allocator.free(entry_path_owned);
         allocator.free(cwd_owned);
@@ -206,7 +211,7 @@ fn spawnCallback(
     var handle = allocator.create(ThreadHandle) catch {
         thread.join();
         allocator.destroy(worker_args);
-        channel.deinit();
+        channel.deinit(io);
         allocator.destroy(channel);
         allocator.free(entry_path_owned);
         allocator.free(cwd_owned);
@@ -215,24 +220,24 @@ fn spawnCallback(
     handle.* = .{ .thread = thread, .channel = channel, .allocator = allocator };
 
     if (!thread_registry_ready) {
-        thread_registry_mutex.lock();
+        thread_registry_mutex.lock(io) catch return jsc.JSValueMakeUndefined(ctx);
         thread_registry = std.AutoArrayHashMap(u32, *ThreadHandle).init(allocator);
         thread_registry_ready = true;
-        thread_registry_mutex.unlock();
+        thread_registry_mutex.unlock(io);
     }
-    thread_registry_mutex.lock();
+    thread_registry_mutex.lock(io) catch return jsc.JSValueMakeUndefined(ctx);
     const id = thread_next_id;
     thread_next_id += 1;
     thread_registry.put(id, handle) catch {
-        thread_registry_mutex.unlock();
+        thread_registry_mutex.unlock(io);
         handle.thread.join();
-        channel.deinit();
+        channel.deinit(io);
         allocator.destroy(channel);
         allocator.destroy(handle);
         allocator.destroy(worker_args);
         return jsc.JSValueMakeUndefined(ctx);
     };
-    thread_registry_mutex.unlock();
+    thread_registry_mutex.unlock(io);
 
     const obj = jsc.JSObjectMake(ctx, null, null);
     const k_id = jsc.JSStringCreateWithUTF8CString("__threadId");
@@ -253,9 +258,10 @@ fn threadSendCallback(
     _: [*]jsc.JSValueRef,
 ) callconv(.c) jsc.JSValueRef {
     const id = getThreadId(ctx, this) orelse return jsc.JSValueMakeUndefined(ctx);
-    thread_registry_mutex.lock();
+    const io = libs_io.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
+    thread_registry_mutex.lock(io) catch return jsc.JSValueMakeUndefined(ctx);
     const handle = thread_registry.get(id);
-    thread_registry_mutex.unlock();
+    thread_registry_mutex.unlock(io);
     if (handle == null) return jsc.JSValueMakeUndefined(ctx);
     if (argumentCount == 0) return jsc.JSValueMakeUndefined(ctx);
     const json_str_ref = jsc.JSStringCreateWithUTF8CString("JSON.stringify");
@@ -277,7 +283,7 @@ fn threadSendCallback(
     defer allocator.free(buf);
     const n = jsc.JSStringGetUTF8CString(msg_js, buf.ptr, max_sz);
     if (n == 0) return jsc.JSValueMakeUndefined(ctx);
-    handle.?.channel.sendToWorker(buf[0 .. n - 1]) catch return jsc.JSValueMakeUndefined(ctx);
+    handle.?.channel.sendToWorker(io, buf[0 .. n - 1]) catch return jsc.JSValueMakeUndefined(ctx);
     return jsc.JSValueMakeUndefined(ctx);
 }
 
@@ -290,11 +296,12 @@ fn threadReceiveSyncCallback(
     _: [*]jsc.JSValueRef,
 ) callconv(.c) jsc.JSValueRef {
     const id = getThreadId(ctx, this) orelse return jsc.JSValueMakeUndefined(ctx);
-    thread_registry_mutex.lock();
+    const io = libs_io.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
+    thread_registry_mutex.lock(io) catch return jsc.JSValueMakeUndefined(ctx);
     const handle = thread_registry.get(id);
-    thread_registry_mutex.unlock();
+    thread_registry_mutex.unlock(io);
     if (handle == null) return jsc.JSValueMakeUndefined(ctx);
-    const msg = handle.?.channel.receiveFromWorker() orelse return jsc.JSValueMakeUndefined(ctx);
+    const msg = handle.?.channel.receiveFromWorker(io) orelse return jsc.JSValueMakeUndefined(ctx);
     defer handle.?.channel.allocator.free(msg);
     const allocator = globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
     const msg_z = allocator.dupeZ(u8, msg) catch return jsc.JSValueMakeUndefined(ctx);
@@ -313,13 +320,14 @@ fn threadJoinCallback(
     _: [*]jsc.JSValueRef,
 ) callconv(.c) jsc.JSValueRef {
     const id = getThreadId(ctx, this) orelse return jsc.JSValueMakeUndefined(ctx);
-    thread_registry_mutex.lock();
+    const io = libs_io.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
+    thread_registry_mutex.lock(io) catch return jsc.JSValueMakeUndefined(ctx);
     const h = thread_registry.get(id);
     if (h != null) _ = thread_registry.swapRemove(id);
-    thread_registry_mutex.unlock();
+    thread_registry_mutex.unlock(io);
     if (h == null) return jsc.JSValueMakeUndefined(ctx);
     h.?.thread.join();
-    h.?.channel.deinit();
+    h.?.channel.deinit(io);
     h.?.allocator.destroy(h.?.channel);
     h.?.allocator.destroy(h.?);
     return jsc.JSValueMakeUndefined(ctx);
