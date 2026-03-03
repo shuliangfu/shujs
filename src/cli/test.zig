@@ -14,18 +14,18 @@ const std = @import("std");
 const builtin = @import("builtin");
 const args = @import("args.zig");
 const version = @import("version.zig");
-const io_core = @import("io_core");
+const libs_io = @import("libs_io");
 const manifest = @import("../package/manifest.zig");
 const scan = @import("scan.zig");
 
 /// 执行 shu test：有 scripts.test 则用 shell 执行；否则默认扫描 tests/ 下 *.test.ts、*.test.js、*.spec.ts、*.spec.js（排除 default_exclude_dirs），对每个文件执行 shu run。
-pub fn runTest(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional: []const []const u8) !void {
+pub fn runTest(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional: []const []const u8, io: std.Io) !void {
     _ = positional;
     _ = parsed;
-    try version.printCommandHeader("test");
+    try version.printCommandHeader(io, "test");
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd = io_core.realpath(".", &cwd_buf) catch {
-        try printStderr("shu test: cannot get current directory\n", .{});
+    const cwd = libs_io.realpath(".", &cwd_buf) catch {
+        try printStderr(io, "shu test: cannot get current directory\n", .{});
         return error.CwdFailed;
     };
     const cwd_owned = allocator.dupe(u8, cwd) catch return;
@@ -34,7 +34,7 @@ pub fn runTest(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional
     var loaded = manifest.Manifest.load(allocator, cwd_owned) catch |e| {
         if (e == error.ManifestNotFound) {
             // 无 package.json 时仍使用默认扫描 tests/
-            return runDefaultTests(allocator, cwd_owned);
+            return runDefaultTests(allocator, cwd_owned, io);
         }
         return e;
     };
@@ -42,74 +42,76 @@ pub fn runTest(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional
     const m = &loaded.manifest;
 
     if (m.scripts.get("test")) |cmd| {
-        runScriptInCwd(allocator, cwd_owned, cmd) catch |e| {
-            try printStderr("shu test: script failed\n", .{});
+        runScriptInCwd(allocator, cwd_owned, cmd, io) catch |e| {
+            try printStderr(io, "shu test: script failed\n", .{});
             return e;
         };
-        try printToStdout("\n", .{});
+        try printToStdout(io, "\n", .{});
         return;
     }
 
-    return runDefaultTests(allocator, cwd_owned);
+    return runDefaultTests(allocator, cwd_owned, io);
 }
 
 /// 默认行为：扫描 tests/ 下 test/spec 文件并逐个 shu run；排除 scan.default_exclude_dirs
-fn runDefaultTests(allocator: std.mem.Allocator, cwd_owned: []const u8) !void {
-    const tests_dir_abs = try io_core.pathJoin(allocator, &.{ cwd_owned, "tests" });
+fn runDefaultTests(allocator: std.mem.Allocator, cwd_owned: []const u8, io: std.Io) !void {
+    const tests_dir_abs = try libs_io.pathJoin(allocator, &.{ cwd_owned, "tests" });
     defer allocator.free(tests_dir_abs);
 
-    var tests_dir = io_core.openDirAbsolute(tests_dir_abs, .{}) catch {
-        try printStderr("shu test: no tests/ directory. Create tests/ with *.test.ts, *.test.js, *.spec.ts, or *.spec.js files.\n", .{});
+    var tests_dir = libs_io.openDirAbsolute(tests_dir_abs, .{}) catch {
+        try printStderr(io, "shu test: no tests/ directory. Create tests/ with *.test.ts, *.test.js, *.spec.ts, or *.spec.js files.\n", .{});
         return error.NoTestsDir;
     };
-    tests_dir.close();
+    tests_dir.close(io);
 
-    var list = try scan.collectFilesRecursive(allocator, tests_dir_abs, &scan.test_extensions);
+    var list = try scan.collectFilesRecursive(allocator, tests_dir_abs, &scan.test_extensions, io);
     defer {
         for (list.items) |p| allocator.free(p);
         list.deinit(allocator);
     }
     if (list.items.len == 0) {
-        try printStderr("shu test: no test files found under tests/\n", .{});
-        try printToStdout("\n", .{});
+        try printStderr(io, "shu test: no test files found under tests/\n", .{});
+        try printToStdout(io, "\n", .{});
         return;
     }
 
-    const self_exe = std.fs.selfExePathAlloc(allocator) catch {
-        try printStderr("shu test: cannot get executable path\n", .{});
+    const self_exe = std.process.executablePathAlloc(io, allocator) catch {
+        try printStderr(io, "shu test: cannot get executable path\n", .{});
         return error.SelfExeFailed;
     };
     defer allocator.free(self_exe);
 
     var failed: bool = false;
     for (list.items) |item| {
-        const run_path = try io_core.pathJoin(allocator, &.{ "tests", item });
+        const run_path = try libs_io.pathJoin(allocator, &.{ "tests", item });
         defer allocator.free(run_path);
         var argv_buf: [4][]const u8 = undefined;
         argv_buf[0] = self_exe;
         argv_buf[1] = "run";
         argv_buf[2] = run_path;
         const argv = argv_buf[0..3];
-        var child = std.process.Child.init(argv, allocator);
-        child.cwd = cwd_owned;
-        child.stdin_behavior = .Inherit;
-        child.stdout_behavior = .Inherit;
-        child.stderr_behavior = .Inherit;
-        try child.spawn();
-        const term = try child.wait();
+        var child = try std.process.spawn(io, .{
+            .argv = argv,
+            .cwd = .{ .path = cwd_owned },
+            .stdin = .inherit,
+            .stdout = .inherit,
+            .stderr = .inherit,
+        });
+        const term = try child.wait(io);
         switch (term) {
-            .Exited => |code| {
+            .exited => |code| {
                 if (code != 0) failed = true;
             },
-            .Signal, .Stopped, .Unknown => failed = true,
+            .signal, .stopped, .unknown => failed = true,
         }
     }
     if (failed) return error.ScriptExitedNonZero;
-    try printToStdout("\n", .{});
+    try printToStdout(io, "\n", .{});
 }
 
-/// 在 cwd 下用 shell 执行 cmd（/bin/sh -c cmd 或 cmd.exe /c cmd）；stdio 继承
-fn runScriptInCwd(allocator: std.mem.Allocator, cwd: []const u8, cmd: []const u8) !void {
+/// 在 cwd 下用 shell 执行 cmd（/bin/sh -c cmd 或 cmd.exe /c cmd）；stdio 继承。Zig 0.16：spawn(io, options)、wait(io)。
+fn runScriptInCwd(allocator: std.mem.Allocator, cwd: []const u8, cmd: []const u8, io: std.Io) !void {
+    _ = allocator;
     var argv_buf: [3][]const u8 = undefined;
     if (builtin.os.tag == .windows) {
         argv_buf[0] = "cmd.exe";
@@ -120,30 +122,32 @@ fn runScriptInCwd(allocator: std.mem.Allocator, cwd: []const u8, cmd: []const u8
         argv_buf[1] = "-c";
         argv_buf[2] = cmd;
     }
-    var child = std.process.Child.init(&argv_buf, allocator);
-    child.cwd = cwd;
-    child.stdin_behavior = .Inherit;
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-    try child.spawn();
-    const term = try child.wait();
+    const argv = argv_buf[0..3];
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .cwd = .{ .path = cwd },
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    const term = try child.wait(io);
     switch (term) {
-        .Exited => |code| if (code != 0) return error.ScriptExitedNonZero,
-        .Signal, .Stopped => return error.ScriptSignalled,
-        .Unknown => return error.ScriptExitedNonZero,
+        .exited => |code| if (code != 0) return error.ScriptExitedNonZero,
+        .signal, .stopped => return error.ScriptSignalled,
+        .unknown => return error.ScriptExitedNonZero,
     }
 }
 
-fn printToStdout(comptime fmt_str: []const u8, fargs: anytype) !void {
+fn printToStdout(io: std.Io, comptime fmt_str: []const u8, fargs: anytype) !void {
     var buf: [64]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf);
+    var w = std.Io.File.Writer.init(std.Io.File.stdout(), io, &buf);
     try w.interface.print(fmt_str, fargs);
     try w.interface.flush();
 }
 
-fn printStderr(comptime fmt_str: []const u8, fargs: anytype) !void {
+fn printStderr(io: std.Io, comptime fmt_str: []const u8, fargs: anytype) !void {
     var buf: [256]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
+    var w = std.Io.File.Writer.init(std.Io.File.stderr(), io, &buf);
     try w.interface.print(fmt_str, fargs);
     try w.interface.flush();
 }
