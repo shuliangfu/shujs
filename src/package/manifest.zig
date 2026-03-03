@@ -98,7 +98,7 @@ pub const Manifest = struct {
         _ = allocator;
     }
 
-    /// 从目录 dir 读取 package.json / package.jsonc（必选其一）与 deno.json/deno.jsonc（可选），合并为一份 Manifest。
+    /// 从目录 dir 读取 package.json / package.jsonc 与 deno.json/deno.jsonc。与 Deno 兼容：可有 package.json、或仅 deno.json、或两者同时存在；至少需其一。
     /// 使用 Arena 分配，返回的 Manifest 与 arena 绑定；调用方 deinit arena 前不得使用 Manifest。
     /// 返回的 arena 由调用方 deinit；Manifest 内字段均指向 arena 内存。
     pub fn load(allocator: std.mem.Allocator, dir: []const u8) !struct { arena: std.heap.ArenaAllocator, manifest: Manifest } {
@@ -125,76 +125,150 @@ pub const Manifest = struct {
             };
         defer dir_handle.close();
 
-        // package.jsonc 或 package.json（优先 jsonc，便于写注释）
+        // package.jsonc 或 package.json（优先 jsonc）
         const pkg_paths = [_][]const u8{ "package.jsonc", "package.json" };
         var pkg_content: []const u8 = undefined;
         var pkg_is_jsonc = false;
+        var has_pkg = false;
         for (pkg_paths) |name| {
             const pkg_file = dir_handle.openFile(name, .{}) catch continue;
             defer pkg_file.close();
             pkg_content = pkg_file.readToEndAlloc(a, std.math.maxInt(usize)) catch return error.OutOfMemory;
             pkg_is_jsonc = std.mem.endsWith(u8, name, ".jsonc");
+            has_pkg = true;
             break;
-        } else return error.ManifestNotFound;
-        const to_parse = if (pkg_is_jsonc) blk: {
-            const stripped = stripJsoncComments(a, pkg_content) catch return error.OutOfMemory;
-            defer a.free(stripped);
-            break :blk stripped;
-        } else pkg_content;
-        var pkg_parsed = try std.json.parseFromSlice(std.json.Value, a, to_parse, .{ .allocate = .alloc_always });
-        defer pkg_parsed.deinit();
-        const root = pkg_parsed.value;
-        if (root != .object) return error.InvalidPackageJson;
+        }
+        if (has_pkg) {
+            const to_parse = if (pkg_is_jsonc) blk: {
+                const stripped = stripJsoncComments(a, pkg_content) catch return error.OutOfMemory;
+                defer a.free(stripped);
+                break :blk stripped;
+            } else pkg_content;
+            var pkg_parsed = try std.json.parseFromSlice(std.json.Value, a, to_parse, .{ .allocate = .alloc_always });
+            defer pkg_parsed.deinit();
+            const root = pkg_parsed.value;
+            if (root != .object) return error.InvalidPackageJson;
 
-        const obj = root.object;
-        if (obj.get("name")) |v| { if (v == .string) manifest.name = v.string; }
-        if (obj.get("version")) |v| { if (v == .string) manifest.version = v.string; }
-        if (obj.get("main")) |v| { if (v == .string) manifest.main = v.string; }
-        if (obj.get("type")) |v| { if (v == .string) manifest.type = v.string; }
-        if (obj.get("exports")) |v| manifest.exports_value = v;
+            const obj = root.object;
+            if (obj.get("name")) |v| {
+                if (v == .string) manifest.name = v.string;
+            }
+            if (obj.get("version")) |v| {
+                if (v == .string) manifest.version = v.string;
+            }
+            if (obj.get("main")) |v| {
+                if (v == .string) manifest.main = v.string;
+            }
+            if (obj.get("type")) |v| {
+                if (v == .string) manifest.type = v.string;
+            }
+            if (obj.get("exports")) |v| manifest.exports_value = v;
 
-        if (obj.get("dependencies")) |v| {
-            if (v == .object) {
-                var it = v.object.iterator();
-                while (it.next()) |entry| {
-                    const val = entry.value_ptr.*;
-                    const ver = if (val == .string) val.string else "";
-                    try manifest.dependencies.put(entry.key_ptr.*, ver);
+            if (obj.get("dependencies")) |v| {
+                if (v == .object) {
+                    var it = v.object.iterator();
+                    while (it.next()) |entry| {
+                        const val = entry.value_ptr.*;
+                        const ver = if (val == .string) val.string else "";
+                        try manifest.dependencies.put(entry.key_ptr.*, ver);
+                    }
                 }
             }
-        }
-        if (obj.get("devDependencies")) |v| {
-            if (v == .object) {
-                var it = v.object.iterator();
-                while (it.next()) |entry| {
-                    const val = entry.value_ptr.*;
-                    const ver = if (val == .string) val.string else "";
-                    try manifest.dev_dependencies.put(entry.key_ptr.*, ver);
+            if (obj.get("devDependencies")) |v| {
+                if (v == .object) {
+                    var it = v.object.iterator();
+                    while (it.next()) |entry| {
+                        const val = entry.value_ptr.*;
+                        const ver = if (val == .string) val.string else "";
+                        try manifest.dev_dependencies.put(entry.key_ptr.*, ver);
+                    }
                 }
             }
-        }
-        if (obj.get("test")) |v| manifest.test_value = v;
-        if (obj.get("fmt")) |v| manifest.fmt_value = v;
-        if (obj.get("lint")) |v| manifest.lint_value = v;
-        if (obj.get("compilerOptions")) |v| manifest.compiler_options_value = v;
-        if (obj.get("scripts")) |v| {
-            if (v == .object) {
-                var it = v.object.iterator();
-                while (it.next()) |entry| {
-                    const val = entry.value_ptr.*;
-                    const cmd = if (val == .string) val.string else "";
-                    try manifest.scripts.put(entry.key_ptr.*, cmd);
+            if (obj.get("test")) |v| manifest.test_value = v;
+            if (obj.get("fmt")) |v| manifest.fmt_value = v;
+            if (obj.get("lint")) |v| manifest.lint_value = v;
+            if (obj.get("compilerOptions")) |v| manifest.compiler_options_value = v;
+            if (obj.get("scripts")) |v| {
+                if (v == .object) {
+                    var it = v.object.iterator();
+                    while (it.next()) |entry| {
+                        const val = entry.value_ptr.*;
+                        const cmd = if (val == .string) val.string else "";
+                        try manifest.scripts.put(entry.key_ptr.*, cmd);
+                    }
                 }
             }
-        }
+            // package.json 的 imports（与 deno 同格式：specifier -> jsr:/npm:/path），供 install 与 deno 一致从 imports 安装
+            if (obj.get("imports")) |v| {
+                if (v == .object) {
+                    var it = v.object.iterator();
+                    while (it.next()) |entry| {
+                        const val = entry.value_ptr.*;
+                        const mapped = if (val == .string) val.string else "";
+                        try manifest.imports.put(entry.key_ptr.*, mapped);
+                    }
+                }
+            }
 
-        // deno.json 或 deno.jsonc（优先 jsonc）
-        const deno_paths = [_][]const u8{ "deno.jsonc", "deno.json" };
-        for (deno_paths) |name| {
+            // deno.json 或 deno.jsonc（优先 jsonc）
+            const deno_paths = [_][]const u8{ "deno.jsonc", "deno.json" };
+            for (deno_paths) |name| {
+                const deno_file = dir_handle.openFile(name, .{}) catch continue;
+                defer deno_file.close();
+                const deno_content = deno_file.readToEndAlloc(a, std.math.maxInt(usize)) catch continue;
+                // .jsonc: deno_to_parse is newly allocated by stripJsoncComments (caller frees). .json: deno_to_parse is deno_content (arena), do not free.
+                const deno_to_parse = if (std.mem.endsWith(u8, name, ".jsonc"))
+                    stripJsoncComments(a, deno_content) catch continue
+                else
+                    deno_content;
+                defer if (std.mem.endsWith(u8, name, ".jsonc")) a.free(deno_to_parse);
+                var deno_parsed = std.json.parseFromSlice(std.json.Value, a, deno_to_parse, .{ .allocate = .alloc_always }) catch continue;
+                defer deno_parsed.deinit();
+                const d_root = deno_parsed.value;
+                if (d_root != .object) continue;
+                const d_obj = d_root.object;
+                if (d_obj.get("imports")) |v| {
+                    if (v == .object) {
+                        var it = v.object.iterator();
+                        while (it.next()) |entry| {
+                            const val = entry.value_ptr.*;
+                            const mapped = if (val == .string) val.string else "";
+                            try manifest.imports.put(entry.key_ptr.*, mapped);
+                        }
+                    }
+                }
+                if (d_obj.get("tasks")) |v| {
+                    if (v == .object) {
+                        var it = v.object.iterator();
+                        while (it.next()) |entry| {
+                            const val = entry.value_ptr.*;
+                            const cmd = if (val == .string) val.string else "";
+                            try manifest.tasks.put(entry.key_ptr.*, cmd);
+                        }
+                    }
+                }
+                if (manifest.test_value == null) {
+                    if (d_obj.get("test")) |v| manifest.test_value = v;
+                }
+                if (manifest.fmt_value == null) {
+                    if (d_obj.get("fmt")) |v| manifest.fmt_value = v;
+                }
+                if (manifest.lint_value == null) {
+                    if (d_obj.get("lint")) |v| manifest.lint_value = v;
+                }
+                if (manifest.compiler_options_value == null) {
+                    if (d_obj.get("compilerOptions")) |v| manifest.compiler_options_value = v;
+                }
+                break;
+            }
+            return .{ .arena = arena, .manifest = manifest };
+        }
+        // 仅 deno.json：与 Deno 一致，无 package.json 时仅从 deno.json 加载
+        const deno_only_paths = [_][]const u8{ "deno.jsonc", "deno.json" };
+        for (deno_only_paths) |name| {
             const deno_file = dir_handle.openFile(name, .{}) catch continue;
             defer deno_file.close();
             const deno_content = deno_file.readToEndAlloc(a, std.math.maxInt(usize)) catch continue;
-            // .jsonc: deno_to_parse is newly allocated by stripJsoncComments (caller frees). .json: deno_to_parse is deno_content (arena), do not free.
             const deno_to_parse = if (std.mem.endsWith(u8, name, ".jsonc"))
                 stripJsoncComments(a, deno_content) catch continue
             else
@@ -205,6 +279,12 @@ pub const Manifest = struct {
             const d_root = deno_parsed.value;
             if (d_root != .object) continue;
             const d_obj = d_root.object;
+            if (d_obj.get("name")) |v| {
+                if (v == .string) manifest.name = v.string;
+            }
+            if (d_obj.get("version")) |v| {
+                if (v == .string) manifest.version = v.string;
+            }
             if (d_obj.get("imports")) |v| {
                 if (v == .object) {
                     var it = v.object.iterator();
@@ -225,22 +305,13 @@ pub const Manifest = struct {
                     }
                 }
             }
-            if (manifest.test_value == null) {
-                if (d_obj.get("test")) |v| manifest.test_value = v;
-            }
-            if (manifest.fmt_value == null) {
-                if (d_obj.get("fmt")) |v| manifest.fmt_value = v;
-            }
-            if (manifest.lint_value == null) {
-                if (d_obj.get("lint")) |v| manifest.lint_value = v;
-            }
-            if (manifest.compiler_options_value == null) {
-                if (d_obj.get("compilerOptions")) |v| manifest.compiler_options_value = v;
-            }
-            break;
+            if (d_obj.get("test")) |v| manifest.test_value = v;
+            if (d_obj.get("fmt")) |v| manifest.fmt_value = v;
+            if (d_obj.get("lint")) |v| manifest.lint_value = v;
+            if (d_obj.get("compilerOptions")) |v| manifest.compiler_options_value = v;
+            return .{ .arena = arena, .manifest = manifest };
         }
-
-        return .{ .arena = arena, .manifest = manifest };
+        return error.ManifestNotFound;
     }
 
     /// 从目录 dir 仅加载 package.json / package.jsonc（用于包目录内解析 main/exports），不读 deno.json。
@@ -289,10 +360,18 @@ pub const Manifest = struct {
         if (root != .object) return error.InvalidPackageJson;
 
         const obj = root.object;
-        if (obj.get("name")) |v| { if (v == .string) manifest.name = v.string; }
-        if (obj.get("version")) |v| { if (v == .string) manifest.version = v.string; }
-        if (obj.get("main")) |v| { if (v == .string) manifest.main = v.string; }
-        if (obj.get("type")) |v| { if (v == .string) manifest.type = v.string; }
+        if (obj.get("name")) |v| {
+            if (v == .string) manifest.name = v.string;
+        }
+        if (obj.get("version")) |v| {
+            if (v == .string) manifest.version = v.string;
+        }
+        if (obj.get("main")) |v| {
+            if (v == .string) manifest.main = v.string;
+        }
+        if (obj.get("type")) |v| {
+            if (v == .string) manifest.type = v.string;
+        }
         if (obj.get("exports")) |v| manifest.exports_value = v;
 
         if (obj.get("dependencies")) |v| {
@@ -331,8 +410,63 @@ pub const Manifest = struct {
     }
 };
 
-/// 在 dir 下向 package.json 或 package.jsonc 的 dependencies 添加/覆盖 name -> version，写回同一文件（写为 JSON，jsonc 会丢失注释）。
-pub fn addPackageDependency(allocator: std.mem.Allocator, dir: []const u8, name: []const u8, version: []const u8) !void {
+/// 释放由 deepCopyJsonValue / addPackageDependency 构建的 std.json.Value 树（递归释放 .string/.number_string/.object/.array 并 deinit 实际 map/array，调用方须用与构建时相同的 allocator）。接受 *Value 以便对真实的 object/array 调用 deinit。
+fn freeJsonValue(allocator: std.mem.Allocator, v: *const std.json.Value) void {
+    switch (v.*) {
+        .string => allocator.free(v.string),
+        .number_string => allocator.free(v.number_string),
+        .object => {
+            var it = v.object.iterator();
+            while (it.next()) |e| {
+                allocator.free(e.key_ptr.*);
+                freeJsonValue(allocator, e.value_ptr);
+            }
+            @constCast(&v.object).deinit();
+        },
+        .array => {
+            for (v.array.items) |*item| {
+                freeJsonValue(allocator, item);
+            }
+            @constCast(&v.array).deinit();
+        },
+        .null, .bool, .integer, .float => {},
+    }
+}
+
+/// 深拷贝 std.json.Value，所有 key/string 均用 a 分配，避免 stringify 时依赖解析器分配的内存。
+fn deepCopyJsonValue(a: std.mem.Allocator, v: std.json.Value) !std.json.Value {
+    switch (v) {
+        .string => return .{ .string = try a.dupe(u8, v.string) },
+        .object => {
+            var new_map = std.json.ObjectMap.init(a);
+            var it = v.object.iterator();
+            while (it.next()) |e| {
+                const k = try a.dupe(u8, e.key_ptr.*);
+                const child = try deepCopyJsonValue(a, e.value_ptr.*);
+                try new_map.put(k, child);
+            }
+            return .{ .object = new_map };
+        },
+        .array => {
+            var new_arr = std.json.Array.initCapacity(a, v.array.items.len) catch return error.OutOfMemory;
+            for (v.array.items) |item| {
+                try new_arr.append(try deepCopyJsonValue(a, item));
+            }
+            return .{ .array = new_arr };
+        },
+        .float => return .{ .float = v.float },
+        .number_string => return .{ .number_string = try a.dupe(u8, v.number_string) },
+        .integer => return .{ .integer = v.integer },
+        .bool => return .{ .bool = v.bool },
+        .null => return .{ .null = {} },
+    }
+}
+
+/// 在 dir 下向 package.json 或 package.jsonc 的 dependencies 或 devDependencies 添加/覆盖 name -> version，写回同一文件（写为 JSON，jsonc 会丢失注释）。
+/// dev 为 true 时写入 devDependencies，否则写入 dependencies。
+/// 使用 Arena 构建全新 root 树再 stringify，避免 stringify 时读到解析器已失效的 key（0xaa 崩溃）。
+pub fn addPackageDependency(allocator: std.mem.Allocator, dir: []const u8, name: []const u8, version: []const u8, dev: bool) !void {
+    const section = if (dev) "devDependencies" else "dependencies";
     var dir_handle = if (io_core.pathIsAbsolute(dir))
         try io_core.openDirAbsolute(dir, .{})
     else
@@ -353,44 +487,146 @@ pub fn addPackageDependency(allocator: std.mem.Allocator, dir: []const u8, name:
         defer parsed.deinit();
         const root = parsed.value;
         if (root != .object) return error.InvalidPackageJson;
-        // 必须用 getPtr 取得树中节点的指针，put 到该 object 才会反映到 parsed.value，stringify 才能写出
-        if (@constCast(&root.object).getPtr("dependencies")) |deps_ptr| {
-            if (deps_ptr.* == .object) {
-                const name_key = try allocator.dupe(u8, name);
-                const version_val = try allocator.dupe(u8, version);
-                try deps_ptr.*.object.put(name_key, .{ .string = version_val });
-                const out = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .whitespace = .indent_2 });
-                defer allocator.free(out);
-                var out_file = try dir_handle.createFile(name_path, .{});
-                defer out_file.close();
-                try out_file.writeAll(out);
-                // parsed.deinit() 不释放由 put 加入的 key/value，须先取回 value 再 swapRemove 并 free 避免 GPA 泄漏
-                var version_to_free: ?[]const u8 = null;
-                if (deps_ptr.*.object.get(name_key)) |val| {
-                    if (val == .string) version_to_free = val.string;
+
+        // 用同一 allocator 构建新树，避免 Arena 导致 Stringify 对 allocator 的 comptime 要求
+        const a = allocator;
+
+        // 新 dependencies 对象：拷贝原 section 内容并加入 name -> version
+        var new_deps = std.json.ObjectMap.init(a);
+        if (root.object.get(section)) |sec_val| {
+            if (sec_val == .object) {
+                var it = sec_val.object.iterator();
+                while (it.next()) |entry| {
+                    if (std.mem.eql(u8, entry.key_ptr.*, name)) continue;
+                    const k = try a.dupe(u8, entry.key_ptr.*);
+                    const ev = entry.value_ptr.*;
+                    if (ev == .string) {
+                        try new_deps.put(k, .{ .string = try a.dupe(u8, ev.string) });
+                    } else {
+                        try new_deps.put(k, try deepCopyJsonValue(a, ev));
+                    }
                 }
-                _ = deps_ptr.*.object.swapRemove(name_key);
-                if (version_to_free) |s| allocator.free(s);
-                allocator.free(name_key);
-                return;
             }
         }
-        // 无 dependencies 或非 object 时新建并写入
-        var new_deps = std.json.ObjectMap.init(allocator);
-        try new_deps.put(try allocator.dupe(u8, name), .{ .string = try allocator.dupe(u8, version) });
-        try @constCast(&root.object).put(try allocator.dupe(u8, "dependencies"), .{ .object = new_deps });
-        const out = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .whitespace = .indent_2 });
+        try new_deps.put(try a.dupe(u8, name), .{ .string = try a.dupe(u8, version) });
+
+        // 新 root：逐 key 深拷贝，section 用 new_deps 替换；若原 manifest 无 section 则遍历时不会出现，故最后统一写入 section
+        var new_root = std.json.ObjectMap.init(a);
+        var it = root.object.iterator();
+        while (it.next()) |e| {
+            const k = try a.dupe(u8, e.key_ptr.*);
+            const val: std.json.Value = if (std.mem.eql(u8, e.key_ptr.*, section))
+                std.json.Value{ .object = new_deps }
+            else
+                try deepCopyJsonValue(a, e.value_ptr.*);
+            try new_root.put(k, val);
+        }
+        // 仅当原 manifest 无 section 时写入，避免重复 put 导致替换后泄漏本次 dupe(section) 的 key
+        if (root.object.get(section) == null) {
+            try new_root.put(try a.dupe(u8, section), std.json.Value{ .object = new_deps });
+        }
+
+        const out = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = new_root }, .{ .whitespace = .indent_2 });
         defer allocator.free(out);
         var out_file = try dir_handle.createFile(name_path, .{});
         defer out_file.close();
         try out_file.writeAll(out);
+        // 按确定顺序释放：先释放 new_deps（含 name/version 的 dupe），再释放 new_root（遇到 section 不再递归，避免二次 deinit）
+        {
+            var it_deps = new_deps.iterator();
+            while (it_deps.next()) |e| {
+                allocator.free(e.key_ptr.*);
+                freeJsonValue(allocator, e.value_ptr);
+            }
+            new_deps.deinit();
+        }
+        {
+            var it_root = new_root.iterator();
+            while (it_root.next()) |e| {
+                const is_section = std.mem.eql(u8, e.key_ptr.*, section);
+                allocator.free(e.key_ptr.*);
+                if (!is_section) {
+                    freeJsonValue(allocator, e.value_ptr);
+                }
+            }
+            new_root.deinit();
+        }
+        return;
+    }
+    return error.ManifestNotFound;
+}
+
+/// 在 dir 下向 package.json 或 package.jsonc 的 imports 添加/覆盖 specifier -> value（与 deno.json 同格式，如 "@dreamer/view" -> "jsr:@dreamer/view@1.1.2"）。写回同一文件。
+pub fn addPackageImport(allocator: std.mem.Allocator, dir: []const u8, specifier: []const u8, value: []const u8) !void {
+    var dir_handle = if (io_core.pathIsAbsolute(dir))
+        try io_core.openDirAbsolute(dir, .{})
+    else
+        try io_core.openDirCwd(dir, .{});
+    defer dir_handle.close();
+    const pkg_paths = [_][]const u8{ "package.jsonc", "package.json" };
+    for (pkg_paths) |name_path| {
+        const f = dir_handle.openFile(name_path, .{}) catch continue;
+        defer f.close();
+        const content = f.readToEndAlloc(allocator, std.math.maxInt(usize)) catch return error.OutOfMemory;
+        defer allocator.free(content);
+        const to_parse = if (std.mem.endsWith(u8, name_path, ".jsonc")) blk: {
+            const s = stripJsoncComments(allocator, content) catch return error.OutOfMemory;
+            defer allocator.free(s);
+            break :blk s;
+        } else content;
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, to_parse, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        // 必须改 parsed.value，不能改拷贝；root 仅用于读/清理，stringify 用 parsed.value
+        if (parsed.value != .object) return error.InvalidPackageJson;
+        const root_ptr = &parsed.value;
+        const specifier_key = try allocator.dupe(u8, specifier);
+        const value_dup = try allocator.dupe(u8, value);
+        var imports_key_owned: ?[]const u8 = null;
+        if (@constCast(root_ptr).object.getPtr("imports")) |imports_ptr| {
+            if (imports_ptr.* == .object) {
+                try imports_ptr.*.object.put(specifier_key, .{ .string = value_dup });
+            }
+        } else {
+            var new_imports = std.json.ObjectMap.init(allocator);
+            try new_imports.put(specifier_key, .{ .string = value_dup });
+            imports_key_owned = try allocator.dupe(u8, "imports");
+            try @constCast(root_ptr).object.put(imports_key_owned.?, .{ .object = new_imports });
+        }
+        const out = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .whitespace = .indent_2 });
+        defer allocator.free(out);
+        // 用绝对路径写入，确保与读取的是同一文件（避免 dir 与 handle 歧义导致未落盘）
+        const full_path = try io_core.pathJoin(allocator, &.{ dir, name_path });
+        defer allocator.free(full_path);
+        var out_file = try io_core.createFileAbsolute(full_path, .{});
+        defer out_file.close();
+        try out_file.writeAll(out);
+        out_file.sync() catch {}; // 确保落盘，避免 IDE/用户未看到更新
+        // parsed.deinit() 不释放由 put 加入的 key/value，须 swapRemove 并 free 避免泄漏（与 addPackageDependency 一致）
+        if (@constCast(root_ptr).object.getPtr("imports")) |imports_ptr| {
+            if (imports_ptr.* == .object) {
+                if (imports_ptr.*.object.get(specifier_key)) |val| {
+                    if (val == .string) allocator.free(val.string);
+                }
+                _ = imports_ptr.*.object.swapRemove(specifier_key);
+            }
+        }
+        allocator.free(specifier_key);
+        // value_dup 已在上方 get().string 时 free，不再重复 free
+        if (imports_key_owned) |imports_key| {
+            if (root_ptr.object.get(imports_key)) |v| {
+                if (v == .object) @constCast(&v.object).deinit();
+            }
+            _ = @constCast(root_ptr).object.swapRemove(imports_key);
+            allocator.free(imports_key);
+        }
         return;
     }
     return error.ManifestNotFound;
 }
 
 /// 从 dir 下 package.json 或 package.jsonc 的 dependencies 与 devDependencies 中移除指定 name，写回同一文件。若 name 不存在则静默成功。
-pub fn removePackageDependency(allocator: std.mem.Allocator, dir: []const u8, name: []const u8) !void {
+/// 返回是否实际移除了该包（至少从 dependencies 或 devDependencies 之一移除）。
+pub fn removePackageDependency(allocator: std.mem.Allocator, dir: []const u8, name: []const u8) !bool {
     var dir_handle = if (io_core.pathIsAbsolute(dir))
         try io_core.openDirAbsolute(dir, .{})
     else
@@ -409,35 +645,44 @@ pub fn removePackageDependency(allocator: std.mem.Allocator, dir: []const u8, na
         } else content;
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, to_parse, .{ .allocate = .alloc_always });
         defer parsed.deinit();
-        const root = parsed.value;
-        if (root != .object) return error.InvalidPackageJson;
-        // 原地删除：Zig 0.15.2 的 json ObjectMap 底层为 ArrayHashMapWithAllocator，swapRemove(key) 按 key 删除，O(1) 且无额外分配（§ 性能规则）。
+        if (parsed.value != .object) return error.InvalidPackageJson;
+        const root_ptr = &parsed.value;
+        // 必须用 getPtr 取得树中节点的指针，swapRemove 才会作用到 parsed.value，stringify 时不会读到无效指针（否则改的是副本会崩）。
         var changed = false;
-        if (root.object.get("dependencies")) |v| {
-            if (v == .object) {
-                const obj_ptr = @constCast(&v.object);
-                if (obj_ptr.swapRemove(name)) {
-                    changed = true;
-                }
+        if (@constCast(root_ptr).object.getPtr("dependencies")) |deps_ptr| {
+            if (deps_ptr.* == .object) {
+                if (@constCast(&deps_ptr.*.object).swapRemove(name)) changed = true;
             }
         }
-        if (root.object.get("devDependencies")) |v| {
-            if (v == .object) {
-                const obj_ptr = @constCast(&v.object);
-                if (obj_ptr.swapRemove(name)) {
-                    changed = true;
-                }
+        if (@constCast(root_ptr).object.getPtr("devDependencies")) |dev_ptr| {
+            if (dev_ptr.* == .object) {
+                if (@constCast(&dev_ptr.*.object).swapRemove(name)) changed = true;
             }
         }
-        if (!changed) return;
+        if (!changed) return false;
         const out = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .whitespace = .indent_2 });
         defer allocator.free(out);
         var out_file = try dir_handle.createFile(name_path, .{});
         defer out_file.close();
         try out_file.writeAll(out);
-        return;
+        return true;
     }
     return error.ManifestNotFound;
+}
+
+/// 目录 dir 下是否存在 deno.json 或 deno.jsonc（用于 add 时决定写入 deno.json 还是 package.json）。
+pub fn hasDenoJsonInDir(dir: []const u8) bool {
+    var dir_handle = if (io_core.pathIsAbsolute(dir))
+        io_core.openDirAbsolute(dir, .{}) catch return false
+    else
+        io_core.openDirCwd(dir, .{}) catch return false;
+    defer dir_handle.close();
+    for ([_][]const u8{ "deno.jsonc", "deno.json" }) |name| {
+        const f = dir_handle.openFile(name, .{}) catch continue;
+        f.close();
+        return true;
+    }
+    return false;
 }
 
 /// 在 dir 下向 deno.json 或 deno.jsonc 的 imports 添加/覆盖 specifier -> value；无文件则创建 deno.json。
