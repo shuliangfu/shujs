@@ -7,7 +7,8 @@ const std = @import("std");
 const jsc = @import("jsc");
 const globals = @import("../../../globals.zig");
 const timer_state = @import("../timers/state.zig");
-const errors = @import("../../../../errors.zig");
+const errors = @import("errors");
+const libs_process = @import("libs_process");
 const build_options = @import("build_options");
 const options = @import("options.zig");
 const iocp = @import("iocp.zig");
@@ -49,7 +50,7 @@ const TLS_SEND_BUF_SIZE = 16 * 1024;
 pub const TickCallbacks = struct {
     cleanup: *const fn (jsc.JSContextRef, *ServerState) void,
     do_listen: *const fn (*ServerState) anyerror!void,
-    handoff_plain: *const fn (*ServerState, std.mem.Allocator, jsc.JSContextRef, *std.net.Stream, ?[]const u8) u32,
+    handoff_plain: *const fn (*ServerState, std.mem.Allocator, jsc.JSContextRef, *std.Io.net.Stream, ?[]const u8) u32,
     handoff_conn: *const fn (*ServerState, std.mem.Allocator, jsc.JSContextRef, *anyopaque) u32,
     step_plain_cb: *const step_plain.StepPlainCallbacks,
 };
@@ -83,7 +84,10 @@ pub fn run(
             state.iocp.?.deinit();
             state.iocp = null;
         }
-        if (state.server) |*srv| srv.deinit();
+        if (state.server) |*srv| {
+            const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
+            srv.deinit(io);
+        }
         state.restart_requested = false;
         if (state.server != null) {
             cbs.do_listen(state) catch {
@@ -103,20 +107,24 @@ pub fn run(
         }
         if (state.cluster_worker_pids) |pids| {
             if (state.cluster_argv) |argv| {
+                const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
                 for (pids, 0..) |pid, i| {
-                    std.posix.kill(pid, 0) catch {
-                        var env = std.process.getEnvMap(state.allocator) catch continue;
+                    std.posix.kill(pid, @enumFromInt(0)) catch {
+                        const env_block = libs_process.getProcessEnviron() orelse std.process.Environ.empty;
+                        var env = std.process.Environ.createMap(env_block, state.allocator) catch continue;
                         defer env.deinit();
                         var num_buf: [16]u8 = undefined;
                         const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{i + 1}) catch continue;
                         env.put("SHU_CLUSTER_WORKER", num_str) catch continue;
-                        var child = std.process.Child.init(argv, state.allocator);
-                        child.stdin_behavior = .Inherit;
-                        child.stdout_behavior = .Inherit;
-                        child.stderr_behavior = .Inherit;
-                        child.env_map = &env;
-                        child.spawn() catch continue;
-                        pids[i] = child.id;
+                        var child = std.process.spawn(io, .{
+                            .argv = argv,
+                            .cwd = .inherit,
+                            .environ_map = &env,
+                            .stdin = .inherit,
+                            .stdout = .inherit,
+                            .stderr = .inherit,
+                        }) catch continue;
+                        pids[i] = child.id.?;
                     };
                 }
             }
@@ -137,7 +145,8 @@ pub fn run(
 
     // 有 server 且已创建 io_core 时，明文与 TLS 均走 io_core（pollCompletions + submitRecv/submitSend）
     if (state.server != null and state.high_perf_io != null) {
-        const server_fd = state.server.?.stream.handle;
+        const io = libs_process.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
+        const server_fd = state.server.?.socket.handle;
         const hio = state.high_perf_io.?;
         const poll_timeout_ns: i64 = if (state.poll_idle_effective_ms > 0) state.poll_idle_effective_ms * std.time.ns_per_ms else 0;
         const comps = hio.pollCompletions(poll_timeout_ns);
@@ -146,29 +155,29 @@ pub fn run(
             switch (c.tag) {
                 .accept => {
                     const stream = c.client_stream orelse continue;
-                    const cfd = @as(usize, @intCast(stream.handle));
+                    const cfd = @as(usize, @intCast(stream.socket.handle));
                     const total_conns = state.plain_mux.conns.count() + (if (state.tls_conns) |*m| m.count() else @as(usize, 0)) + (if (state.tls_pending) |*m| m.count() else @as(usize, 0));
                     if (total_conns >= state.plain_mux.max_conns) {
-                        stream.close();
+                        stream.close(io);
                         continue;
                     }
                     mux.setTcpNoDelay(&stream);
-                    if (builtin.os.tag != .windows) mux.setNonBlocking(stream.handle);
+                    if (builtin.os.tag != .windows) mux.setNonBlocking(stream.socket.handle);
                     const initial_slice = c.buffer_ptr[0..c.len];
                     if (state.tls_ctx == null) {
                         var plain_conn = PlainConnState.init(state.plain_mux.allocator, stream, &state.config, initial_slice) catch {
-                            stream.close();
+                            stream.close(io);
                             continue;
                         };
                         state.plain_mux.conns.put(cfd, plain_conn) catch {
                             plain_conn.deinit(state.plain_mux.allocator, true);
-                            stream.close();
+                            stream.close(io);
                             continue;
                         };
                         hio.submitRecv(stream, cfd);
                     } else if (build_options.have_tls and state.tls_ctx != null and state.tls_pending != null and state.tls_conns != null) {
                         var pending = tls.TlsPending.startBio(&state.tls_ctx.?) orelse {
-                            stream.close();
+                            stream.close(io);
                             continue;
                         };
                         _ = pending.feedRead(initial_slice);
@@ -176,12 +185,12 @@ pub fn run(
                         switch (pending.stepBio(&out_conn)) {
                             .done => {
                                 const conn_ptr = out_conn orelse {
-                                    stream.close();
+                                    stream.close(io);
                                     continue;
                                 };
                                 var tls_stream = tls.TlsStream.fromConn(stream, conn_ptr);
                                 var tls_conn = TlsConnState.init(state.allocator, tls_stream, &state.config) catch {
-                                    tls_stream.close();
+                                    tls_stream.close(io);
                                     continue;
                                 };
                                 state.tls_conns.?.put(cfd, tls_conn) catch {
@@ -201,12 +210,12 @@ pub fn run(
                                 var raw_send_buf: if (use_iocp_full_tls) []u8 else void = if (use_iocp_full_tls) undefined else {};
                                 if (use_iocp_full_tls) {
                                     raw_recv_buf = allocator.alloc(u8, conn_state.TLS_RAW_BUF_SIZE) catch {
-                                        stream.close();
+                                        if (libs_process.getProcessIo()) |process_io| stream.close(process_io);
                                         continue;
                                     };
                                     raw_send_buf = allocator.alloc(u8, conn_state.TLS_RAW_BUF_SIZE) catch {
                                         allocator.free(raw_recv_buf);
-                                        stream.close();
+                                        if (libs_process.getProcessIo()) |process_io| stream.close(process_io);
                                         continue;
                                     };
                                 }
@@ -223,12 +232,12 @@ pub fn run(
                                         allocator.free(raw_recv_buf);
                                         allocator.free(raw_send_buf);
                                     }
-                                    stream.close();
+                                    stream.close(io);
                                     continue;
                                 };
                                 hio.submitRecv(stream, cfd);
                             },
-                            .err => stream.close(),
+                            .err => stream.close(io),
                         }
                     }
                 },
@@ -274,7 +283,7 @@ pub fn run(
                                 conn.deinit(state.plain_mux.allocator, false);
                                 _ = state.plain_mux.conns.remove(cfd);
                                 const n = cbs.handoff_plain(state, allocator, ctx, &stream, copy);
-                                stream.close();
+                                if (libs_process.getProcessIo()) |process_io| stream.close(process_io);
                                 state.total_requests += n;
                             },
                             .handoff_h2 => {
@@ -282,15 +291,17 @@ pub fn run(
                                 if (conn.ws_id != 0) _ = state.ws_registry.remove(conn.ws_id);
                                 conn.deinit(state.plain_mux.allocator, false);
                                 _ = state.plain_mux.conns.remove(cfd);
-                                const n = connection.handleH2Connection(allocator, ctx, &stream, state.handler_fn, &state.config, state.compression_enabled, state.error_callback, true) catch 0;
-                                stream.close();
+                                const process_io = libs_process.getProcessIo() orelse continue;
+                                var net_adapter = connection.NetStreamAdapter{ .stream = &stream, .io = process_io };
+                                const n = connection.handleH2Connection(allocator, ctx, &net_adapter, state.handler_fn, &state.config, state.compression_enabled, state.error_callback, true) catch 0;
+                                stream.close(process_io);
                                 state.total_requests += n;
                             },
                         }
                     } else if (build_options.have_tls and state.tls_pending != null) {
                         if (state.tls_pending.?.getPtr(cfd)) |entry| {
                             if (c.err != null) {
-                                entry.stream.close();
+                                if (libs_process.getProcessIo()) |process_io| entry.stream.close(process_io);
                                 if (state.tls_pending.?.fetchRemove(cfd)) |kv| kv.value.deinit(allocator);
                                 continue;
                             }
@@ -299,13 +310,13 @@ pub fn run(
                             switch (entry.pending.stepBio(&out_conn)) {
                                 .done => {
                                     const conn_ptr = out_conn orelse {
-                                        entry.stream.close();
+                                        if (libs_process.getProcessIo()) |process_io| entry.stream.close(process_io);
                                         if (state.tls_pending.?.fetchRemove(cfd)) |kv| kv.value.deinit(allocator);
                                         continue;
                                     };
                                     var tls_stream = tls.TlsStream.fromConn(entry.stream, conn_ptr);
                                     var tls_conn = TlsConnState.init(state.allocator, tls_stream, &state.config) catch {
-                                        tls_stream.close();
+                                        if (libs_process.getProcessIo()) |process_io| tls_stream.close(process_io);
                                         if (state.tls_pending.?.fetchRemove(cfd)) |kv| kv.value.deinit(allocator);
                                         continue;
                                     };
@@ -333,7 +344,7 @@ pub fn run(
                                     hio.submitRecv(entry.stream, cfd);
                                 },
                                 .err => {
-                                    entry.stream.close();
+                                    if (libs_process.getProcessIo()) |process_io| entry.stream.close(process_io);
                                     if (state.tls_pending.?.fetchRemove(cfd)) |kv| kv.value.deinit(allocator);
                                 },
                             }
@@ -411,7 +422,7 @@ pub fn run(
                                 conn.deinit(state.plain_mux.allocator, false);
                                 _ = state.plain_mux.conns.remove(cfd);
                                 const n = cbs.handoff_plain(state, allocator, ctx, &stream, copy);
-                                stream.close();
+                                if (libs_process.getProcessIo()) |process_io| stream.close(process_io);
                                 state.total_requests += n;
                             },
                             .handoff_h2 => {
@@ -419,8 +430,10 @@ pub fn run(
                                 if (conn.ws_id != 0) _ = state.ws_registry.remove(conn.ws_id);
                                 conn.deinit(state.plain_mux.allocator, false);
                                 _ = state.plain_mux.conns.remove(cfd);
-                                const n = connection.handleH2Connection(allocator, ctx, &stream, state.handler_fn, &state.config, state.compression_enabled, state.error_callback, true) catch 0;
-                                stream.close();
+                                const process_io = libs_process.getProcessIo() orelse continue;
+                                var net_adapter = connection.NetStreamAdapter{ .stream = &stream, .io = process_io };
+                                const n = connection.handleH2Connection(allocator, ctx, &net_adapter, state.handler_fn, &state.config, state.compression_enabled, state.error_callback, true) catch 0;
+                                stream.close(process_io);
                                 state.total_requests += n;
                             },
                         }
@@ -475,12 +488,13 @@ pub fn run(
     }
     // 其他路径（明文 poll/iocp fallback、TLS 全路径）尚未迁入，此处仅执行 runLoop + setImmediate 以维持事件循环
 
+    const process_io = libs_process.getProcessIo();
     if (state.run_loop_every == 0 or state.total_requests % state.run_loop_every == 0) {
         timer.runMicrotasks(ctx);
         timer.runLoop(ctx);
-        state.last_run_loop_ms = std.time.milliTimestamp();
-    } else if (state.run_loop_interval_ms > 0) {
-        const now_ms = std.time.milliTimestamp();
+        state.last_run_loop_ms = if (process_io) |io| @as(i64, @intCast(@divTrunc(std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds, 1_000_000))) else 0;
+    } else if (state.run_loop_interval_ms > 0 and process_io != null) {
+        const now_ms = @as(i64, @intCast(@divTrunc(std.Io.Clock.Timestamp.now(process_io.?, .real).raw.nanoseconds, 1_000_000)));
         if (now_ms - state.last_run_loop_ms >= state.run_loop_interval_ms) {
             timer.runMicrotasks(ctx);
             timer.runLoop(ctx);
