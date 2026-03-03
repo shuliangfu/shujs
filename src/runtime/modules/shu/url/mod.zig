@@ -469,24 +469,25 @@ fn formatCallback(
     const uri = std.Uri.parse(built_slice) catch return jsc.JSValueMakeString(ctx, jsc.JSStringCreateWithUTF8CString(""));
     var href_out: [2048]u8 = undefined;
     var len: usize = 0;
-    len += (std.fmt.bufPrint(href_out[len..], "{s}://", .{uri.scheme}) catch href_out[len..][0..0]).len;
+    const empty: []u8 = href_out[len..][0..0];
+    len += (std.fmt.bufPrint(href_out[len..], "{s}://", .{uri.scheme}) catch empty).len;
     if (uri.host) |h| {
         var host_buf: [256]u8 = undefined;
-        len += (std.fmt.bufPrint(href_out[len..], "{s}", .{(h.toRaw(&host_buf) catch host_buf[0..0])}) catch href_out[len..][0..0]).len;
+        len += (std.fmt.bufPrint(href_out[len..], "{s}", .{(h.toRaw(&host_buf) catch host_buf[0..0])}) catch empty).len;
     }
-    if (uri.port) |p| len += (std.fmt.bufPrint(href_out[len..], ":{d}", .{p}) catch href_out[len..][0..0]).len;
+    if (uri.port) |p| len += (std.fmt.bufPrint(href_out[len..], ":{d}", .{p}) catch empty).len;
     var path_buf: [1024]u8 = undefined;
     const path_slice = uri.path.toRaw(&path_buf) catch path_buf[0..0];
     if (path_slice.len > 0) {
-        len += (std.fmt.bufPrint(href_out[len..], "{s}", .{path_slice}) catch href_out[len..][0..0]).len;
+        len += (std.fmt.bufPrint(href_out[len..], "{s}", .{path_slice}) catch empty).len;
     }
     if (uri.query) |q| {
         var q_buf: [512]u8 = undefined;
-        len += (std.fmt.bufPrint(href_out[len..], "?{s}", .{(q.toRaw(&q_buf) catch q_buf[0..0])}) catch href_out[len..][0..0]).len;
+        len += (std.fmt.bufPrint(href_out[len..], "?{s}", .{(q.toRaw(&q_buf) catch q_buf[0..0])}) catch empty).len;
     }
     if (uri.fragment) |f| {
         var f_buf: [256]u8 = undefined;
-        len += (std.fmt.bufPrint(href_out[len..], "#{s}", .{(f.toRaw(&f_buf) catch f_buf[0..0])}) catch href_out[len..][0..0]).len;
+        len += (std.fmt.bufPrint(href_out[len..], "#{s}", .{(f.toRaw(&f_buf) catch f_buf[0..0])}) catch empty).len;
     }
     const z = allocator.dupeZ(u8, href_out[0..len]) catch return jsc.JSValueMakeString(ctx, jsc.JSStringCreateWithUTF8CString(""));
     defer allocator.free(z);
