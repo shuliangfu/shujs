@@ -16,7 +16,9 @@
 
 const std = @import("std");
 const args_mod = @import("args.zig");
-const errors = @import("../errors.zig");
+const errors = @import("errors");
+const libs_io = @import("libs_io");
+const libs_process = @import("libs_process");
 const strip_types = @import("../transpiler/strip_types.zig");
 const jsx = @import("../transpiler/jsx.zig");
 const run_options = @import("../runtime/run_options.zig");
@@ -26,16 +28,18 @@ const pkg_install = @import("../package/install.zig");
 /// 执行 shu run [entry] 或 shu run <script>
 /// entry 可为单文件路径；.ts/.tsx 会先做类型擦除；.tsx 再经 JSX 转译（默认 @dreamer/view 格式）。
 /// 若当前目录存在 package.json 或 package.jsonc、deno.json 或 deno.jsonc 任一，会先自动执行依赖安装（与 Deno 一致）；皆无则跳过。
-/// argv 为完整命令行参数（含程序名与子命令），用于 process.argv。
-pub fn run(allocator: std.mem.Allocator, parsed: args_mod.ParsedArgs, positional: []const []const u8, argv: []const []const u8) !void {
+/// argv 为完整命令行参数（含程序名与子命令），用于 process.argv。io 为 Zig 0.16 std.Io，用于 stdout/stderr。
+pub fn run(allocator: std.mem.Allocator, parsed: args_mod.ParsedArgs, positional: []const []const u8, argv: []const []const u8, io: std.Io) !void {
     if (parsed.help or positional.len == 0) {
-        try printRunUsage();
+        try printRunUsage(io);
         if (positional.len == 0) return error.MissingEntry;
         return;
     }
 
     const entry = positional[0];
-    const cwd_str = try std.process.getCwdAlloc(allocator);
+    // Zig 0.16：process.getCwdAlloc 已移除，用 libs_io.realpath 取当前目录；路径长度用 Io.Dir.max_path_bytes
+    var cwd_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const cwd_str = allocator.dupe(u8, try libs_io.realpath(".", &cwd_buf)) catch return;
     defer allocator.free(cwd_str);
     // 存在 package.json/jsonc 或 deno.json/jsonc 时自动安装依赖（Deno 风格）；皆无则跳过（install 需 package 才真正安装，仅 deno 时会 NoManifest）
     if (hasAnyManifest(cwd_str)) {
@@ -44,9 +48,9 @@ pub fn run(allocator: std.mem.Allocator, parsed: args_mod.ParsedArgs, positional
         };
     }
 
-    const cwd_dir = std.fs.cwd();
-    const file = cwd_dir.openFile(entry, .{}) catch |e| {
-        if (e == std.fs.File.OpenError.FileNotFound) {
+    const cwd_dir = std.Io.Dir.cwd();
+    const file = cwd_dir.openFile(io, entry, .{}) catch |e| {
+        if (e == std.Io.File.OpenError.FileNotFound) {
             const msg = std.fmt.allocPrint(allocator, "File not found: {s}", .{entry}) catch "File not found";
             defer allocator.free(msg);
             try errors.reportToStderr(.{ .code = .file_not_found, .message = msg });
@@ -54,9 +58,10 @@ pub fn run(allocator: std.mem.Allocator, parsed: args_mod.ParsedArgs, positional
         }
         return e;
     };
-    defer file.close();
+    defer file.close(io);
 
-    const raw = file.readToEndAlloc(allocator, std.math.maxInt(usize)) catch return;
+    var file_reader = file.reader(io, &.{});
+    const raw = file_reader.interface.allocRemaining(allocator, std.Io.Limit.unlimited) catch return;
     defer allocator.free(raw);
 
     var stripped_to_free: ?[]const u8 = null;
@@ -80,7 +85,7 @@ pub fn run(allocator: std.mem.Allocator, parsed: args_mod.ParsedArgs, positional
     // 构建 RunOptions：cwd、入口绝对路径、argv、权限（供 process / __dirname / __filename）
     const entry_path_abs = try std.fs.path.join(allocator, &.{ cwd_str, entry });
     defer allocator.free(entry_path_abs);
-    const is_forked = std.posix.getenv("SHU_FORKED") != null;
+    const is_forked = std.c.getenv("SHU_FORKED") != null;
     const options = run_options.RunOptions{
         .entry_path = entry_path_abs,
         .cwd = cwd_str,
@@ -103,14 +108,15 @@ pub fn run(allocator: std.mem.Allocator, parsed: args_mod.ParsedArgs, positional
     try runtime.run(source, entry_path_abs);
 }
 
-/// 当前目录是否存在任意 manifest：package.json 或 package.jsonc、deno.json 或 deno.jsonc 任一存在即返回 true
+/// 当前目录是否存在任意 manifest：package.json 或 package.jsonc、deno.json 或 deno.jsonc 任一存在即返回 true。Zig 0.16：用 libs_io.openDirAbsolute，Dir/File 操作需 io。
 fn hasAnyManifest(dir: []const u8) bool {
+    const io = libs_process.getProcessIo() orelse return false;
     const names = [_][]const u8{ "package.json", "package.jsonc", "deno.json", "deno.jsonc" };
-    var d = std.fs.openDirAbsolute(dir, .{}) catch return false;
-    defer d.close();
+    var d = libs_io.openDirAbsolute(dir, .{}) catch return false;
+    defer d.close(io);
     for (names) |name| {
-        const f = d.openFile(name, .{}) catch continue;
-        f.close();
+        const f = d.openFile(io, name, .{}) catch continue;
+        defer f.close(io);
         return true;
     }
     return false;
@@ -121,9 +127,9 @@ fn hasExtension(path: []const u8, ext: []const u8) bool {
     return std.mem.eql(u8, path[path.len - ext.len ..], ext);
 }
 
-/// 打印 run 子命令用法（硬编码英文）
-fn printRunUsage() !void {
-    try printToStdout(
+/// 打印 run 子命令用法（硬编码英文）。Zig 0.16：使用 io 写 stdout。
+fn printRunUsage(io: std.Io) !void {
+    try printToStdout(io,
         \\shu run <entry> [options...]
         \\Run a single .js / .ts / .tsx file (types stripped; .tsx also JSX-transformed); or package.json script (later).
         \\Options: --allow-all / -A, --allow-net, --allow-read, --allow-env, --allow-write, --allow-run, --allow-hrtime, --allow-ffi
@@ -131,10 +137,9 @@ fn printRunUsage() !void {
     , .{});
 }
 
-fn printToStdout(comptime fmt: []const u8, fargs: anytype) !void {
+fn printToStdout(io: std.Io, comptime fmt: []const u8, fargs: anytype) !void {
     var buf: [256]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf);
-    const out = &w.interface;
-    try out.print(fmt, fargs);
-    try out.flush();
+    var w = std.Io.File.Writer.init(std.Io.File.stdout(), io, &buf);
+    try w.interface.print(fmt, fargs);
+    w.flush() catch {};
 }
