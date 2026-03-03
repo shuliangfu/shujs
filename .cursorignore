@@ -1,0 +1,48 @@
+# Cursor 索引与 AI 上下文排除列表（语法同 .gitignore）
+# 用于减少索引体积、加快检索，并避免把构建/依赖内容喂给 AI
+
+# Zig 构建与缓存
+zig-out/
+.zig-cache/
+zig-cache/
+*.a
+libmain.a
+
+# 依赖与大型第三方代码（减少索引，按需可注释掉 deps/）
+node_modules/
+deps/.bun-webkit-tmp/
+deps/**/*.pdb
+.deno/
+
+# 构建与输出目录
+dist/
+build/
+out/
+
+# 环境与本地配置（避免误读密钥）
+.env
+.env*
+!.env.example
+
+# 编辑器与系统
+.cursor
+.DS_Store
+*.swp
+*.swo
+*~
+Thumbs.db
+
+# 测试与覆盖率产物
+coverage/
+*.profraw
+*.profdata
+
+# 日志与临时文件
+*.log
+logs/
+tmp/
+temp/
+.cache/
+
+# 可选：版本控制元数据（按需取消注释以进一步减小索引）
+# .git/
