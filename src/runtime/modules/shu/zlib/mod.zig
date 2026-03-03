@@ -176,8 +176,16 @@ fn brotliAsyncCallback(
     return compressAsyncScript(ctx, allocator, input, "brotliSync");
 }
 
-// ---------- 供 Shu.server 等直接调用的压缩 API（与 gzip.zig / brotli.zig 一致） ----------
+// ---------- 供 Shu.server、package 等直接调用的压缩/解压 API（与 gzip.zig / brotli.zig 一致） ----------
 
+/// Gzip：压缩 / 解压。解压供 package 下载 Content-Encoding: gzip 时使用；返回的 slice 调用方 free。
 pub const compressGzip = gzip.compressGzip;
+pub const decompressGzip = gzip.decompressGzip;
+
+/// Deflate（zlib）：压缩为 raw deflate / 解压为 zlib 格式。解压供 Content-Encoding: deflate 时使用；返回的 slice 调用方 free。
 pub const compressDeflate = gzip.compressDeflate;
+pub const decompressDeflate = gzip.decompressDeflate;
+
+/// Brotli：压缩 / 解压。解压供 package 下载 Content-Encoding: br 时使用；返回的 slice 调用方 free。
 pub const compressBrotli = brotli_mod.compressBrotli;
+pub const decompressBrotli = brotli_mod.decompressBrotli;
