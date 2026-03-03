@@ -119,9 +119,9 @@ fn allocCallback(
                             @ptrCast(@constCast(chunk_slice.ptr)),
                             BUFFER_POOL_CHUNK_SIZE,
                             poolChunkDeallocator,
-                        c,
-                        @ptrCast(&exception[0]),
-                    );
+                            c,
+                            @ptrCast(&exception[0]),
+                        );
                         if (arr != null) {
                             @memset(@as([*]u8, @ptrCast(@constCast(chunk_slice.ptr)))[0..BUFFER_POOL_CHUNK_SIZE], 0);
                             return arr.?;

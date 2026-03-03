@@ -37,6 +37,7 @@ const shu_fs = @import("fs/mod.zig");
 const shu_path = @import("path/mod.zig");
 const shu_system = @import("system/mod.zig");
 const shu_zlib = @import("zlib/mod.zig");
+const shu_archive = @import("archive/mod.zig");
 const shu_crypto = @import("crypto/mod.zig");
 const shu_assert = @import("assert/mod.zig");
 const shu_events = @import("events/mod.zig");
@@ -88,6 +89,7 @@ pub const SUPPORTED: []const []const u8 = &.{
     "shu:console",
     "shu:system",
     "shu:zlib",
+    "shu:archive",
     "shu:crypto",
     "shu:assert",
     "shu:os",
@@ -147,6 +149,7 @@ pub fn getShuBuiltin(ctx: jsc.JSContextRef, allocator: std.mem.Allocator, specif
     if (std.mem.eql(u8, specifier, "shu:system")) return shu_system.getExports(ctx, allocator);
     // shu:zlib — 压缩/解压。gzip、deflate、brotli 等，用于 HTTP 响应压缩或文件压缩。对应 node:zlib。
     if (std.mem.eql(u8, specifier, "shu:zlib")) return shu_zlib.getExports(ctx, allocator);
+    if (std.mem.eql(u8, specifier, "shu:archive")) return shu_archive.getExports(ctx, allocator);
     // shu:crypto — 加密与哈希。randomBytes、createHash、createHmac、scrypt、pbkdf2 等，用于密码、签名、随机数。对应 node:crypto。
     if (std.mem.eql(u8, specifier, "shu:crypto")) return shu_crypto.getExports(ctx, allocator);
     // shu:assert — 断言。ok、equal、strictEqual、throws 等，测试中做条件检查。对应 node:assert。

@@ -99,9 +99,9 @@ fn randomUUIDCallback(
     bytes[8] = (bytes[8] & 0x3F) | 0x80;
     var buf: [37]u8 = undefined;
     _ = std.fmt.bufPrint(&buf, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
-        bytes[0], bytes[1], bytes[2], bytes[3],
-        bytes[4], bytes[5], bytes[6], bytes[7],
-        bytes[8], bytes[9], bytes[10], bytes[11],
+        bytes[0],  bytes[1],  bytes[2],  bytes[3],
+        bytes[4],  bytes[5],  bytes[6],  bytes[7],
+        bytes[8],  bytes[9],  bytes[10], bytes[11],
         bytes[12], bytes[13], bytes[14], bytes[15],
     }) catch return jsc.JSValueMakeUndefined(ctx);
     buf[36] = 0;
@@ -238,8 +238,7 @@ fn encryptCallback(
     if (argumentCount >= 3) {
         const alg_str_opt = jsValueToUtf8Bytes(ctx, arguments[2], allocator);
         if (alg_str_opt) |alg_str| {
-            if (std.mem.eql(u8, alg_str, "aes-256-gcm")) alg_byte = alg_aes_gcm
-            else if (!std.mem.eql(u8, alg_str, "chacha20-poly1305")) return throwCryptoError(ctx, "crypto.encrypt algorithm must be chacha20-poly1305 or aes-256-gcm");
+            if (std.mem.eql(u8, alg_str, "aes-256-gcm")) alg_byte = alg_aes_gcm else if (!std.mem.eql(u8, alg_str, "chacha20-poly1305")) return throwCryptoError(ctx, "crypto.encrypt algorithm must be chacha20-poly1305 or aes-256-gcm");
         }
     }
     var nonce: [12]u8 = undefined;

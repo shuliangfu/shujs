@@ -131,7 +131,7 @@ fn offCallback(
     const len: usize = @intFromFloat(len_f);
     if (argumentCount < 2) {
         var empty_elems: [0]jsc.JSValueRef = undefined;
-    const empty_arr = jsc.JSObjectMakeArray(ctx, 0, &empty_elems, null);
+        const empty_arr = jsc.JSObjectMakeArray(ctx, 0, &empty_elems, null);
         _ = jsc.JSObjectSetProperty(ctx, events, name_str, empty_arr, jsc.kJSPropertyAttributeNone, null);
         return thisObject;
     }

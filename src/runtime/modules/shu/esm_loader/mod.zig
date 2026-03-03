@@ -74,7 +74,7 @@ fn parseModule(allocator: std.mem.Allocator, source: []const u8) !ParseResult {
             const rest = line["import ".len..];
             if (std.mem.indexOf(u8, rest, " from ")) |from_pos| {
                 const before_from = std.mem.trim(u8, rest[0..from_pos], " \t\r\n");
-                const after_from = std.mem.trim(u8, rest[from_pos + " from ".len..], " \t\r\n");
+                const after_from = std.mem.trim(u8, rest[from_pos + " from ".len ..], " \t\r\n");
                 const specifier = extractQuotedSpecifier(after_from);
                 if (specifier) |spec| {
                     if (std.mem.startsWith(u8, before_from, "* as ")) {
