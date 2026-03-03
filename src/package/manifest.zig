@@ -670,6 +670,54 @@ pub fn removePackageDependency(allocator: std.mem.Allocator, dir: []const u8, na
     return error.ManifestNotFound;
 }
 
+/// 从 dir 下 package.json 或 package.jsonc 的 imports 中移除指定 specifier（如 "@dreamer/console"），写回同一文件。若 specifier 不存在则静默返回 false。
+/// 返回是否实际移除了该项。JSR 包若通过 shu add jsr:@scope/name 添加，会写在 imports 中，remove 时需同时调本函数与 removePackageDependency。
+pub fn removePackageImport(allocator: std.mem.Allocator, dir: []const u8, specifier: []const u8) !bool {
+    var dir_handle = if (io_core.pathIsAbsolute(dir))
+        try io_core.openDirAbsolute(dir, .{})
+    else
+        try io_core.openDirCwd(dir, .{});
+    defer dir_handle.close();
+    const pkg_paths = [_][]const u8{ "package.jsonc", "package.json" };
+    for (pkg_paths) |name_path| {
+        const f = dir_handle.openFile(name_path, .{}) catch continue;
+        defer f.close();
+        const content = f.readToEndAlloc(allocator, std.math.maxInt(usize)) catch return error.OutOfMemory;
+        defer allocator.free(content);
+        const to_parse = if (std.mem.endsWith(u8, name_path, ".jsonc")) blk: {
+            const s = stripJsoncComments(allocator, content) catch return error.OutOfMemory;
+            defer allocator.free(s);
+            break :blk s;
+        } else content;
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, to_parse, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidPackageJson;
+        const root_ptr = &parsed.value;
+        var changed = false;
+        if (@constCast(root_ptr).object.getPtr("imports")) |imports_ptr| {
+            if (imports_ptr.* == .object) {
+                var it = imports_ptr.*.object.iterator();
+                while (it.next()) |entry| {
+                    if (std.mem.eql(u8, entry.key_ptr.*, specifier)) {
+                        // 只 swapRemove，不 free value：解析器分配的内存在 parsed.deinit() 时统一释放；若在此处用 allocator.free(entry.value_ptr.*.string) 会与解析器内部 allocator 不一致导致 Invalid free
+                        _ = @constCast(&imports_ptr.*.object).swapRemove(entry.key_ptr.*);
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!changed) return false;
+        const out = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .whitespace = .indent_2 });
+        defer allocator.free(out);
+        var out_file = try dir_handle.createFile(name_path, .{});
+        defer out_file.close();
+        try out_file.writeAll(out);
+        return true;
+    }
+    return error.ManifestNotFound;
+}
+
 /// 目录 dir 下是否存在 deno.json 或 deno.jsonc（用于 add 时决定写入 deno.json 还是 package.json）。
 pub fn hasDenoJsonInDir(dir: []const u8) bool {
     var dir_handle = if (io_core.pathIsAbsolute(dir))
