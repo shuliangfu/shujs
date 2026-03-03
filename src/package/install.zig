@@ -165,7 +165,7 @@ const JsrInstallWorkerCtx = struct {
     last_completed_name: ?*LastCompletedName = null,
 };
 
-/// JSR 安装 worker：循环取任务并调用 downloadPackageToDir；与 npm 一致，网络类失败（超时、CurlFailed 等）时重试
+/// JSR 安装 worker：循环取任务并调用 downloadPackageToDir；与 npm 一致，网络类失败（超时、HttpFailed 等）时重试
 /// INSTALL_NETWORK_RETRIES 次，失败写 results[i] 并在 mutex 下写 first_error。
 fn jsrInstallWorker(ctx: *const JsrInstallWorkerCtx) void {
     while (true) {
@@ -480,7 +480,7 @@ pub const InstallErrorDetail = struct {
     version: ?[]const u8 = null,
 };
 
-/// 安装进度回调：onResolving 本次要解析的数量；onResolvingComplete() 解析阶段曾输出过 onResolving 时在 onStart 前调用一次，供 CLI 在 Resolving 与 Installing 间输出空行；onStart(new_count) 本次新安装数量，进度条用；onProgress(current, total, last_completed_name) 下载/解压过程中由主线程轮询调用，last_completed_name 为最近完成的一包名（可选）；onPackage(..., newly_installed)；onDone(total_count, new_count)。
+/// 安装进度回调：onResolving 本次要解析的数量；onResolvingComplete() 解析阶段曾输出过 onResolving 时在 onStart 前调用一次，供 CLI 在 Resolving 与 Installing 间输出空行；onStart(new_count) 本次新安装数量，进度条用；onProgress(current, total, last_completed_name) 下载/解压过程中由主线程轮询调用，last_completed_name 为最近完成的一包名（可选）；onPackage(..., newly_installed)；onDone(total_count, new_count, elapsed_ms) 其中 elapsed_ms 从 install() 入口计时，含 Resolving + Installing。
 /// onPackageAdded(name, version)：add 流程下 install 结束后对 added_names 中在 resolved 的包各调用一次，用于打印「+ name@version」。
 /// onResolveFailure()：解析阶段某个包失败时、在写 stderr 诊断前调用一次，便于 CLI 先换行/刷新进度行，避免错误信息被后续进度覆盖。
 pub const InstallReporter = struct {
@@ -493,14 +493,17 @@ pub const InstallReporter = struct {
     /// 下载阶段主线程轮询调用，更新进度条与第二行文案；total 与 onStart 一致；last_completed_name 为最近完成的一包名（主线程从共享缓冲读出，可为 null）。
     onProgress: ?*const fn (?*anyopaque, usize, usize, ?[]const u8) void = null,
     onPackage: ?*const fn (?*anyopaque, usize, usize, []const u8, []const u8, bool) void = null,
-    onDone: ?*const fn (?*anyopaque, usize, usize) void = null,
+    /// elapsed_ms 由 install 从函数入口计时到 onDone 调用前，含 Resolving + Installing，供 CLI 显示真实总耗时
+    onDone: ?*const fn (?*anyopaque, usize, usize, i64) void = null,
     onPackageAdded: ?*const fn (?*anyopaque, []const u8, []const u8) void = null,
 };
 
 /// 根据 manifest 与 lockfile 安装依赖到 cwd/node_modules。若 added_names 非 null（add 流程），install 结束后对其中在 resolved 的包调用 reporter.onPackageAdded。
 /// 若 error_detail 非 null，安装失败时会填入最后一次失败的 err 及包 name/version（由 allocator 分配，调用方 free name/version）。
 /// §1.2：整次 install 用 Arena 分配临时路径与 key，仅 resolved map 的 key/value 用主 allocator（供 save 后释放），减少 alloc/free 与碎片。
+/// 耗时统计：从本函数入口计时，onDone 时传入 elapsed_ms（含 Resolving + Installing），避免 CLI 只统计安装阶段造成虚假时间。
 pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const InstallReporter, added_names: ?[]const []const u8, error_detail: ?*InstallErrorDetail) !void {
+    const install_start_ms = std.time.milliTimestamp();
     var loaded = manifest.Manifest.load(allocator, cwd) catch |e| {
         if (e == error.ManifestNotFound) return error.NoManifest;
         return e;
@@ -645,10 +648,10 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
         to_process.deinit(allocator);
     }
     var first_error: ?anyerror = null;
-    // 将 HTTP ReadFailed 转为 CurlFailed，避免 CLI 显示 ReadFailed（底层已重试 libcurl，仍失败则按网络错误提示重试）
+    // 将 HTTP ReadFailed 转为 HttpFailed，避免 CLI 显示 ReadFailed（底层已 Zig 重试，仍失败则按网络错误提示重试）
     const map_install_err = struct {
         fn call(err: anyerror) anyerror {
-            if (err == error.ReadFailed) return error.CurlFailed;
+            if (err == error.ReadFailed) return error.HttpFailed;
             return err;
         }
     }.call;
@@ -1670,7 +1673,8 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
             // add 流程：统计只显示本次添加的包数，如 "1 package installed"
             const done_total = if (added_names) |names| names.len else total_count;
             const done_new = if (added_names) |names| names.len else new_index;
-            cb(r.ctx, done_total, done_new);
+            const elapsed_ms = std.time.milliTimestamp() - install_start_ms;
+            cb(r.ctx, done_total, done_new, elapsed_ms);
         }
     }
     try lockfile.saveFromResolved(allocator, lock_path, resolved, &deps_of, &jsr_packages);
