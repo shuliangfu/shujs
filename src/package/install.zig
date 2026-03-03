@@ -20,6 +20,7 @@ const registry = @import("registry.zig");
 const npmrc = @import("npmrc.zig");
 const resolver = @import("resolver.zig");
 const jsr = @import("jsr.zig");
+const shu_zlib = @import("shu_zlib");
 
 /// 无 .npmrc 时使用的默认 registry host 与 URL（与 npmrc.DEFAULT_REGISTRY_URL 一致）
 const DEFAULT_REGISTRY_HOST = "registry.npmjs.org";
@@ -564,6 +565,7 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
 
     // 优化 B：npm 下载临时文件改为各 worker 内 .tmp-download-<worker_id>.tgz，主线程不再使用单一 temp_tgz
     // 传递依赖统一放在 node_modules/.shu/<name>@<version>，不再使用 .shu/store 子目录
+    // Windows：创建符号链接需「开发者模式」或管理员权限，否则会 AccessDenied；失败时见 CLI 的 Hint
     const shu_dir = try io_core.pathJoin(a, &.{ nm_dir, ".shu" });
     io_core.makePathAbsolute(shu_dir) catch {};
 
@@ -1490,6 +1492,16 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
 
     // 直接依赖已安装在 node_modules/<name>，无需再建顶层符号链接
 
+    // node_modules/.bin：为每个直接依赖的 package.json "bin" 在 .bin 下创建符号链接，供 npx/CLI 解析
+    const bin_dir = io_core.pathJoin(a, &.{ nm_dir, ".bin" }) catch return error.OutOfMemory;
+    io_core.makePathAbsolute(bin_dir) catch {};
+    var direct_it = direct_set.iterator();
+    while (direct_it.next()) |e| {
+        const pkg_name = e.key_ptr.*;
+        const pkg_dir = io_core.pathJoin(a, &.{ nm_dir, pkg_name }) catch continue;
+        linkPackageBins(a, bin_dir, pkg_name, pkg_dir);
+    }
+
     // 每个包（直接依赖在 node_modules，传递依赖在 .shu）内建 node_modules/<dep>，供 require 解析
     // 目标：传递依赖在 .shu/<name>@<version>；直接依赖在 node_modules/<name>
     var deps_it = deps_of.iterator();
@@ -1511,7 +1523,8 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                 logInstallFailure("[shu install] skip symlink: no resolved version for dep {s} of {s}\n", .{ dep_name, pkg_name });
                 continue;
             };
-            const target_rel = blk: {
+            // 传递依赖指向 node_modules/.shu/<name>@<ver>，直接依赖指向 node_modules/<name>；用绝对路径指向 .shu，避免相对路径 ../../.shu 依赖 cwd 或解析歧义
+            const target_path = blk: {
                 if (direct_set.contains(dep_name)) {
                     break :blk if (direct_set.contains(pkg_name))
                         std.fmt.allocPrint(a, "../../{s}", .{dep_name}) catch continue
@@ -1520,14 +1533,9 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                 } else {
                     const name_at_ver = std.fmt.allocPrint(a, "{s}@{s}", .{ dep_name, dep_ver }) catch continue;
                     if (direct_set.contains(pkg_name)) {
-                        // 从「当前包」的 node_modules 内链接到项目 node_modules/.shu；深度 = pkg_name 的路径段数 + 1(node_modules) + (scoped 时 +1)
-                        const depth: usize = 2 + std.mem.count(u8, pkg_name, "/") + (if (std.mem.indexOf(u8, dep_name, "/")) |_| @as(usize, 1) else 0);
-                        var prefix = std.ArrayList(u8).initCapacity(a, depth * 3 + 1) catch continue;
-                        defer prefix.deinit(a);
-                        for (0..depth) |_| prefix.appendSlice(a, "../") catch continue;
-                        break :blk std.fmt.allocPrint(a, "{s}.shu/{s}", .{ prefix.items, name_at_ver }) catch continue;
-                    } else
-                        break :blk std.fmt.allocPrint(a, "../{s}", .{name_at_ver}) catch continue;
+                        // 从「直接依赖包」的 node_modules 链到项目 node_modules/.shu/<name>@<ver>：用绝对路径，确保任意 cwd 下都能解析
+                        break :blk io_core.pathJoin(a, &.{ shu_dir, name_at_ver }) catch continue;
+                    } else break :blk std.fmt.allocPrint(a, "../{s}", .{name_at_ver}) catch continue;
                 }
             };
             const dep_link_path = io_core.pathJoin(a, &.{ nm_inside, dep_name }) catch continue;
@@ -1536,7 +1544,11 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
             const link_name = io_core.pathBasename(dep_link_path);
             io_core.makePathAbsolute(parent) catch {};
             var dep_dir = io_core.openDirAbsolute(parent, .{}) catch continue;
-            dep_dir.symLink(target_rel, link_name, .{ .is_directory = true }) catch {};
+            dep_dir.symLink(target_path, link_name, .{ .is_directory = true }) catch |e| {
+                if (@import("builtin").os.tag == .windows) {
+                    logInstallFailure("[shu install] symlink failed (Windows): enable Developer Mode or run as Administrator. dep={s} error={s}\n", .{ dep_name, @errorName(e) });
+                }
+            };
             dep_dir.close();
         }
     }
@@ -1614,9 +1626,98 @@ fn storePkgDir(allocator: std.mem.Allocator, shu_dir: []const u8, name: []const 
     return io_core.pathJoin(allocator, &.{ shu_dir, try std.fmt.allocPrint(allocator, "{s}@{s}", .{ name, version }) });
 }
 
+/// 从包目录 pkg_dir 的 package.json 解析 "bin" 字段，为每个 bin 在 node_modules/.bin 下创建符号链接。
+/// bin 为字符串时视为单一条目，命令名为 pkg_name；为对象时键为命令名、值为相对路径。
+/// 使用相对目标（../<pkg_name>/<path>），与 npm 一致。失败仅打日志，不中断 install。
+fn linkPackageBins(
+    allocator: std.mem.Allocator,
+    bin_dir: []const u8,
+    pkg_name: []const u8,
+    pkg_dir: []const u8,
+) void {
+    const pkg_json_path = io_core.pathJoin(allocator, &.{ pkg_dir, "package.json" }) catch return;
+    defer allocator.free(pkg_json_path);
+    var f = io_core.openFileAbsolute(pkg_json_path, .{}) catch return;
+    defer f.close();
+    const raw = f.readToEndAlloc(allocator, std.math.maxInt(usize)) catch return;
+    defer allocator.free(raw);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{ .allocate = .alloc_always }) catch return;
+    defer parsed.deinit();
+    const root = parsed.value;
+    if (root != .object) return;
+    const bin_value = root.object.get("bin") orelse return;
+    var bin_name: []const u8 = undefined;
+    var rel_path: []const u8 = undefined;
+    switch (bin_value) {
+        .string => |s| {
+            bin_name = pkg_name;
+            rel_path = s;
+        },
+        .object => |obj| {
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                bin_name = entry.key_ptr.*;
+                const val = entry.value_ptr.*;
+                if (val != .string) continue;
+                rel_path = val.string;
+                linkOneBin(allocator, bin_dir, pkg_dir, bin_name, rel_path) catch |e| {
+                    if (@import("builtin").os.tag == .windows) {
+                        logInstallFailure("[shu install] .bin link failed (Windows): {s} -> {s} error={s}\n", .{ bin_name, rel_path, @errorName(e) });
+                    }
+                };
+            }
+            return;
+        },
+        else => return,
+    }
+    linkOneBin(allocator, bin_dir, pkg_dir, bin_name, rel_path) catch |e| {
+        if (@import("builtin").os.tag == .windows) {
+            logInstallFailure("[shu install] .bin link failed (Windows): {s} -> {s} error={s}\n", .{ bin_name, rel_path, @errorName(e) });
+        }
+    };
+}
+
+/// 在 bin_dir 下创建一条 bin 链接：bin_dir/<bin_name> -> pkg_dir/<normalized_path>。
+/// target 须为绝对路径，否则 std.fs.symLinkAbsolute 会断言失败。
+/// Unix：创建后对目标脚本 fchmod +x，使 exec .bin/<name> 时 shebang 能执行。
+/// Windows：无「可执行位」概念，不需 chmod；额外写 .bin/<bin_name>.cmd 包装脚本（@node "target" %*），
+/// 以便在 cmd 中直接运行 <name> 时能正确执行。
+fn linkOneBin(
+    allocator: std.mem.Allocator,
+    bin_dir: []const u8,
+    pkg_dir: []const u8,
+    bin_name: []const u8,
+    rel_path: []const u8,
+) !void {
+    const normalized = std.mem.trim(u8, rel_path, "./");
+    const target_absolute = io_core.pathJoin(allocator, &.{ pkg_dir, normalized }) catch return error.OutOfMemory;
+    defer allocator.free(target_absolute);
+    const link_path = io_core.pathJoin(allocator, &.{ bin_dir, bin_name }) catch return error.OutOfMemory;
+    defer allocator.free(link_path);
+    io_core.deleteFileAbsolute(link_path) catch |err| if (err == error.IsDir) io_core.deleteTreeAbsolute(link_path) catch {};
+    io_core.symLinkAbsolute(target_absolute, link_path, .{}) catch return;
+    const is_windows = @import("builtin").os.tag == .windows;
+    if (is_windows) {
+        // Windows：写 .cmd 包装，使 cmd 中运行 <name> 时执行 node target %*
+        const cmd_path = std.fmt.allocPrint(allocator, "{s}.cmd", .{link_path}) catch return;
+        defer allocator.free(cmd_path);
+        io_core.deleteFileAbsolute(cmd_path) catch {};
+        var f = io_core.createFileAbsolute(cmd_path, .{}) catch return;
+        defer f.close();
+        // @echo off & node "target_absolute" %*
+        var buf: [4096]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "@echo off\r\nnode \"{s}\" %*\r\n", .{target_absolute}) catch return;
+        f.writeAll(line) catch return;
+    } else {
+        // Unix：对目标脚本加可执行权限
+        var f = io_core.openFileAbsolute(target_absolute, .{}) catch return;
+        defer f.close();
+        std.posix.fchmod(f.handle, 0o755) catch {};
+    }
+}
+
 /// 首次解压失败时无条件打印一次：包名、错误、路径、文件大小、前 16 字节（hex）。便于自动定位 tgz 是否为 gzip（1f 8b）或误写为 br 等。用原子标记保证只打印一次（与 first_error 谁先无关）。
 fn logFirstTarballExtractFailure(ctx: *const NpmInstallWorkerCtx, tgz_path: []const u8, err: anyerror, name: []const u8, version: []const u8) void {
-    _ = std.posix.write(2, "[shu install] first tarball extract failure (raw)\n") catch {};
     if (ctx.first_extract_failure_logged.swap(true, .monotonic)) return;
     logInstallFailure("[shu install] first tarball extract failure: {s}@{s} error={s}\n", .{ name, version, @errorName(err) });
     var f = io_core.openFileAbsolute(tgz_path, .{}) catch {
@@ -1638,6 +1739,48 @@ fn logFirstTarballExtractFailure(ctx: *const NpmInstallWorkerCtx, tgz_path: []co
         tgz_path,
         stat.size,
         hex[0..@min(n * 3, 48)],
+    });
+}
+
+/// 当 SHU_DEBUG_TGZ 非空时，在 extractRawTarFromSlice 返回 InvalidGzip 前调用，打印解压后 content 长度与首个 tar 条目的名字，用于区分「截断」与「无 package/」。
+fn logInvalidTarContent(tgz_path: []const u8, content: []const u8, reason: []const u8) void {
+    if (std.posix.getenv("SHU_DEBUG_TGZ")) |_| {} else return;
+    var name_buf: [120]u8 = undefined;
+    var name_slice: []const u8 = "?";
+    if (content.len >= 512) {
+        const name_end = std.mem.indexOfScalar(u8, content[0..100], 0) orelse 100;
+        if (name_end > 0) {
+            name_slice = content[0..name_end];
+        }
+        const ustar = content[257..262];
+        if (ustar.len >= 5 and ustar[0] == 'u' and ustar[1] == 's' and ustar[2] == 't' and ustar[3] == 'a' and ustar[4] == 'r') {
+            const prefix_end = std.mem.indexOfScalar(u8, content[345..500], 0) orelse 155;
+            const prefix_slice = content[345..][0..prefix_end];
+            var fbs = std.io.fixedBufferStream(&name_buf);
+            if (prefix_slice.len > 0) {
+                fbs.writer().print("{s}/{s}", .{ prefix_slice, name_slice }) catch {};
+            } else {
+                fbs.writer().print("{s}", .{name_slice}) catch {};
+            }
+            name_slice = fbs.getWritten();
+        }
+    }
+    logInstallFailure("[shu tgz debug] InvalidGzip reason={s} path={s} decompressed_len={d} first_entry={s}\n", .{
+        reason,
+        tgz_path,
+        content.len,
+        name_slice,
+    });
+}
+
+/// 当 SHU_DEBUG_TGZ 非空时，解压某步骤失败则向 stderr 打印步骤、路径与错误，便于定位 TarballExtractFailed 等。
+fn logExtractFailureStep(tgz_path: []const u8, step: []const u8, path_or_rel: []const u8, err: anyerror) void {
+    if (std.posix.getenv("SHU_DEBUG_TGZ")) |_| {} else return;
+    logInstallFailure("[shu tgz debug] step={s} path={s} target={s} error={s}\n", .{
+        step,
+        tgz_path,
+        path_or_rel,
+        @errorName(err),
     });
 }
 
@@ -1664,10 +1807,118 @@ fn debugLogTarballExtractFailed(tgz_path: []const u8, err: anyerror) void {
     });
 }
 
+/// 从内存中的 raw tar 切片解析并解出「单层顶层目录」下内容到 dest_dir。与 extractTarballToDir 的 tar 解析逻辑一致，用于服务端返回未压缩 tar（Accept-Encoding: identity）时。
+/// 兼容任意单层顶层目录：从第一条条目的路径推断前缀（如 package/、ws/、foo/ 等），只解压该前缀下的文件到 dest_dir。
+fn extractRawTarFromSlice(tgz_path: []const u8, content: []const u8, dest_dir: []const u8) !void {
+    try io_core.makePathAbsolute(dest_dir);
+    var dest_dir_handle = std.fs.openDirAbsolute(dest_dir, .{}) catch |e| {
+        logExtractFailureStep(tgz_path, "open_dest_dir", dest_dir, e);
+        return error.TarballExtractFailed;
+    };
+    defer dest_dir_handle.close();
+    var wrote_any_file = false;
+    var offset: usize = 0;
+    var prefix_buf: [256]u8 = undefined;
+    var prefix: []const u8 = "";
+    var prefix_len: usize = 0;
+    while (offset + 512 <= content.len) {
+        const header_buf = content[offset..][0..512];
+        offset += 512;
+        const name_end = std.mem.indexOfScalar(u8, header_buf[0..100], 0) orelse 100;
+        const name_slice = header_buf[0..name_end];
+        if (name_slice.len == 0) {
+            if (!wrote_any_file) {
+                logInvalidTarContent(tgz_path, content, "empty_block_no_package");
+                return error.InvalidGzip;
+            }
+            break;
+        }
+        const full_name = blk: {
+            const ustar_magic = header_buf[257..262];
+            if (ustar_magic[0] == 'u' and ustar_magic[1] == 's' and ustar_magic[2] == 't' and ustar_magic[3] == 'a' and ustar_magic[4] == 'r') {
+                const prefix_end = std.mem.indexOfScalar(u8, header_buf[345..500], 0) orelse 155;
+                const prefix_slice = header_buf[345..][0..prefix_end];
+                if (prefix_slice.len > 0) {
+                    var buf: [256]u8 = undefined;
+                    var fbs = std.io.fixedBufferStream(&buf);
+                    fbs.writer().print("{s}/{s}", .{ prefix_slice, name_slice }) catch break :blk name_slice;
+                    break :blk fbs.getWritten();
+                }
+            }
+            break :blk name_slice;
+        };
+        var size: usize = 0;
+        for (header_buf[124..136]) |c| {
+            if (c >= '0' and c <= '7') size = size * 8 + (c - '0');
+        }
+        const typeflag = if (header_buf.len > 156) header_buf[156] else '0';
+        const block_rounded = (size + 511) / 512 * 512;
+        if (offset + block_rounded > content.len) {
+            logInvalidTarContent(tgz_path, content, "truncated");
+            return error.InvalidGzip;
+        }
+        // 从第一条条目推断顶层目录前缀（package/、ws/、任意单层目录），后续只接受此前缀下的条目
+        if (prefix_len == 0) {
+            const slash = std.mem.indexOfScalar(u8, full_name, '/');
+            if (slash) |s| {
+                if (s + 1 <= prefix_buf.len) {
+                    @memcpy(prefix_buf[0..s], full_name[0..s]);
+                    prefix_buf[s] = '/';
+                    prefix = prefix_buf[0 .. s + 1];
+                    prefix_len = s + 1;
+                }
+            } else if (full_name.len + 1 <= prefix_buf.len) {
+                @memcpy(prefix_buf[0..full_name.len], full_name);
+                prefix_buf[full_name.len] = '/';
+                prefix = prefix_buf[0 .. full_name.len + 1];
+                prefix_len = full_name.len + 1;
+            }
+        }
+        const under_prefix = prefix_len > 0 and std.mem.startsWith(u8, full_name, prefix);
+        if (!under_prefix) {
+            offset += block_rounded;
+            continue;
+        }
+        var rel_full = full_name[prefix_len..];
+        // 兼容 USTAR 双层 package（如 prefix=package/package、name=package.json → package/package/package.json）：再剥掉一层 package/
+        if (std.mem.startsWith(u8, rel_full, "package/")) rel_full = rel_full["package/".len..];
+        const rel_null = std.mem.indexOfScalar(u8, rel_full, 0) orelse rel_full.len;
+        const rel = rel_full[0..rel_null];
+        if (rel.len == 0) {
+            offset += block_rounded;
+            continue;
+        }
+        if (typeflag == '5') {
+            dest_dir_handle.makePath(rel) catch {};
+            offset += block_rounded;
+        } else {
+            if (std.mem.indexOf(u8, rel, "..")) |_| {
+                offset += block_rounded;
+                continue;
+            }
+            if (io_core.pathDirname(rel)) |rel_dir| if (rel_dir.len > 0) dest_dir_handle.makePath(rel_dir) catch {};
+            const out_file = dest_dir_handle.createFile(rel, .{}) catch |e| {
+                logExtractFailureStep(tgz_path, "create_file", rel, e);
+                offset += block_rounded;
+                return e;
+            };
+            defer out_file.close();
+            wrote_any_file = true;
+            if (size > 0) {
+                try out_file.writeAll(content[offset..][0..size]);
+            }
+            offset += block_rounded;
+        }
+    }
+    if (!wrote_any_file) {
+        logInvalidTarContent(tgz_path, content, "no_package_entry");
+        return error.InvalidGzip;
+    }
+}
+
 /// 将 .tgz 解压到指定目录 dest_dir（tgz 内 package/ 前缀下的内容写入 dest_dir）。使用 io_core.mapFileReadOnly 映射 tgz，gzip 解压后流式解析 tar。
 /// 通过 openDirAbsolute(dest_dir) + Dir.createFile/makePath 写文件，避免依赖 *Absolute 路径语义。
 fn extractTarballToDir(allocator: std.mem.Allocator, tgz_path: []const u8, dest_dir: []const u8) !void {
-    _ = allocator;
     var mapped = io_core.mapFileReadOnly(tgz_path) catch |e| {
         debugLogTarballExtractFailed(tgz_path, e);
         return e;
@@ -1678,29 +1929,41 @@ fn extractTarballToDir(allocator: std.mem.Allocator, tgz_path: []const u8, dest_
         debugLogTarballExtractFailed(tgz_path, error.InvalidGzip);
         return error.InvalidGzip;
     }
-    // 若非 gzip magic（如下载到 HTML 错误页），直接报错便于上层打首条失败日志
+    // 若非 gzip magic：视为未压缩 tar（如 Accept-Encoding: identity 时服务端返回的 body），直接按 raw tar 解析
     if (tgz_content[0] != 0x1f or tgz_content[1] != 0x8b) {
-        debugLogTarballExtractFailed(tgz_path, error.InvalidGzip);
-        return error.InvalidGzip;
+        return extractRawTarFromSlice(tgz_path, tgz_content, dest_dir);
     }
 
-    var in_reader = std.io.Reader.fixed(tgz_content);
-    var dec_buf: [std.compress.flate.max_window_len]u8 = undefined;
-    var dec = std.compress.flate.Decompress.init(&in_reader, .gzip, &dec_buf);
+    // 先尝试一次性 gzip 解压再按 raw tar 解析，兼容部分镜像（如 npmmirror）的 gzip 与 std.compress.flate 流式解压不兼容导致 InvalidGzip 的情况
+    if (shu_zlib.decompressGzip(allocator, tgz_content)) |tar_bytes| {
+        defer allocator.free(tar_bytes);
+        if (tar_bytes.len > 0) {
+            return extractRawTarFromSlice(tgz_path, tar_bytes, dest_dir);
+        }
+    } else |_| {}
 
-    const prefix = "package/";
-    const prefix_len = prefix.len;
+    // 回退：进程内流式 gzip 解压（decode.zig 已支持多 member，此处仅作流式兜底）
+    var in_reader = std.Io.Reader.fixed(tgz_content);
+    var dec = std.compress.flate.Decompress.init(&in_reader, .gzip, &[0]u8{});
+
     try io_core.makePathAbsolute(dest_dir);
-    var dest_dir_handle = std.fs.openDirAbsolute(dest_dir, .{}) catch return error.TarballExtractFailed;
+    var dest_dir_handle = std.fs.openDirAbsolute(dest_dir, .{}) catch |e| {
+        logExtractFailureStep(tgz_path, "open_dest_dir(stream)", dest_dir, e);
+        return error.TarballExtractFailed;
+    };
     defer dest_dir_handle.close();
 
     var header_buf: [512]u8 = undefined;
     var chunk: [8192]u8 = undefined;
     var wrote_any_file = false;
+    var stream_prefix_buf: [256]u8 = undefined;
+    var stream_prefix: []const u8 = "";
+    var stream_prefix_len: usize = 0;
 
     while (true) {
         streamReadExactlyToBuffer(&dec, header_buf[0..512], &chunk) catch |e| {
             if (e == error.UnexpectedEof) break;
+            logExtractFailureStep(tgz_path, "stream_read_header", dest_dir, e);
             return e;
         };
         const name_end = std.mem.indexOfScalar(u8, header_buf[0..100], 0) orelse 100;
@@ -1738,12 +2001,32 @@ fn extractTarballToDir(allocator: std.mem.Allocator, tgz_path: []const u8, dest_
 
         const block_rounded = (size + 511) / 512 * 512;
 
-        if (!std.mem.startsWith(u8, full_name, prefix)) {
+        // 从第一条条目推断顶层目录前缀，与 extractRawTarFromSlice 一致，兼容任意单层顶层目录
+        if (stream_prefix_len == 0) {
+            const slash = std.mem.indexOfScalar(u8, full_name, '/');
+            if (slash) |s| {
+                if (s + 1 <= stream_prefix_buf.len) {
+                    @memcpy(stream_prefix_buf[0..s], full_name[0..s]);
+                    stream_prefix_buf[s] = '/';
+                    stream_prefix = stream_prefix_buf[0 .. s + 1];
+                    stream_prefix_len = s + 1;
+                }
+            } else if (full_name.len + 1 <= stream_prefix_buf.len) {
+                @memcpy(stream_prefix_buf[0..full_name.len], full_name);
+                stream_prefix_buf[full_name.len] = '/';
+                stream_prefix = stream_prefix_buf[0 .. full_name.len + 1];
+                stream_prefix_len = full_name.len + 1;
+            }
+        }
+        const under_prefix = stream_prefix_len > 0 and std.mem.startsWith(u8, full_name, stream_prefix);
+        if (!under_prefix) {
             try streamSkipExactly(&dec, block_rounded, &chunk);
             continue;
         }
         // 截断到首个 null，避免 name 域未以 0 结尾时产生错误文件名（如 package.json\x00...）
-        const rel_full = full_name[prefix_len..];
+        var rel_full = full_name[stream_prefix_len..];
+        // 兼容 USTAR 双层 package（同 extractRawTarFromSlice）：再剥掉一层 package/
+        if (std.mem.startsWith(u8, rel_full, "package/")) rel_full = rel_full["package/".len..];
         const rel_null = std.mem.indexOfScalar(u8, rel_full, 0) orelse rel_full.len;
         const rel = rel_full[0..rel_null];
         if (rel.len == 0) {
@@ -1761,6 +2044,7 @@ fn extractTarballToDir(allocator: std.mem.Allocator, tgz_path: []const u8, dest_
             }
             if (io_core.pathDirname(rel)) |rel_dir| if (rel_dir.len > 0) dest_dir_handle.makePath(rel_dir) catch {};
             const out_file = dest_dir_handle.createFile(rel, .{}) catch |e| {
+                logExtractFailureStep(tgz_path, "create_file(stream)", rel, e);
                 try streamSkipExactly(&dec, block_rounded, &chunk);
                 return e;
             };
@@ -1768,10 +2052,18 @@ fn extractTarballToDir(allocator: std.mem.Allocator, tgz_path: []const u8, dest_
             wrote_any_file = true;
             // 必须完整读出文件内容；失败则直接返回，避免流位置错位导致后续条目（如 package.json）解析错乱
             if (size > 0) {
-                try streamReadExactlyToFile(&dec, out_file, size, &chunk);
+                streamReadExactlyToFile(&dec, out_file, size, &chunk) catch |e| {
+                    logExtractFailureStep(tgz_path, "stream_read_file", rel, e);
+                    return e;
+                };
             }
             const padding = block_rounded - size;
-            if (padding > 0) try streamSkipExactly(&dec, padding, &chunk);
+            if (padding > 0) {
+                streamSkipExactly(&dec, padding, &chunk) catch |e| {
+                    logExtractFailureStep(tgz_path, "stream_skip_padding", rel, e);
+                    return e;
+                };
+            }
         }
     }
     if (!wrote_any_file) {
@@ -1827,4 +2119,3 @@ test "extractTarballToDir: real tgz when SHU_TGZ_PATH set" {
     defer a.free(pkg_json);
     try std.testing.expect(io_core.accessAbsolute(pkg_json, .{}) == .ok);
 }
-
