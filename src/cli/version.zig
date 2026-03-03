@@ -22,3 +22,20 @@ pub fn printVersion() !void {
     try w.interface.print("shu {s}\n", .{VERSION});
     try w.interface.flush();
 }
+
+// ANSI SGR：仅 TTY 时使用，与 install/help 等一致
+const c_cyan = "\x1b[36m";
+const c_reset = "\x1b[0m";
+
+/// 打印统一命令头 "shu <cmd> v<VERSION>" 到 stdout；stdout 为 TTY 时使用青色美化，否则无颜色。供各子命令入口调用以统一首行输出。
+pub fn printCommandHeader(cmd: []const u8) !void {
+    var buf: [128]u8 = undefined;
+    var w = std.fs.File.stdout().writer(&buf);
+    const use_color = std.posix.isatty(1);
+    if (use_color) {
+        try w.interface.print("{s}shu {s} v{s}{s}\n\n", .{ c_cyan, cmd, VERSION, c_reset });
+    } else {
+        try w.interface.print("shu {s} v{s}\n\n", .{ cmd, VERSION });
+    }
+    try w.interface.flush();
+}
