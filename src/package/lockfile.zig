@@ -5,7 +5,9 @@
 // 文件 I/O 经 io_core（§3.0）；path 由调用方传绝对路径（如 pathJoin(cwd, lock_file_name)）
 
 const std = @import("std");
-const io_core = @import("io_core");
+const errors = @import("errors");
+const libs_io = @import("libs_io");
+const libs_process = @import("libs_process");
 
 /// 锁文件名（项目根目录下），与 deno.lock、bun.lock 命名一致
 pub const lock_file_name = "shu.lock";
@@ -51,12 +53,17 @@ pub fn loadWithDeps(allocator: std.mem.Allocator, path: []const u8) !LoadWithDep
         for (jsr_packages.items) |p| allocator.free(p);
         jsr_packages.deinit(allocator);
     }
-    const file = io_core.openFileAbsolute(path, .{}) catch |e| {
-        if (e == io_core.FileOpenError.FileNotFound) return .{ .packages = packages, .root_dependencies = root_dependencies, .jsr_packages = jsr_packages };
+    const io = libs_process.getProcessIo() orelse return error.ProcessIoNotSet;
+    const file = libs_io.openFileAbsolute(path, .{}) catch |e| {
+        if (e == libs_io.FileOpenError.FileNotFound) return .{ .packages = packages, .root_dependencies = root_dependencies, .jsr_packages = jsr_packages };
         return e;
     };
-    defer file.close();
-    const content = file.readToEndAlloc(allocator, load_max_bytes) catch return .{ .packages = packages, .root_dependencies = root_dependencies, .jsr_packages = jsr_packages };
+    defer file.close(io);
+    var file_reader = file.reader(io, &.{});
+    const content = file_reader.interface.allocRemaining(allocator, std.Io.Limit.limited(load_max_bytes)) catch |e| switch (e) {
+        error.ReadFailed => return file_reader.err orelse error.ReadFailed,
+        error.OutOfMemory, error.StreamTooLong => return .{ .packages = packages, .root_dependencies = root_dependencies, .jsr_packages = jsr_packages },
+    };
     defer allocator.free(content);
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{ .allocate = .alloc_always }) catch return .{ .packages = packages, .root_dependencies = root_dependencies, .jsr_packages = jsr_packages };
     defer parsed.deinit();
@@ -144,7 +151,11 @@ fn appendJsonEscaped(allocator: std.mem.Allocator, list: *std.ArrayList(u8), s: 
             '\r' => try list.appendSlice(allocator, "\\r"),
             '\t' => try list.appendSlice(allocator, "\\t"),
             else => {
-                if (c < 0x20) try std.fmt.format(list.writer(allocator), "\\u{d:0>4}", .{c}) else try list.append(allocator, c);
+                if (c < 0x20) {
+                    var buf: [8]u8 = undefined;
+                    const part = std.fmt.bufPrint(&buf, "\\u{d:0>4}", .{c}) catch return;
+                    try list.appendSlice(allocator, part);
+                } else try list.append(allocator, c);
             },
         }
     }
@@ -202,12 +213,13 @@ pub fn save(
         }
     }
     try list.appendSlice(allocator, "\n}\n");
-    if (io_core.pathDirname(path)) |dir| {
-        io_core.makePathAbsolute(dir) catch {};
+    if (libs_io.pathDirname(path)) |dir| {
+        libs_io.makePathAbsolute(dir) catch {};
     }
-    const file = io_core.createFileAbsolute(path, .{}) catch return error.CannotCreateLockfile;
-    defer file.close();
-    try file.writeAll(list.items);
+    const io = libs_process.getProcessIo() orelse return error.CannotCreateLockfile;
+    const file = libs_io.createFileAbsolute(path, .{}) catch return error.CannotCreateLockfile;
+    defer file.close(io);
+    try file.writeStreamingAll(io, list.items);
 }
 
 /// 从旧式 resolved(name->version) + 可选 deps_of(name->deps 名字) 与 jsr 包名集合，构建新格式并写入 path；供 update 等只持有 resolved 的调用方使用。调用方不释放传入的 map/list。
