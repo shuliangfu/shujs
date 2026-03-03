@@ -18,7 +18,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const args = @import("args.zig");
 const version = @import("version.zig");
-const io_core = @import("io_core");
+const libs_io = @import("libs_io");
+const errors = @import("errors");
+const libs_process = @import("libs_process");
 const manifest = @import("../package/manifest.zig");
 const scan = @import("scan.zig");
 
@@ -26,9 +28,10 @@ const scan = @import("scan.zig");
 /// 无则全局扫描 fmt_extensions。
 pub fn fmt(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional: []const []const u8) !void {
     _ = parsed;
-    try version.printCommandHeader("fmt");
+    const io = libs_process.getProcessIo() orelse return error.NoProcessIo;
+    try version.printCommandHeader(io, "fmt");
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd = io_core.realpath(".", &cwd_buf) catch {
+    const cwd = libs_io.realpath(".", &cwd_buf) catch {
         try printStderr("shu fmt: cannot get current directory\n", .{});
         return error.CwdFailed;
     };
@@ -139,10 +142,11 @@ fn filterPathsByFmtConfig(
 /// 默认行为：若有 positional 则只扫描指定文件/目录，无则递归收集（不含 .c/.h）。
 /// 若 manifest 存在则用其 fmt 配置过滤。JS/TS/JSON/MD 仅用 Prettier；.zig 用 zig fmt。
 fn runDefaultFmt(allocator: std.mem.Allocator, cwd_owned: []const u8, positional: []const []const u8, fmt_value: ?std.json.Value) !void {
+    const io = libs_process.getProcessIo() orelse return error.NoProcessIo;
     var list = if (positional.len > 0)
-        try collectFilesFromPositional(allocator, cwd_owned, positional)
+        try collectFilesFromPositional(allocator, cwd_owned, positional, io)
     else
-        try scan.collectFilesRecursive(allocator, cwd_owned, &scan.fmt_extensions);
+        try scan.collectFilesRecursive(allocator, cwd_owned, &scan.fmt_extensions, io);
     if (fmt_value) |fv| {
         const filtered = try filterPathsByFmtConfig(allocator, list, fv);
         for (list.items) |p| allocator.free(p);
@@ -186,30 +190,30 @@ fn runDefaultFmt(allocator: std.mem.Allocator, cwd_owned: []const u8, positional
 }
 
 /// 根据 positional 收集要格式化的文件：目录则递归收集 fmt_extensions，
-/// 文件则仅当扩展名匹配时加入；路径相对 cwd 解析为绝对。
-fn collectFilesFromPositional(allocator: std.mem.Allocator, cwd_owned: []const u8, positional: []const []const u8) !std.ArrayList([]const u8) {
+/// 文件则仅当扩展名匹配时加入；路径相对 cwd 解析为绝对。io 用于目录遍历（0.16）。
+fn collectFilesFromPositional(allocator: std.mem.Allocator, cwd_owned: []const u8, positional: []const []const u8, io: std.Io) !std.ArrayList([]const u8) {
     var list = try std.ArrayList([]const u8).initCapacity(allocator, 32);
     for (positional) |path| {
-        const path_abs = if (io_core.pathIsAbsolute(path))
+        const path_abs = if (libs_io.pathIsAbsolute(path))
             try allocator.dupe(u8, path)
         else
-            try io_core.pathJoin(allocator, &.{ cwd_owned, path });
+            try libs_io.pathJoin(allocator, &.{ cwd_owned, path });
         defer allocator.free(path_abs);
 
-        var dir = io_core.openDirAbsolute(path_abs, .{ .iterate = true }) catch {
+        var dir = libs_io.openDirAbsolute(path_abs, .{ .iterate = true }) catch {
             if (scan.hasExtension(path_abs, &scan.fmt_extensions)) {
                 try list.append(allocator, try allocator.dupe(u8, path_abs));
             }
             continue;
         };
-        defer dir.close();
-        var sub = try scan.collectFilesRecursive(allocator, path_abs, &scan.fmt_extensions);
+        defer dir.close(io);
+        var sub = try scan.collectFilesRecursive(allocator, path_abs, &scan.fmt_extensions, io);
         defer {
             for (sub.items) |p| allocator.free(p);
             sub.deinit(allocator);
         }
         for (sub.items) |rel| {
-            try list.append(allocator, try io_core.pathJoin(allocator, &.{ path_abs, rel }));
+            try list.append(allocator, try libs_io.pathJoin(allocator, &.{ path_abs, rel }));
         }
     }
     return list;
@@ -217,8 +221,9 @@ fn collectFilesFromPositional(allocator: std.mem.Allocator, cwd_owned: []const u
 
 /// 执行 npx --yes prettier --write <files...>；成功返回 true，未找到或失败返回 false。
 /// 仅将「有变更」的文件行打印到 stdout（过滤掉 Prettier 输出的 "(unchanged)" 行）。
-/// （--yes 避免交互安装，fmt 不需额外权限。）退出码 0 与 1 均视为成功。
+/// （--yes 避免交互安装，fmt 不需额外权限。）退出码 0 与 1 均视为成功。0.16：spawn(io, options)、wait(io)、File.reader 读 stdout
 fn runPrettierFmt(allocator: std.mem.Allocator, cwd: []const u8, files: []const []const u8) bool {
+    const io = libs_process.getProcessIo() orelse return false;
     var argv = std.ArrayList([]const u8).initCapacity(allocator, files.len + 5) catch return false;
     defer argv.deinit(allocator);
     argv.append(allocator, "npx") catch return false;
@@ -228,34 +233,37 @@ fn runPrettierFmt(allocator: std.mem.Allocator, cwd: []const u8, files: []const 
     for (files) |f| {
         argv.append(allocator, f) catch return false;
     }
-    var child = std.process.Child.init(argv.items, allocator);
-    child.cwd = cwd;
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Inherit;
-    child.spawn() catch return false;
+    var child = std.process.spawn(io, .{
+        .argv = argv.items,
+        .cwd = .{ .path = cwd },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .inherit,
+    }) catch return false;
     const stdout = child.stdout orelse {
-        _ = child.wait() catch {};
+        std.process.Child.kill(&child, io);
         return false;
     };
     var buf: [4096]u8 = undefined;
     var out = std.ArrayList(u8).initCapacity(allocator, 4096) catch {
-        _ = child.wait() catch {};
+        std.process.Child.kill(&child, io);
         return false;
     };
     defer out.deinit(allocator);
-    while (stdout.read(buf[0..])) |n| {
+    var r = stdout.reader(io, &buf);
+    while (true) {
+        var dest: [1][]u8 = .{buf[0..]};
+        const n = std.Io.Reader.readVec(&r.interface, &dest) catch break;
         if (n == 0) break;
         out.appendSlice(allocator, buf[0..n]) catch break;
-    } else |_| {}
-    // 不在此 close stdout，由 child.wait() 内部 cleanupStreams() 统一关闭，否则会 BADF
-    const term = child.wait() catch return false;
+    }
+    const term = child.wait(io) catch return false;
     const ok = switch (term) {
-        .Exited => |code| code == 0 or code == 1,
+        .exited => |code| code == 0 or code == 1,
         else => false,
     };
     // 只输出「有变更」的行（Prettier 对未修改文件会输出 "(unchanged)"），路径与时间分色
-    const use_color = std.posix.isatty(1);
+    const use_color = std.c.isatty(1) != 0;
     var it = std.mem.splitScalar(u8, out.items, '\n');
     while (it.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \r");
@@ -266,8 +274,9 @@ fn runPrettierFmt(allocator: std.mem.Allocator, cwd: []const u8, files: []const 
     return ok;
 }
 
-/// 执行 zig fmt <files...>；成功返回 true，未找到 zig 或失败返回 false。退出码 0/1 均视为成功。
+/// 执行 zig fmt <files...>；成功返回 true，未找到 zig 或失败返回 false。退出码 0/1 均视为成功。0.16：spawn(io, options)、wait(io)
 fn runZigFmt(allocator: std.mem.Allocator, cwd: []const u8, files: []const []const u8) bool {
+    const io = libs_process.getProcessIo() orelse return false;
     var argv = std.ArrayList([]const u8).initCapacity(allocator, files.len + 2) catch return false;
     defer argv.deinit(allocator);
     argv.append(allocator, "zig") catch return false;
@@ -275,20 +284,23 @@ fn runZigFmt(allocator: std.mem.Allocator, cwd: []const u8, files: []const []con
     for (files) |f| {
         argv.append(allocator, f) catch return false;
     }
-    var child = std.process.Child.init(argv.items, allocator);
-    child.cwd = cwd;
-    child.stdin_behavior = .Inherit;
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-    child.spawn() catch return false;
-    const term = child.wait() catch return false;
+    var child = std.process.spawn(io, .{
+        .argv = argv.items,
+        .cwd = .{ .path = cwd },
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch return false;
+    const term = child.wait(io) catch return false;
     return switch (term) {
-        .Exited => |code| code == 0 or code == 1,
+        .exited => |code| code == 0 or code == 1,
         else => false,
     };
 }
 
 fn runScriptInCwd(allocator: std.mem.Allocator, cwd: []const u8, cmd: []const u8) !void {
+    const io = libs_process.getProcessIo() orelse return error.NoProcessIo;
+    _ = allocator;
     var argv_buf: [3][]const u8 = undefined;
     if (builtin.os.tag == .windows) {
         argv_buf[0] = "cmd.exe";
@@ -299,27 +311,30 @@ fn runScriptInCwd(allocator: std.mem.Allocator, cwd: []const u8, cmd: []const u8
         argv_buf[1] = "-c";
         argv_buf[2] = cmd;
     }
-    var child = std.process.Child.init(&argv_buf, allocator);
-    child.cwd = cwd;
-    child.stdin_behavior = .Inherit;
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-    try child.spawn();
-    const term = try child.wait();
+    const argv = argv_buf[0..3];
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .cwd = .{ .path = cwd },
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    const term = try child.wait(io);
     switch (term) {
-        .Exited => |code| if (code != 0) return error.ScriptExitedNonZero,
-        .Signal, .Stopped => return error.ScriptSignalled,
-        .Unknown => return error.ScriptExitedNonZero,
+        .exited => |code| if (code != 0) return error.ScriptExitedNonZero,
+        .signal, .stopped => return error.ScriptSignalled,
+        .unknown => return error.ScriptExitedNonZero,
     }
 }
 
 /// Prettier 单行格式为 "path time"（如 examples/fetch-test.js 2ms），路径与时间分色输出；非 TTY 则原样输出。
 fn printFmtChangedLine(line: []const u8, use_color: bool) !void {
+    const io = libs_process.getProcessIo() orelse return error.NoProcessIo;
     const path_color = "\x1b[36m"; // cyan
     const time_color = "\x1b[2m"; // dim
     const reset = "\x1b[0m";
     var buf: [512]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf);
+    var w = std.Io.File.Writer.init(std.Io.File.stdout(), io, &buf);
     const last_space = std.mem.lastIndexOfScalar(u8, line, ' ');
     if (use_color and last_space != null) {
         const path = line[0..last_space.?];
@@ -332,15 +347,17 @@ fn printFmtChangedLine(line: []const u8, use_color: bool) !void {
 }
 
 fn printToStdout(comptime fmt_str: []const u8, fargs: anytype) !void {
+    const io = libs_process.getProcessIo() orelse return error.NoProcessIo;
     var buf: [64]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf);
+    var w = std.Io.File.Writer.init(std.Io.File.stdout(), io, &buf);
     try w.interface.print(fmt_str, fargs);
     try w.interface.flush();
 }
 
 fn printStderr(comptime fmt_str: []const u8, fargs: anytype) !void {
+    const io = libs_process.getProcessIo() orelse return error.NoProcessIo;
     var buf: [256]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
+    var w = std.Io.File.Writer.init(std.Io.File.stderr(), io, &buf);
     try w.interface.print(fmt_str, fargs);
     try w.interface.flush();
 }
