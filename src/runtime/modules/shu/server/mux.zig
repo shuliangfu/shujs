@@ -24,16 +24,16 @@ pub fn setNonBlocking(fd: std.posix.socket_t) void {
         _ = std.c.ioctlsocket(fd, std.c.FIONBIO, &mode);
         return;
     }
-    const flags = std.posix.fcntl(fd, std.posix.F.GETFL, 0) catch return;
-    _ = std.posix.fcntl(fd, std.posix.F.SETFL, flags | 0x4) catch {};
+    const flags = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
+    if (flags < 0) return;
+    _ = std.c.fcntl(fd, std.c.F.SETFL, flags | 0x4);
 }
 
 /// 对已 accept 的 TCP stream 设置 TCP_NODELAY，降低小包延迟；非 POSIX 或失败时静默忽略
-pub fn setTcpNoDelay(stream: *const std.net.Stream) void {
+pub fn setTcpNoDelay(stream: *const std.Io.net.Stream) void {
     if (builtin.os.tag == .windows) return;
-    const posix = std.posix;
     const one: u32 = 1;
-    posix.setsockopt(stream.handle, posix.IPPROTO.TCP, posix.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
+    std.posix.setsockopt(stream.socket.handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
 }
 
 // ------------------------------------------------------------------------------
