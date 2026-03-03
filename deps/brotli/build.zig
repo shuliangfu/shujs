@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Zig 0.15.2：用 createModule + addLibrary 替代已移除的 addStaticLibrary
+    // Zig 0.16.0-dev：用 createModule + addLibrary 替代已移除的 addStaticLibrary
     // 体积优化：strip 去掉符号；用 zig build -Doptimize=ReleaseSmall 可把 .a 从约 7MB 压到 ~700KB
     const root = b.createModule(.{
         .root_source_file = null,
