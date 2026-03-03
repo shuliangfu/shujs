@@ -8,7 +8,9 @@
 //! - **流水线**：写盘与下一任务拉取由不同 worker 并行，整体上网络与磁盘重叠。
 
 const std = @import("std");
-const io_core = @import("io_core");
+const errors = @import("errors");
+const libs_io = @import("libs_io");
+const libs_process = @import("libs_process");
 const cache = @import("cache.zig");
 const registry = @import("registry.zig");
 const resolver = @import("resolver.zig");
@@ -18,11 +20,11 @@ const JSR_CACHE_HOST = "jsr.io";
 
 /// 当环境变量 SHU_DEBUG_RESOLVE_CACHE 非空时，向 stderr 打印一条缓存命中日志，便于验证「无 lock 第二次安装」是否走缓存。
 fn logResolveCacheHit(allocator: std.mem.Allocator, kind: []const u8, key: []const u8) void {
-    if (std.posix.getenv("SHU_DEBUG_RESOLVE_CACHE")) |v| {
-        if (v.len > 0) {
+    if (std.c.getenv("SHU_DEBUG_RESOLVE_CACHE")) |v| {
+        if (std.mem.span(v).len > 0) {
             const msg = std.fmt.allocPrint(allocator, "[shu] jsr {s} cache hit: {s}\n", .{ kind, key }) catch return;
             defer allocator.free(msg);
-            _ = std.posix.write(2, msg) catch {};
+            _ = std.c.write(2, msg.ptr, msg.len);
         }
     }
 }
@@ -41,39 +43,43 @@ const JsrWriteItem = struct { body: []const u8, dest_path: []const u8, job: *Jsr
 const JsrDownloadJob = struct {
     remaining: std.atomic.Value(usize),
     first_error: ?anyerror = null,
-    done_mutex: std.Thread.Mutex = .{},
-    done_cond: std.Thread.Condition = .{},
+    done_mutex: std.Io.Mutex = std.Io.Mutex.init,
+    done_cond: std.Io.Condition = std.Io.Condition.init,
 };
 
 var g_jsr_pool: ?*JsrDownloadPool = null;
-var g_jsr_pool_mutex: std.Thread.Mutex = .{};
+var g_jsr_pool_mutex: std.Io.Mutex = std.Io.Mutex.init;
 
 /// 全局 JSR 下载线程池：固定 N 个 fetcher + 1 个 writer；fetcher 只拉取并入写盘队列，writer 写盘，实现网络/磁盘流水线。可由调用方创建并在适当时机 deinit 以避免 GPA 泄漏。
 pub const JsrDownloadPool = struct {
     allocator: std.mem.Allocator,
     queue: std.ArrayList(JsrPoolTask),
     head: usize = 0,
-    mutex: std.Thread.Mutex = .{},
-    cond: std.Thread.Condition = .{},
+    mutex: std.Io.Mutex = std.Io.Mutex.init,
+    cond: std.Io.Condition = std.Io.Condition.init,
     threads: std.ArrayList(std.Thread),
     write_queue: std.ArrayList(JsrWriteItem),
     write_head: usize = 0,
-    write_mutex: std.Thread.Mutex = .{},
-    write_cond: std.Thread.Condition = .{},
+    write_mutex: std.Io.Mutex = std.Io.Mutex.init,
+    write_cond: std.Io.Condition = std.Io.Condition.init,
     writer_thread: std.Thread,
     shutdown: std.atomic.Value(bool) = .{ .raw = false },
 
-    /// 每 worker 持有一个 std.http.Client，复用同 host 连接（Zig 路径、Keep-Alive）。
+    /// 每 worker 持有一个 std.http.Client，复用同 host 连接（Zig 路径、Keep-Alive）。Zig 0.16 使用 std.Io.Mutex/Condition，需传入 io。
     fn worker(pool: *JsrDownloadPool) void {
-        var zig_client = std.http.Client{ .allocator = pool.allocator };
+        const io = libs_process.getProcessIo() orelse return;
+        var zig_client = std.http.Client{ .allocator = pool.allocator, .io = io };
         defer zig_client.deinit();
         while (true) {
-            pool.mutex.lock();
+            pool.mutex.lock(io) catch return;
             while (pool.head >= pool.queue.items.len and pool.shutdown.load(.monotonic) == false) {
-                pool.cond.wait(&pool.mutex);
+                pool.cond.wait(io, &pool.mutex) catch {
+                    pool.mutex.unlock(io);
+                    return;
+                };
             }
             if (pool.shutdown.load(.monotonic)) {
-                pool.mutex.unlock();
+                pool.mutex.unlock(io);
                 break;
             }
             const task = pool.queue.items[pool.head];
@@ -82,40 +88,44 @@ pub const JsrDownloadPool = struct {
                 pool.queue.clearRetainingCapacity();
                 pool.head = 0;
             }
-            pool.mutex.unlock();
+            pool.mutex.unlock(io);
             const content = registry.fetchUrlForJsrMetaWithClient(&zig_client, pool.allocator, task.url, JSR_FETCH_MAX_BYTES) catch |e| {
-                task.job.done_mutex.lock();
+                task.job.done_mutex.lock(io) catch continue;
                 if (task.job.first_error == null) task.job.first_error = e;
                 _ = task.job.remaining.fetchSub(1, .monotonic);
-                task.job.done_cond.signal();
-                task.job.done_mutex.unlock();
+                task.job.done_cond.signal(io);
+                task.job.done_mutex.unlock(io);
                 continue;
             };
             // 入写盘队列后立即继续拉取下一任务，不等待写盘（网络/磁盘流水线）
-            pool.write_mutex.lock();
+            pool.write_mutex.lock(io) catch return;
             pool.write_queue.append(pool.allocator, .{ .body = content, .dest_path = task.dest_path, .job = task.job }) catch {
                 pool.allocator.free(content);
-                task.job.done_mutex.lock();
+                task.job.done_mutex.lock(io) catch {};
                 if (task.job.first_error == null) task.job.first_error = error.OutOfMemory;
                 _ = task.job.remaining.fetchSub(1, .monotonic);
-                task.job.done_cond.signal();
-                task.job.done_mutex.unlock();
-                pool.write_mutex.unlock();
+                task.job.done_cond.signal(io);
+                task.job.done_mutex.unlock(io);
+                pool.write_mutex.unlock(io);
                 continue;
             };
-            pool.write_cond.signal();
-            pool.write_mutex.unlock();
+            pool.write_cond.signal(io);
+            pool.write_mutex.unlock(io);
         }
     }
 
     fn writerLoop(pool: *JsrDownloadPool) void {
+        const io = libs_process.getProcessIo() orelse return;
         while (true) {
-            pool.write_mutex.lock();
+            pool.write_mutex.lock(io) catch return;
             while (pool.write_head >= pool.write_queue.items.len and pool.shutdown.load(.monotonic) == false) {
-                pool.write_cond.wait(&pool.write_mutex);
+                pool.write_cond.wait(io, &pool.write_mutex) catch {
+                    pool.write_mutex.unlock(io);
+                    return;
+                };
             }
             if (pool.shutdown.load(.monotonic)) {
-                pool.write_mutex.unlock();
+                pool.write_mutex.unlock(io);
                 break;
             }
             const item = pool.write_queue.items[pool.write_head];
@@ -124,31 +134,31 @@ pub const JsrDownloadPool = struct {
                 pool.write_queue.clearRetainingCapacity();
                 pool.write_head = 0;
             }
-            pool.write_mutex.unlock();
+            pool.write_mutex.unlock(io);
             defer pool.allocator.free(item.body);
-            var f = io_core.createFileAbsolute(item.dest_path, .{}) catch |e| {
-                item.job.done_mutex.lock();
+            var f = libs_io.createFileAbsolute(item.dest_path, .{}) catch |e| {
+                item.job.done_mutex.lock(io) catch continue;
                 if (item.job.first_error == null) item.job.first_error = e;
-                item.job.done_mutex.unlock();
+                item.job.done_mutex.unlock(io);
                 const prev = item.job.remaining.fetchSub(1, .monotonic);
                 if (prev == 1) {
-                    item.job.done_mutex.lock();
-                    item.job.done_cond.signal();
-                    item.job.done_mutex.unlock();
+                    item.job.done_mutex.lock(io) catch {};
+                    item.job.done_cond.signal(io);
+                    item.job.done_mutex.unlock(io);
                 }
                 continue;
             };
-            f.writeAll(item.body) catch |e| {
-                item.job.done_mutex.lock();
+            f.writeStreamingAll(io, item.body) catch |e| {
+                item.job.done_mutex.lock(io) catch {};
                 if (item.job.first_error == null) item.job.first_error = e;
-                item.job.done_mutex.unlock();
+                item.job.done_mutex.unlock(io);
             };
-            f.close();
+            f.close(io);
             const prev = item.job.remaining.fetchSub(1, .monotonic);
             if (prev == 1) {
-                item.job.done_mutex.lock();
-                item.job.done_cond.signal();
-                item.job.done_mutex.unlock();
+                item.job.done_mutex.lock(io) catch {};
+                item.job.done_cond.signal(io);
+                item.job.done_mutex.unlock(io);
             }
         }
     }
@@ -171,30 +181,35 @@ pub const JsrDownloadPool = struct {
         return pool;
     }
 
-    /// 将一批任务入队并阻塞直到全部完成。tasks 的 url/dest_path 在返回前必须有效（通常由调用方 arena 持有）。任一步失败则返回 job.first_error。
+    /// 将一批任务入队并阻塞直到全部完成。tasks 的 url/dest_path 在返回前必须有效（通常由调用方 arena 持有）。任一步失败则返回 job.first_error。Zig 0.16 使用 std.Io.Mutex/Condition，需传入 io。
     fn submit(pool: *JsrDownloadPool, tasks: []const JsrFileTask) !void {
         if (tasks.len == 0) return;
+        const io = libs_process.getProcessIo() orelse return error.ProcessIoNotSet;
         var job: JsrDownloadJob = .{ .remaining = std.atomic.Value(usize).init(tasks.len) };
-        pool.mutex.lock();
+        pool.mutex.lock(io) catch return error.ProcessIoNotSet;
         for (tasks) |t| {
             try pool.queue.append(pool.allocator, .{ .url = t.url, .dest_path = t.dest_path, .job = &job });
         }
-        pool.cond.broadcast();
-        pool.mutex.unlock();
-        job.done_mutex.lock();
+        pool.cond.broadcast(io);
+        pool.mutex.unlock(io);
+        job.done_mutex.lock(io) catch return error.ProcessIoNotSet;
         while (job.remaining.load(.monotonic) != 0) {
-            job.done_cond.wait(&job.done_mutex);
+            job.done_cond.wait(io, &job.done_mutex) catch |e| {
+                job.done_mutex.unlock(io);
+                return e;
+            };
         }
         const err = job.first_error;
-        job.done_mutex.unlock();
+        job.done_mutex.unlock(io);
         if (err) |e| return e;
     }
 
     /// 关闭池并释放资源：置 shutdown、唤醒并 join 所有 worker 与 writer，deinit 内部 ArrayList，最后 destroy 自身。调用方负责用创建池时的 allocator 调用。
     pub fn deinit(pool: *JsrDownloadPool, allocator: std.mem.Allocator) void {
+        const io = libs_process.getProcessIo() orelse return;
         pool.shutdown.store(true, .monotonic);
-        pool.cond.broadcast();
-        pool.write_cond.broadcast();
+        pool.cond.broadcast(io);
+        pool.write_cond.broadcast(io);
         for (pool.threads.items) |*th| th.join();
         pool.writer_thread.join();
         pool.queue.deinit(allocator);
@@ -206,18 +221,20 @@ pub const JsrDownloadPool = struct {
 
 /// 获取或创建全局 JSR 下载线程池（首次调用时用传入的 allocator 创建，进程内复用）。
 fn getOrCreatePool(allocator: std.mem.Allocator) !*JsrDownloadPool {
-    g_jsr_pool_mutex.lock();
-    defer g_jsr_pool_mutex.unlock();
+    const io = libs_process.getProcessIo() orelse return error.ProcessIoNotSet;
+    g_jsr_pool_mutex.lock(io) catch return error.ProcessIoNotSet;
+    defer g_jsr_pool_mutex.unlock(io);
     if (g_jsr_pool) |p| return p;
     const pool = try JsrDownloadPool.init(allocator);
     g_jsr_pool = pool;
     return pool;
 }
 
-/// 发生 JsrMetaNoJsonObject 时始终向 stderr 打印失败 URL 与短 body 预览，便于用户定位是哪个包/请求。
+/// 发生 JsrMetaNoJsonObject 时始终向 stderr 打印失败 URL 与短 body 预览，便于用户定位是哪个包/请求。Zig 0.16 使用 std.Io.File.stderr() + Writer。
 fn logJsrMetaNoJson(url: []const u8, body_trimmed: []const u8) void {
+    const io = libs_process.getProcessIo() orelse return;
     var buf: [512]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
+    var w = std.Io.File.Writer.init(std.Io.File.stderr(), io, &buf);
     w.interface.print("JSR meta not JSON for: {s}\n", .{url}) catch return;
     const preview_len = @min(120, body_trimmed.len);
     if (preview_len > 0) {
@@ -225,15 +242,16 @@ fn logJsrMetaNoJson(url: []const u8, body_trimmed: []const u8) void {
     } else {
         w.interface.print("  body: (empty)\n", .{}) catch return;
     }
-    w.interface.flush() catch return;
+    w.flush() catch return;
 }
 
 /// 当 SHU_DEBUG_HTTP 非空时向 stderr 打印 JSR 请求的 URL 与完整 body 预览，用于排查 JsrMetaNoJsonObject。
 fn debugLogJsrResponse(url: []const u8, body_trimmed: []const u8) void {
-    const env = std.posix.getenv("SHU_DEBUG_HTTP") orelse return;
-    if (env.len == 0) return;
+    const env = std.c.getenv("SHU_DEBUG_HTTP") orelse return;
+    if (std.mem.span(env).len == 0) return;
+    const io = libs_process.getProcessIo() orelse return;
     var buf: [1024]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
+    var w = std.Io.File.Writer.init(std.Io.File.stderr(), io, &buf);
     w.interface.print("[shu jsr debug] url={s}\n", .{url}) catch return;
     w.interface.print("[shu jsr debug] body_len={d}\n", .{body_trimmed.len}) catch return;
     const preview_len = @min(512, body_trimmed.len);
@@ -242,7 +260,7 @@ fn debugLogJsrResponse(url: []const u8, body_trimmed: []const u8) void {
     } else {
         w.interface.print("[shu jsr debug] body_preview: (empty)\n", .{}) catch return;
     }
-    w.interface.flush() catch return;
+    w.flush() catch return;
 }
 
 /// 从 jsr.io 的 meta.json 解析版本。jsr_spec 为 jsr:@scope/name 或 jsr:@scope/name@version；version_spec 为 "latest" 时用 meta 的 "latest" 字段。返回的切片由调用方 free。
@@ -423,13 +441,13 @@ pub fn fetchDenoJsonImportsFromRegistryOrJsoncWithClient(client: ?*std.http.Clie
 /// 读取已安装 JSR 包目录下的 deno.json（或 deno.jsonc）的 imports，解析出 jsr: 与 npm: 依赖列表。（兜底用，优先用 fetchDenoJsonImportsFromRegistry）
 /// 返回的列表中每项的 name、spec 由 allocator 分配，调用方负责 free 并 deinit 列表。
 pub fn getDenoJsonImports(allocator: std.mem.Allocator, pkg_dir: []const u8) !std.ArrayList(DenoImportDep) {
-    const deno_path = try io_core.pathJoin(allocator, &.{ pkg_dir, "deno.json" });
+    const deno_path = try libs_io.pathJoin(allocator, &.{ pkg_dir, "deno.json" });
     defer allocator.free(deno_path);
-    var f = io_core.openFileAbsolute(deno_path, .{}) catch |e| {
+    var f = libs_io.openFileAbsolute(deno_path, .{}) catch |e| {
         if (e == error.FileNotFound) {
-            const deno_jsonc = try io_core.pathJoin(allocator, &.{ pkg_dir, "deno.jsonc" });
+            const deno_jsonc = try libs_io.pathJoin(allocator, &.{ pkg_dir, "deno.jsonc" });
             defer allocator.free(deno_jsonc);
-            var fc = io_core.openFileAbsolute(deno_jsonc, .{}) catch return error.ManifestNotFound;
+            var fc = libs_io.openFileAbsolute(deno_jsonc, .{}) catch return error.ManifestNotFound;
             defer fc.close();
             const content = try readFileAll(allocator, fc);
             defer allocator.free(content);
@@ -503,14 +521,15 @@ const JsrFileTask = struct { url: []const u8, dest_path: []const u8 };
 /// pool 非 null 时使用传入的池（调用方负责在适当时机 deinit）；为 null 时使用全局 getOrCreatePool(allocator)。
 /// 单包内解析与 task 列表使用 ArenaAllocator，结束时一次 deinit，减少碎片化分配。首包 version_meta 用 std.http.Client（Zig 路径）拉取。
 pub fn downloadPackageToDir(allocator: std.mem.Allocator, pool: ?*JsrDownloadPool, scope_name: []const u8, version: []const u8, dest_dir: []const u8) !void {
-    io_core.makePathAbsolute(dest_dir) catch {};
+    libs_io.makePathAbsolute(dest_dir) catch {};
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
     const sn = try scopeNameFromAtScopeName(a, scope_name);
     const version_meta_url = try std.fmt.allocPrint(a, "{s}/@{s}/{s}/{s}_meta.json", .{ JSR_META_BASE, sn.scope, sn.name, version });
-    var zig_client = std.http.Client{ .allocator = a };
+    const io = libs_process.getProcessIo() orelse return error.ProcessIoNotSet;
+    var zig_client = std.http.Client{ .allocator = a, .io = io };
     defer zig_client.deinit();
     const body = registry.fetchUrlForJsrMetaWithClient(&zig_client, a, version_meta_url, JSR_FETCH_MAX_BYTES) catch |e| return e;
     const trimmed = std.mem.trim(u8, body, " \t\r\n");
@@ -534,9 +553,9 @@ pub fn downloadPackageToDir(allocator: std.mem.Allocator, pool: ?*JsrDownloadPoo
         if (path_key.len == 0 or path_key[0] != '/') continue;
         const rel = path_key[1..];
         const file_url = if (rel.len == 0) base_url else try std.fmt.allocPrint(a, "{s}/{s}", .{ base_url, rel });
-        const dest_path = try io_core.pathJoin(a, &.{ dest_dir, rel });
-        if (io_core.pathDirname(dest_path)) |parent| {
-            io_core.makePathAbsolute(parent) catch {};
+        const dest_path = try libs_io.pathJoin(a, &.{ dest_dir, rel });
+        if (libs_io.pathDirname(dest_path)) |parent| {
+            libs_io.makePathAbsolute(parent) catch {};
         }
         try tasks.append(a, .{ .url = file_url, .dest_path = dest_path });
     }
