@@ -3,6 +3,8 @@
 
 const std = @import("std");
 const jsc = @import("jsc");
+const errors = @import("errors");
+const libs_process = @import("libs_process");
 const cron = @import("../crond/mod.zig");
 const async_ctx = @import("../async/context.zig");
 
@@ -82,7 +84,8 @@ pub const TimerState = struct {
     /// 脚本执行结束后按 scheduled_at 执行到期回调，interval 重新入队
     pub fn runLoop(self: *TimerState, ctx: jsc.JSGlobalContextRef) void {
         while (self.pending_timers.items.len > 0) {
-            const now = std.time.milliTimestamp();
+            const io = libs_process.getProcessIo() orelse return;
+            const now = @as(i64, @intCast(@divTrunc(std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds, 1_000_000)));
             var i: usize = 0;
             var fired: bool = false;
             while (i < self.pending_timers.items.len) {
@@ -161,12 +164,14 @@ pub const TimerState = struct {
             }
             if (self.pending_timers.items.len == 0) break;
             if (!fired) {
+                const io_clock = libs_process.getProcessIo() orelse break;
+                const now_ms = @as(i64, @intCast(@divTrunc(std.Io.Clock.Timestamp.now(io_clock, .real).raw.nanoseconds, 1_000_000)));
                 var next: i64 = std.math.maxInt(i64);
                 for (self.pending_timers.items) |e| {
-                    const d = e.scheduled_at - std.time.milliTimestamp();
+                    const d = e.scheduled_at - now_ms;
                     if (d < next and d > 0) next = d;
                 }
-                if (next != std.math.maxInt(i64) and next > 0) std.Thread.sleep(@intCast(next * 1_000_000));
+                if (next != std.math.maxInt(i64) and next > 0) std.Io.sleep(io, .{ .nanoseconds = @intCast(next * 1_000_000) }, .real) catch {};
             }
         }
     }
