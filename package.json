@@ -3,13 +3,12 @@
   "version": "0.0.1",
   "type": "module",
   "dependencies": {
-    "express": "^5.2.1",
-    "preact": "^10.28.4",
-    "react": "^19.2.4"
+    "express": "^5.2.1"
   },
   "imports": {
     "@dreamer/view": "jsr:@dreamer/view@^1.1.2",
-    "@dreamer/dweb": "jsr:@dreamer/dweb@^3.0.95"
+    "@dreamer/dweb": "jsr:@dreamer/dweb@^3.0.95",
+    "@dreamer/console": "jsr:@dreamer/console@^1.0.12"
   },
   "devDependencies": {
     "globals": "^16.0.0",
