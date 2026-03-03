@@ -13,17 +13,18 @@
 
 const std = @import("std");
 const args = @import("args.zig");
+const version = @import("version.zig");
 const manifest = @import("../package/manifest.zig");
 const lockfile = @import("../package/lockfile.zig");
 const registry = @import("../package/registry.zig");
+const npmrc = @import("../package/npmrc.zig");
 const pkg_install = @import("../package/install.zig");
 const io_core = @import("io_core");
-
-const REGISTRY_BASE_URL = "https://registry.npmjs.org";
 
 /// 执行 shu update [包名...]：若无参数则对所有 dependencies 与 devDependencies 按当前版本范围重新向 registry 解析，更新 shu.lock 后 install；若有包名则仅更新这些包。
 pub fn update(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional: []const []const u8) !void {
     _ = parsed;
+    try version.printCommandHeader("update");
     var cwd_buf: [1024]u8 = undefined;
     const cwd = std.posix.getcwd(&cwd_buf) catch return error.CwdFailed;
     const cwd_owned = allocator.dupe(u8, cwd) catch return error.OutOfMemory;
@@ -31,7 +32,7 @@ pub fn update(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional:
 
     var loaded = manifest.Manifest.load(allocator, cwd_owned) catch |e| {
         if (e == error.ManifestNotFound) {
-            try printToStdout("shu update: no package.json or package.jsonc in current directory\n", .{});
+            try printToStdout("shu update: no manifest (package.json or deno.json) in current directory\n", .{});
             return e;
         }
         return e;
@@ -70,11 +71,14 @@ pub fn update(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional:
     const resolveOne = struct {
         fn f(
             alloc: std.mem.Allocator,
+            project_dir: []const u8,
             name: []const u8,
             version_spec: []const u8,
             resolved_map: *std.StringArrayHashMap([]const u8),
         ) void {
-            const res = registry.resolveVersionAndTarball(alloc, REGISTRY_BASE_URL, name, version_spec) catch return;
+            const registry_url = npmrc.getRegistryForPackage(alloc, project_dir, name) catch return;
+            defer alloc.free(registry_url);
+            const res = registry.resolveVersionAndTarball(alloc, registry_url, name, version_spec, null) catch return;
             defer alloc.free(res.version);
             defer alloc.free(res.tarball_url);
             if (resolved_map.getPtr(name)) |val_ptr| {
@@ -89,26 +93,27 @@ pub fn update(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional:
     if (positional.len == 0) {
         var it = m.dependencies.iterator();
         while (it.next()) |e| {
-            resolveOne(allocator, e.key_ptr.*, e.value_ptr.*, &resolved);
+            resolveOne(allocator, cwd_owned, e.key_ptr.*, e.value_ptr.*, &resolved);
         }
         var dev_it = m.dev_dependencies.iterator();
         while (dev_it.next()) |e| {
-            resolveOne(allocator, e.key_ptr.*, e.value_ptr.*, &resolved);
+            resolveOne(allocator, cwd_owned, e.key_ptr.*, e.value_ptr.*, &resolved);
         }
     } else {
         for (positional) |name| {
             if (m.dependencies.get(name)) |spec| {
-                resolveOne(allocator, name, spec, &resolved);
+                resolveOne(allocator, cwd_owned, name, spec, &resolved);
             } else if (m.dev_dependencies.get(name)) |spec| {
-                resolveOne(allocator, name, spec, &resolved);
+                resolveOne(allocator, cwd_owned, name, spec, &resolved);
             } else {
                 try printToStdout("shu update: {s} not in dependencies or devDependencies\n", .{name});
             }
         }
     }
 
-    try lockfile.save(allocator, lock_path, resolved, null);
-    try pkg_install.install(allocator, cwd_owned, null, null);
+    try lockfile.saveFromResolved(allocator, lock_path, resolved, null, null);
+    try pkg_install.install(allocator, cwd_owned, null, null, null);
+    try printToStdout("\n", .{});
 }
 
 fn printToStdout(comptime fmt: []const u8, fargs: anytype) !void {
