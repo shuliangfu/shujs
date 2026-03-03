@@ -12,20 +12,21 @@ pub const RunOutput = struct {
 };
 
 /// 使用给定 argv、可选 cwd 执行子进程，收集 stdout/stderr，返回 RunOutput
-/// 返回的 stdout/stderr 由 allocator 分配，调用方需 free
+/// 返回的 stdout/stderr 由 allocator 分配，调用方需 free。Zig 0.16：run(gpa, io, RunOptions)。
 pub fn runProcess(
     allocator: std.mem.Allocator,
     argv: []const []const u8,
     cwd: ?[]const u8,
+    io: std.Io,
 ) !RunOutput {
-    const result = try std.process.Child.run(.{
-        .allocator = allocator,
+    const result = try std.process.run(allocator, io, .{
         .argv = argv,
-        .cwd = cwd,
-        .max_output_bytes = 256 * 1024,
+        .cwd = if (cwd) |c| .{ .path = c } else .inherit,
+        .stdout_limit = .limited(256 * 1024),
+        .stderr_limit = .limited(256 * 1024),
     });
     const code: u8 = switch (result.term) {
-        .Exited => |c| c,
+        .exited => |c| c,
         else => 255,
     };
     return .{
