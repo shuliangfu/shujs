@@ -13,12 +13,12 @@
 const std = @import("std");
 const args = @import("args.zig");
 const version = @import("version.zig");
-const io_core = @import("io_core");
+const libs_io = @import("libs_io");
 const cli_install = @import("install.zig");
 
 /// 执行 shu add <specifier>...；支持 --dev/-D 将包写入 devDependencies（仅本命令识别，非全局选项）。
-/// 将每个说明符（npm 包名或 jsr:@scope/name）写入 manifest 并安装到 node_modules；无参数时提示用法。
-pub fn add(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional: []const []const u8) !void {
+/// 将每个说明符（npm 包名或 jsr:@scope/name）写入 manifest 并安装到 node_modules；无参数时提示用法。Zig 0.16：io 用于 stdout。
+pub fn add(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional: []const []const u8, io: std.Io) !void {
     _ = parsed;
     var dev: bool = false;
     var specifiers = std.ArrayList([]const u8).initCapacity(allocator, positional.len) catch return;
@@ -31,25 +31,25 @@ pub fn add(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional: []
         }
     }
     if (specifiers.items.len == 0) {
-        try printToStdout("shu add: please specify at least one package (package name or jsr:)\n", .{});
-        try printToStdout("Usage: shu add [--dev|-D] <specifier>...  e.g. shu add <pkg>  shu add -D <pkg>  shu add <pkg>@<version>\n", .{});
+        try printToStdout(io, "shu add: please specify at least one package (package name or jsr:)\n", .{});
+        try printToStdout(io, "Usage: shu add [--dev|-D] <specifier>...  e.g. shu add <pkg>  shu add -D <pkg>  shu add <pkg>@<version>\n", .{});
         return;
     }
-    try version.printCommandHeader("add");
-    var cwd_buf: [io_core.max_path_bytes]u8 = undefined;
-    const cwd = io_core.realpath(".", &cwd_buf) catch {
-        try printToStdout("shu add: cannot get current directory\n", .{});
+    try version.printCommandHeader(io, "add");
+    var cwd_buf: [libs_io.max_path_bytes]u8 = undefined;
+    const cwd = libs_io.realpath(".", &cwd_buf) catch {
+        try printToStdout(io, "shu add: cannot get current directory\n", .{});
         return;
     };
     const cwd_owned = allocator.dupe(u8, cwd) catch return;
     defer allocator.free(cwd_owned);
-    try cli_install.addSpecifiersThenInstall(allocator, cwd_owned, specifiers.items, "shu add", dev);
-    try printToStdout("\n", .{});
+    try cli_install.addSpecifiersThenInstall(allocator, cwd_owned, specifiers.items, "shu add", dev, io);
+    try printToStdout(io, "\n", .{});
 }
 
-fn printToStdout(comptime fmt: []const u8, fargs: anytype) !void {
+fn printToStdout(io: std.Io, comptime fmt: []const u8, fargs: anytype) !void {
     var buf: [128]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf);
+    var w = std.Io.File.Writer.init(std.Io.File.stdout(), io, &buf);
     try w.interface.print(fmt, fargs);
-    try w.interface.flush();
+    w.flush() catch {};
 }
