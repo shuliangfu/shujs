@@ -47,9 +47,9 @@ const Execution = [_]CmdHelp{
     .{ .name = "x", .desc = "Run a package binary without installing (like npx)" },
 };
 const Dependency = [_]CmdHelp{
-    .{ .name = "install, -i", .desc = "Install dependencies to node_modules (package.json / lockfile)" },
-    .{ .name = "add", .desc = "Add dependency and run install (npm or jsr:)" },
-    .{ .name = "remove", .desc = "Remove dependency from package.json" },
+    .{ .name = "install, -i", .desc = "Install dependencies (shu.lock / package.json / deno.json)" },
+    .{ .name = "add", .desc = "Add dependency and run shu install (package or jsr:)" },
+    .{ .name = "remove", .desc = "Remove dependency from manifest (package.json or deno.json)" },
     .{ .name = "update", .desc = "Update dependencies within version range" },
     .{ .name = "outdated", .desc = "List outdated dependencies" },
     .{ .name = "list", .desc = "List installed packages (alias: ls)" },
@@ -73,7 +73,7 @@ const Project = [_]CmdHelp{
     .{ .name = "init", .desc = "Initialize a new project (package.json, etc.)" },
     .{ .name = "create", .desc = "Create project from template" },
     .{ .name = "pack", .desc = "Create a tarball from package.json" },
-    .{ .name = "publish", .desc = "Publish to npm or registry" },
+    .{ .name = "publish", .desc = "Publish to registry" },
     .{ .name = "clean", .desc = "Remove cache and build artifacts" },
 };
 const Registry = [_]CmdHelp{
