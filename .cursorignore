@@ -25,7 +25,6 @@ out/
 !.env.example
 
 # 编辑器与系统
-.cursor
 .DS_Store
 *.swp
 *.swo
