@@ -1,11 +1,11 @@
 // 全局 fetch(url) 注册与 C 回调；需 --allow-net，同步 GET 返回 { ok, status, statusText, body }
 // 由 bindings 在具备 RunOptions 时调用注册到 globalThis；本模块不依赖 engine。
-// HTTP 请求统一经 io_core.http（Content-Length 固定长度 / chunked 流式解压），与 registry、JSR 一致。
+// HTTP 请求统一经 libs_io.http（Content-Length 固定长度 / chunked 流式解压），与 registry、JSR 一致。
 
 const std = @import("std");
 const jsc = @import("jsc");
-const io_core = @import("io_core");
-const errors = @import("../../../../errors.zig");
+const libs_io = @import("libs_io");
+const errors = @import("errors");
 const globals = @import("../../../globals.zig");
 
 /// §1.1 显式 allocator 收敛：register 时注入，fetch 回调优先使用
@@ -47,8 +47,8 @@ fn callback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "fetch requires --allow-net" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    // 统一经 io_core.http 发 GET：有 Content-Length 读固定长度，chunked 时流式解压，与 registry/JSR 一致；用 freeResponse 统一释放 body 与可分配的 status_text
-    const resp = io_core.http.request(allocator, url, .{
+    // 统一经 libs_io.http 发 GET：有 Content-Length 读固定长度，chunked 时流式解压，与 registry/JSR 一致；用 freeResponse 统一释放 body 与可分配的 status_text
+    const resp = libs_io.http.request(allocator, url, .{
         .method = .GET,
         .max_response_bytes = 2 * 1024 * 1024,
     }) catch |e| {
@@ -59,7 +59,7 @@ fn callback(
         }
         return jsc.JSValueMakeUndefined(ctx);
     };
-    defer io_core.http.freeResponse(allocator, &resp);
+    defer libs_io.http.freeResponse(allocator, &resp);
     const status: u16 = resp.status;
     const ok = status >= 200 and status < 300;
     const body_slice = resp.body;
