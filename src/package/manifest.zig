@@ -4,7 +4,9 @@
 // 文件/目录与路径经 io_core（§3.0）
 
 const std = @import("std");
-const io_core = @import("io_core");
+const errors = @import("errors");
+const libs_io = @import("libs_io");
+const libs_process = @import("libs_process");
 
 /// 剥离 JSONC 注释（// 行注释与 /* */ 块注释），不剥离字符串字面量内的内容。返回的切片由调用方 free。
 fn stripJsoncComments(allocator: std.mem.Allocator, content: []const u8) ![]const u8 {
@@ -113,17 +115,18 @@ pub const Manifest = struct {
         manifest.imports = std.StringArrayHashMap([]const u8).init(a);
         manifest.tasks = std.StringArrayHashMap([]const u8).init(a);
 
-        var dir_handle = if (io_core.pathIsAbsolute(dir))
-            io_core.openDirAbsolute(dir, .{}) catch |e| {
-                if (e == io_core.FileOpenError.FileNotFound) return error.ManifestNotFound;
+        const io = libs_process.getProcessIo() orelse return error.ProcessIoNotSet;
+        var dir_handle = if (libs_io.pathIsAbsolute(dir))
+            libs_io.openDirAbsolute(dir, .{}) catch |e| {
+                if (e == libs_io.FileOpenError.FileNotFound) return error.ManifestNotFound;
                 return e;
             }
         else
-            io_core.openDirCwd(dir, .{}) catch |e| {
-                if (e == io_core.FileOpenError.FileNotFound) return error.ManifestNotFound;
+            libs_io.openDirCwd(dir, .{}) catch |e| {
+                if (e == libs_io.FileOpenError.FileNotFound) return error.ManifestNotFound;
                 return e;
             };
-        defer dir_handle.close();
+        defer dir_handle.close(io);
 
         // package.jsonc 或 package.json（优先 jsonc）
         const pkg_paths = [_][]const u8{ "package.jsonc", "package.json" };
@@ -131,9 +134,7 @@ pub const Manifest = struct {
         var pkg_is_jsonc = false;
         var has_pkg = false;
         for (pkg_paths) |name| {
-            const pkg_file = dir_handle.openFile(name, .{}) catch continue;
-            defer pkg_file.close();
-            pkg_content = pkg_file.readToEndAlloc(a, std.math.maxInt(usize)) catch return error.OutOfMemory;
+            pkg_content = dir_handle.readFileAlloc(io, name, a, .unlimited) catch continue;
             pkg_is_jsonc = std.mem.endsWith(u8, name, ".jsonc");
             has_pkg = true;
             break;
@@ -213,9 +214,7 @@ pub const Manifest = struct {
             // deno.json 或 deno.jsonc（优先 jsonc）
             const deno_paths = [_][]const u8{ "deno.jsonc", "deno.json" };
             for (deno_paths) |name| {
-                const deno_file = dir_handle.openFile(name, .{}) catch continue;
-                defer deno_file.close();
-                const deno_content = deno_file.readToEndAlloc(a, std.math.maxInt(usize)) catch continue;
+                const deno_content = dir_handle.readFileAlloc(io, name, a, .unlimited) catch continue;
                 // .jsonc: deno_to_parse is newly allocated by stripJsoncComments (caller frees). .json: deno_to_parse is deno_content (arena), do not free.
                 const deno_to_parse = if (std.mem.endsWith(u8, name, ".jsonc"))
                     stripJsoncComments(a, deno_content) catch continue
@@ -266,9 +265,7 @@ pub const Manifest = struct {
         // 仅 deno.json：与 Deno 一致，无 package.json 时仅从 deno.json 加载
         const deno_only_paths = [_][]const u8{ "deno.jsonc", "deno.json" };
         for (deno_only_paths) |name| {
-            const deno_file = dir_handle.openFile(name, .{}) catch continue;
-            defer deno_file.close();
-            const deno_content = deno_file.readToEndAlloc(a, std.math.maxInt(usize)) catch continue;
+            const deno_content = dir_handle.readFileAlloc(io, name, a, .unlimited) catch continue;
             const deno_to_parse = if (std.mem.endsWith(u8, name, ".jsonc"))
                 stripJsoncComments(a, deno_content) catch continue
             else
@@ -328,24 +325,23 @@ pub const Manifest = struct {
         manifest.imports = std.StringArrayHashMap([]const u8).init(a);
         manifest.tasks = std.StringArrayHashMap([]const u8).init(a);
 
-        var dir_handle = if (io_core.pathIsAbsolute(dir))
-            io_core.openDirAbsolute(dir, .{}) catch |e| {
-                if (e == io_core.FileOpenError.FileNotFound) return error.ManifestNotFound;
+        const io = libs_process.getProcessIo() orelse return error.ProcessIoNotSet;
+        var dir_handle = if (libs_io.pathIsAbsolute(dir))
+            libs_io.openDirAbsolute(dir, .{}) catch |e| {
+                if (e == libs_io.FileOpenError.FileNotFound) return error.ManifestNotFound;
                 return e;
             }
         else
-            io_core.openDirCwd(dir, .{}) catch |e| {
-                if (e == io_core.FileOpenError.FileNotFound) return error.ManifestNotFound;
+            libs_io.openDirCwd(dir, .{}) catch |e| {
+                if (e == libs_io.FileOpenError.FileNotFound) return error.ManifestNotFound;
                 return e;
             };
-        defer dir_handle.close();
+        defer dir_handle.close(io);
         const pkg_paths = [_][]const u8{ "package.jsonc", "package.json" };
         var pkg_content: []const u8 = undefined;
         var pkg_is_jsonc = false;
         for (pkg_paths) |name| {
-            const pkg_file = dir_handle.openFile(name, .{}) catch continue;
-            defer pkg_file.close();
-            pkg_content = pkg_file.readToEndAlloc(a, std.math.maxInt(usize)) catch return error.OutOfMemory;
+            pkg_content = dir_handle.readFileAlloc(io, name, a, .unlimited) catch continue;
             pkg_is_jsonc = std.mem.endsWith(u8, name, ".jsonc");
             break;
         } else return error.ManifestNotFound;
@@ -466,17 +462,16 @@ fn deepCopyJsonValue(a: std.mem.Allocator, v: std.json.Value) !std.json.Value {
 /// dev 为 true 时写入 devDependencies，否则写入 dependencies。
 /// 使用 Arena 构建全新 root 树再 stringify，避免 stringify 时读到解析器已失效的 key（0xaa 崩溃）。
 pub fn addPackageDependency(allocator: std.mem.Allocator, dir: []const u8, name: []const u8, version: []const u8, dev: bool) !void {
+    const io = libs_process.getProcessIo() orelse return error.ProcessIoNotSet;
     const section = if (dev) "devDependencies" else "dependencies";
-    var dir_handle = if (io_core.pathIsAbsolute(dir))
-        try io_core.openDirAbsolute(dir, .{})
+    var dir_handle = if (libs_io.pathIsAbsolute(dir))
+        try libs_io.openDirAbsolute(dir, .{})
     else
-        try io_core.openDirCwd(dir, .{});
-    defer dir_handle.close();
+        try libs_io.openDirCwd(dir, .{});
+    defer dir_handle.close(io);
     const pkg_paths = [_][]const u8{ "package.jsonc", "package.json" };
     for (pkg_paths) |name_path| {
-        const f = dir_handle.openFile(name_path, .{}) catch continue;
-        defer f.close();
-        const content = f.readToEndAlloc(allocator, std.math.maxInt(usize)) catch return error.OutOfMemory;
+        const content = dir_handle.readFileAlloc(io, name_path, allocator, .unlimited) catch continue;
         defer allocator.free(content);
         const to_parse = if (std.mem.endsWith(u8, name_path, ".jsonc")) blk: {
             const s = stripJsoncComments(allocator, content) catch return error.OutOfMemory;
@@ -528,9 +523,9 @@ pub fn addPackageDependency(allocator: std.mem.Allocator, dir: []const u8, name:
 
         const out = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = new_root }, .{ .whitespace = .indent_2 });
         defer allocator.free(out);
-        var out_file = try dir_handle.createFile(name_path, .{});
-        defer out_file.close();
-        try out_file.writeAll(out);
+        var out_file = try dir_handle.createFile(io, name_path, .{});
+        defer out_file.close(io);
+        try out_file.writeStreamingAll(io, out);
         // 按确定顺序释放：先释放 new_deps（含 name/version 的 dupe），再释放 new_root（遇到 section 不再递归，避免二次 deinit）
         {
             var it_deps = new_deps.iterator();
@@ -558,16 +553,15 @@ pub fn addPackageDependency(allocator: std.mem.Allocator, dir: []const u8, name:
 
 /// 在 dir 下向 package.json 或 package.jsonc 的 imports 添加/覆盖 specifier -> value（与 deno.json 同格式，如 "@dreamer/view" -> "jsr:@dreamer/view@1.1.2"）。写回同一文件。
 pub fn addPackageImport(allocator: std.mem.Allocator, dir: []const u8, specifier: []const u8, value: []const u8) !void {
-    var dir_handle = if (io_core.pathIsAbsolute(dir))
-        try io_core.openDirAbsolute(dir, .{})
+    const io = libs_process.getProcessIo() orelse return error.ProcessIoNotSet;
+    var dir_handle = if (libs_io.pathIsAbsolute(dir))
+        try libs_io.openDirAbsolute(dir, .{})
     else
-        try io_core.openDirCwd(dir, .{});
-    defer dir_handle.close();
+        try libs_io.openDirCwd(dir, .{});
+    defer dir_handle.close(io);
     const pkg_paths = [_][]const u8{ "package.jsonc", "package.json" };
     for (pkg_paths) |name_path| {
-        const f = dir_handle.openFile(name_path, .{}) catch continue;
-        defer f.close();
-        const content = f.readToEndAlloc(allocator, std.math.maxInt(usize)) catch return error.OutOfMemory;
+        const content = dir_handle.readFileAlloc(io, name_path, allocator, .unlimited) catch continue;
         defer allocator.free(content);
         const to_parse = if (std.mem.endsWith(u8, name_path, ".jsonc")) blk: {
             const s = stripJsoncComments(allocator, content) catch return error.OutOfMemory;
@@ -595,12 +589,12 @@ pub fn addPackageImport(allocator: std.mem.Allocator, dir: []const u8, specifier
         const out = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .whitespace = .indent_2 });
         defer allocator.free(out);
         // 用绝对路径写入，确保与读取的是同一文件（避免 dir 与 handle 歧义导致未落盘）
-        const full_path = try io_core.pathJoin(allocator, &.{ dir, name_path });
+        const full_path = try libs_io.pathJoin(allocator, &.{ dir, name_path });
         defer allocator.free(full_path);
-        var out_file = try io_core.createFileAbsolute(full_path, .{});
-        defer out_file.close();
-        try out_file.writeAll(out);
-        out_file.sync() catch {}; // 确保落盘，避免 IDE/用户未看到更新
+        var out_file = try libs_io.createFileAbsolute(full_path, .{});
+        defer out_file.close(io);
+        try out_file.writeStreamingAll(io, out);
+        out_file.sync(io) catch {}; // 确保落盘，避免 IDE/用户未看到更新
         // parsed.deinit() 不释放由 put 加入的 key/value，须 swapRemove 并 free 避免泄漏（与 addPackageDependency 一致）
         if (@constCast(root_ptr).object.getPtr("imports")) |imports_ptr| {
             if (imports_ptr.* == .object) {
@@ -627,16 +621,15 @@ pub fn addPackageImport(allocator: std.mem.Allocator, dir: []const u8, specifier
 /// 从 dir 下 package.json 或 package.jsonc 的 dependencies 与 devDependencies 中移除指定 name，写回同一文件。若 name 不存在则静默成功。
 /// 返回是否实际移除了该包（至少从 dependencies 或 devDependencies 之一移除）。
 pub fn removePackageDependency(allocator: std.mem.Allocator, dir: []const u8, name: []const u8) !bool {
-    var dir_handle = if (io_core.pathIsAbsolute(dir))
-        try io_core.openDirAbsolute(dir, .{})
+    const io = libs_process.getProcessIo() orelse return error.ProcessIoNotSet;
+    var dir_handle = if (libs_io.pathIsAbsolute(dir))
+        try libs_io.openDirAbsolute(dir, .{})
     else
-        try io_core.openDirCwd(dir, .{});
-    defer dir_handle.close();
+        try libs_io.openDirCwd(dir, .{});
+    defer dir_handle.close(io);
     const pkg_paths = [_][]const u8{ "package.jsonc", "package.json" };
     for (pkg_paths) |name_path| {
-        const f = dir_handle.openFile(name_path, .{}) catch continue;
-        defer f.close();
-        const content = f.readToEndAlloc(allocator, std.math.maxInt(usize)) catch return error.OutOfMemory;
+        const content = dir_handle.readFileAlloc(io, name_path, allocator, .unlimited) catch continue;
         defer allocator.free(content);
         const to_parse = if (std.mem.endsWith(u8, name_path, ".jsonc")) blk: {
             const s = stripJsoncComments(allocator, content) catch return error.OutOfMemory;
@@ -662,9 +655,9 @@ pub fn removePackageDependency(allocator: std.mem.Allocator, dir: []const u8, na
         if (!changed) return false;
         const out = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .whitespace = .indent_2 });
         defer allocator.free(out);
-        var out_file = try dir_handle.createFile(name_path, .{});
-        defer out_file.close();
-        try out_file.writeAll(out);
+        var out_file = try dir_handle.createFile(io, name_path, .{});
+        defer out_file.close(io);
+        try out_file.writeStreamingAll(io, out);
         return true;
     }
     return error.ManifestNotFound;
@@ -673,16 +666,15 @@ pub fn removePackageDependency(allocator: std.mem.Allocator, dir: []const u8, na
 /// 从 dir 下 package.json 或 package.jsonc 的 imports 中移除指定 specifier（如 "@dreamer/console"），写回同一文件。若 specifier 不存在则静默返回 false。
 /// 返回是否实际移除了该项。JSR 包若通过 shu add jsr:@scope/name 添加，会写在 imports 中，remove 时需同时调本函数与 removePackageDependency。
 pub fn removePackageImport(allocator: std.mem.Allocator, dir: []const u8, specifier: []const u8) !bool {
-    var dir_handle = if (io_core.pathIsAbsolute(dir))
-        try io_core.openDirAbsolute(dir, .{})
+    const io = libs_process.getProcessIo() orelse return error.ProcessIoNotSet;
+    var dir_handle = if (libs_io.pathIsAbsolute(dir))
+        try libs_io.openDirAbsolute(dir, .{})
     else
-        try io_core.openDirCwd(dir, .{});
-    defer dir_handle.close();
+        try libs_io.openDirCwd(dir, .{});
+    defer dir_handle.close(io);
     const pkg_paths = [_][]const u8{ "package.jsonc", "package.json" };
     for (pkg_paths) |name_path| {
-        const f = dir_handle.openFile(name_path, .{}) catch continue;
-        defer f.close();
-        const content = f.readToEndAlloc(allocator, std.math.maxInt(usize)) catch return error.OutOfMemory;
+        const content = dir_handle.readFileAlloc(io, name_path, allocator, .unlimited) catch continue;
         defer allocator.free(content);
         const to_parse = if (std.mem.endsWith(u8, name_path, ".jsonc")) blk: {
             const s = stripJsoncComments(allocator, content) catch return error.OutOfMemory;
@@ -710,9 +702,9 @@ pub fn removePackageImport(allocator: std.mem.Allocator, dir: []const u8, specif
         if (!changed) return false;
         const out = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .whitespace = .indent_2 });
         defer allocator.free(out);
-        var out_file = try dir_handle.createFile(name_path, .{});
-        defer out_file.close();
-        try out_file.writeAll(out);
+        var out_file = try dir_handle.createFile(io, name_path, .{});
+        defer out_file.close(io);
+        try out_file.writeStreamingAll(io, out);
         return true;
     }
     return error.ManifestNotFound;
@@ -720,14 +712,15 @@ pub fn removePackageImport(allocator: std.mem.Allocator, dir: []const u8, specif
 
 /// 目录 dir 下是否存在 deno.json 或 deno.jsonc（用于 add 时决定写入 deno.json 还是 package.json）。
 pub fn hasDenoJsonInDir(dir: []const u8) bool {
-    var dir_handle = if (io_core.pathIsAbsolute(dir))
-        io_core.openDirAbsolute(dir, .{}) catch return false
+    const io = libs_process.getProcessIo() orelse return false;
+    var dir_handle = if (libs_io.pathIsAbsolute(dir))
+        libs_io.openDirAbsolute(dir, .{}) catch return false
     else
-        io_core.openDirCwd(dir, .{}) catch return false;
-    defer dir_handle.close();
+        libs_io.openDirCwd(dir, .{}) catch return false;
+    defer dir_handle.close(io);
     for ([_][]const u8{ "deno.jsonc", "deno.json" }) |name| {
-        const f = dir_handle.openFile(name, .{}) catch continue;
-        f.close();
+        const f = dir_handle.openFile(io, name, .{}) catch continue;
+        f.close(io);
         return true;
     }
     return false;
@@ -735,16 +728,15 @@ pub fn hasDenoJsonInDir(dir: []const u8) bool {
 
 /// 在 dir 下向 deno.json 或 deno.jsonc 的 imports 添加/覆盖 specifier -> value；无文件则创建 deno.json。
 pub fn addDenoImport(allocator: std.mem.Allocator, dir: []const u8, specifier: []const u8, value: []const u8) !void {
-    var dir_handle = if (io_core.pathIsAbsolute(dir))
-        try io_core.openDirAbsolute(dir, .{})
+    const io = libs_process.getProcessIo() orelse return error.ProcessIoNotSet;
+    var dir_handle = if (libs_io.pathIsAbsolute(dir))
+        try libs_io.openDirAbsolute(dir, .{})
     else
-        try io_core.openDirCwd(dir, .{});
-    defer dir_handle.close();
+        try libs_io.openDirCwd(dir, .{});
+    defer dir_handle.close(io);
     const deno_paths = [_][]const u8{ "deno.jsonc", "deno.json" };
     for (deno_paths) |name_path| {
-        const f = dir_handle.openFile(name_path, .{}) catch continue;
-        defer f.close();
-        const content = f.readToEndAlloc(allocator, std.math.maxInt(usize)) catch return error.OutOfMemory;
+        const content = dir_handle.readFileAlloc(io, name_path, allocator, .unlimited) catch continue;
         defer allocator.free(content);
         const to_parse = if (std.mem.endsWith(u8, name_path, ".jsonc")) blk: {
             const s = stripJsoncComments(allocator, content) catch return error.OutOfMemory;
@@ -766,9 +758,9 @@ pub fn addDenoImport(allocator: std.mem.Allocator, dir: []const u8, specifier: [
         }
         const out = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .whitespace = .indent_2 });
         defer allocator.free(out);
-        var out_file = try dir_handle.createFile(name_path, .{});
-        defer out_file.close();
-        try out_file.writeAll(out);
+        var out_file = try dir_handle.createFile(io, name_path, .{});
+        defer out_file.close(io);
+        try out_file.writeStreamingAll(io, out);
         return;
     }
     var new_root = std.json.ObjectMap.init(allocator);
@@ -777,7 +769,7 @@ pub fn addDenoImport(allocator: std.mem.Allocator, dir: []const u8, specifier: [
     try new_root.put(try allocator.dupe(u8, "imports"), .{ .object = new_imports });
     const out = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = new_root }, .{ .whitespace = .indent_2 });
     defer allocator.free(out);
-    var out_file = try dir_handle.createFile("deno.json", .{});
-    defer out_file.close();
-    try out_file.writeAll(out);
+    var out_file = try dir_handle.createFile(io, "deno.json", .{});
+    defer out_file.close(io);
+    try out_file.writeStreamingAll(io, out);
 }
