@@ -250,9 +250,9 @@ pub fn resolveVersionFromMeta(allocator: std.mem.Allocator, jsr_spec: []const u8
     return resolveVersionFromMetaWithClient(null, allocator, jsr_spec);
 }
 
-/// 与 resolveVersionFromMeta 相同；JSR meta 优先读 .shu/cache 下 jsr.io 元数据缓存，未命中再请求 jsr.io（libcurl），避免无 lockfile 时重复拉 meta.json。
+/// 与 resolveVersionFromMeta 相同；JSR meta 优先读 .shu/cache 下 jsr.io 元数据缓存，未命中再请求 jsr.io，避免无 lockfile 时重复拉 meta.json。
+/// 当 client 非 null 时用 fetchUrlForJsrMetaWithClient 复用连接，避免每请求新建 Client 导致多线程下 Zig Client 内部 proxy 等状态异常（如 connect 时 proxy.host 野指针 segfault）。
 pub fn resolveVersionFromMetaWithClient(client: ?*std.http.Client, allocator: std.mem.Allocator, jsr_spec: []const u8) ![]const u8 {
-    _ = client;
     const scope_name = try jsrSpecToScopeAndName(allocator, jsr_spec);
     defer allocator.free(scope_name.scope);
     defer allocator.free(scope_name.name);
@@ -269,7 +269,10 @@ pub fn resolveVersionFromMetaWithClient(client: ?*std.http.Client, allocator: st
     }
     const meta_url = try buildMetaUrl(allocator, scope_name.scope, scope_name.name);
     defer allocator.free(meta_url);
-    const body = registry.fetchUrlForJsrMeta(allocator, meta_url, JSR_FETCH_MAX_BYTES) catch |e| return e;
+    const body = if (client) |c|
+        registry.fetchUrlForJsrMetaWithClient(c, allocator, meta_url, JSR_FETCH_MAX_BYTES) catch |e| return e
+    else
+        registry.fetchUrlForJsrMeta(allocator, meta_url, JSR_FETCH_MAX_BYTES) catch |e| return e;
     defer allocator.free(body);
     // 若响应明显是 HTML 或非 JSON，先报明确错误便于排查；空 body 单独报错便于上层重试（连接被关等）
     const trimmed = std.mem.trim(u8, body, " \t\r\n");
@@ -362,7 +365,7 @@ fn specFromImportValue(value: []const u8) []const u8 {
 /// deno.json imports 中的一条依赖：name 为包名（@scope/name 或 npm 名），spec 为版本范围，is_jsr 表示是否走 JSR。name/spec 由调用方 free。
 pub const DenoImportDep = struct { name: []const u8, spec: []const u8, is_jsr: bool };
 
-/// 在解析阶段从 jsr.io 直接 GET deno.json（不下载整包），解析 imports。优先读 .shu/cache 下 jsr.io 元数据缓存，未命中再走 fetchUrlForJsrMeta（libcurl）并写入缓存。
+/// 在解析阶段从 jsr.io 直接 GET deno.json（不下载整包），解析 imports。优先读 .shu/cache 下 jsr.io 元数据缓存，未命中再走 fetchUrlForJsrMeta 并写入缓存。
 pub fn fetchDenoJsonImportsFromRegistryWithClient(client: ?*std.http.Client, allocator: std.mem.Allocator, scope_name: []const u8, version: []const u8) !?std.ArrayList(DenoImportDep) {
     _ = client;
     const cache_key = try std.fmt.allocPrint(allocator, "deno/{s}/{s}", .{ scope_name, version });
