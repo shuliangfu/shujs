@@ -75,6 +75,11 @@ const JSR_RESOLVE_MAX_WORKERS = 16;
 /// 每批请求数：超过后重建 Client，避免同一连接复用过多导致服务端关闭或返回非 JSON（常见于「最后一包」报 JsrMetaNoJsonObject）。与 CPU 无关，保持常量。
 const JSR_RESOLVE_CLIENT_REUSE_LIMIT = 32;
 
+/// 解析阶段 JSR 仅对「可能瞬断」的错误重试，避免永久性错误（404、解析失败等）上白等；重试次数与退避时间从简以不拖慢正常安装。
+const JSR_RESOLVE_RETRIES = 2;
+/// 第 2 次重试前等待的纳秒数（0.2s），仅对空响应/非 JSON 等瞬断错误重试时用。
+const JSR_RESOLVE_RETRY_DELAY_NS: u64 = 200_000_000;
+
 /// npm 解析阶段每层并发 worker 数；与 JSR 对齐，实际上限由 libs_process.getConcurrencyCapForRequests 按 CPU/内存/网络决定（不考虑磁盘）。
 const NPM_RESOLVE_MAX_WORKERS = 16;
 
@@ -119,7 +124,7 @@ const NpmResolveWorkerCtx = struct {
     resolving_progress: ?*ResolvingProgress = null,
 };
 
-/// npm 解析 worker：每 worker 持有一个 Client，循环取任务并调用 resolveVersionTarballAndDeps，结果写入 results[i]。完成一个即更新 resolving_progress（与 Installing worker 更新 install_completed_count 一致），供 CLI 轮询。
+/// npm 解析 worker：每 worker 持有一个 Client，循环取任务并调用 resolveVersionTarballAndDeps，结果写入 results[i]。领到任务后立即更新 resolving_progress.count（claim 时计数），保证 count 与 total 一致不缺口。
 fn npmResolveWorker(ctx: *const NpmResolveWorkerCtx) void {
     const a = ctx.allocator;
     const io = libs_process.getProcessIo() orelse return;
@@ -129,15 +134,6 @@ fn npmResolveWorker(ctx: *const NpmResolveWorkerCtx) void {
         const i = ctx.next_index.fetchAdd(1, .monotonic);
         if (i >= ctx.items.len) return;
         const item = ctx.items[i];
-        const r = registry.resolveVersionTarballAndDeps(a, item.registry_url, item.name, item.spec, &client) catch |e| {
-            ctx.results[i] = .{ .err = e };
-            continue;
-        };
-        ctx.results[i] = .{
-            .version = r.version,
-            .tarball_url = r.tarball_url,
-            .dependencies = r.dependencies,
-        };
         if (ctx.resolving_progress) |p| {
             _ = p.count.fetchAdd(1, .monotonic);
             p.name_mutex.lock(io) catch {};
@@ -148,6 +144,15 @@ fn npmResolveWorker(ctx: *const NpmResolveWorkerCtx) void {
             p.name_len.store(copy_len, .monotonic);
             p.name_mutex.unlock(io);
         }
+        const r = registry.resolveVersionTarballAndDeps(a, item.registry_url, item.name, item.spec, &client) catch |e| {
+            ctx.results[i] = .{ .err = e };
+            continue;
+        };
+        ctx.results[i] = .{
+            .version = r.version,
+            .tarball_url = r.tarball_url,
+            .dependencies = r.dependencies,
+        };
     }
 }
 
@@ -447,32 +452,51 @@ fn jsrResolveWorker(ctx: *const JsrResolveWorkerCtx) void {
                 return;
             }
             const item = ctx.items[i];
+            if (ctx.resolving_progress) |p| {
+                _ = p.count.fetchAdd(1, .monotonic);
+                p.name_mutex.lock(io) catch {};
+                const copy_len = @min(item.name.len, 63);
+                @memcpy(p.name_buf[0..copy_len], item.name[0..copy_len]);
+                p.name_buf[copy_len] = 0;
+                p.name_len.store(copy_len, .monotonic);
+                p.name_mutex.unlock(io);
+            }
             const jsr_spec = std.fmt.allocPrint(a, "jsr:{s}@{s}", .{ item.name, item.spec }) catch {
                 ctx.results[i].err = error.OutOfMemory;
                 client.deinit();
                 return;
             };
-            // Arena：不在此处 free，主线程 deinit 时统一释放
-            const version = jsr.resolveVersionFromMetaWithClient(&client, a, jsr_spec) catch |e| blk: {
-                // 空 body 或非 JSON 常因连接被关/限流导致，用新 client 重试一次
-                if (e == error.JsrMetaEmptyResponse or e == error.JsrMetaNoJsonObject) {
-                    var retry_client = std.http.Client{ .allocator = a, .io = io };
-                    defer retry_client.deinit();
-                    break :blk jsr.resolveVersionFromMetaWithClient(&retry_client, a, jsr_spec) catch |e2| {
-                        ctx.results[i].err = e2;
-                        client.deinit();
-                        return;
-                    };
+            // 仅对可能瞬断的错误（空响应、非 JSON）重试一次，永久性错误不重试不等待，避免拖慢安装
+            var last_err: anyerror = undefined;
+            var version: []const u8 = undefined;
+            var imports_list: ?std.ArrayList(jsr.DenoImportDep) = null;
+            var resolved_ok = false;
+            var attempt: u32 = 0;
+            while (attempt < JSR_RESOLVE_RETRIES) : (attempt += 1) {
+                if (attempt > 0) {
+                    std.Io.sleep(io, std.Io.Duration.fromNanoseconds(JSR_RESOLVE_RETRY_DELAY_NS), .awake) catch {};
                 }
-                ctx.results[i].err = e;
+                var attempt_client = std.http.Client{ .allocator = a, .io = io };
+                defer attempt_client.deinit();
+                const ver = jsr.resolveVersionFromMetaWithClient(&attempt_client, a, jsr_spec) catch |e| {
+                    last_err = e;
+                    if (e != error.JsrMetaEmptyResponse and e != error.JsrMetaNoJsonObject) break;
+                    continue;
+                };
+                const imports = jsr.fetchDenoJsonImportsFromRegistryOrJsoncWithClient(&attempt_client, a, item.name, ver) catch |e| {
+                    last_err = e;
+                    continue;
+                };
+                version = ver;
+                imports_list = imports;
+                resolved_ok = true;
+                break;
+            }
+            if (!resolved_ok) {
+                ctx.results[i].err = last_err;
                 client.deinit();
                 return;
-            };
-            var imports_list = jsr.fetchDenoJsonImportsFromRegistryOrJsoncWithClient(&client, a, item.name, version) catch |e| {
-                ctx.results[i].err = e;
-                client.deinit();
-                return;
-            };
+            }
             if (imports_list) |*lst| {
                 defer lst.deinit(a);
                 const slice = a.dupe(jsr.DenoImportDep, lst.items) catch |e| {
@@ -483,15 +507,6 @@ fn jsrResolveWorker(ctx: *const JsrResolveWorkerCtx) void {
                 ctx.results[i] = .{ .version = version, .imports = slice };
             } else {
                 ctx.results[i] = .{ .version = version, .imports = null };
-            }
-            if (ctx.resolving_progress) |p| {
-                _ = p.count.fetchAdd(1, .monotonic);
-                p.name_mutex.lock(io) catch {};
-                const copy_len = @min(item.name.len, 63);
-                @memcpy(p.name_buf[0..copy_len], item.name[0..copy_len]);
-                p.name_buf[copy_len] = 0;
-                p.name_len.store(copy_len, .monotonic);
-                p.name_mutex.unlock(io);
             }
         }
         client.deinit();
@@ -857,10 +872,6 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                 var npm_next = std.atomic.Value(usize).init(0);
                 var npm_arena = std.heap.ArenaAllocator.init(allocator);
                 defer npm_arena.deinit();
-                if (reporter) |r| if (r.resolving_progress) |p| {
-                    total_resolve_tasks += npm_indices.items.len;
-                    p.total.store(total_resolve_tasks, .monotonic);
-                };
                 const npm_ctx = NpmResolveWorkerCtx{
                     .items = work_items,
                     .results = npm_results.ptr,
@@ -879,6 +890,12 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                         for (npm_threads.items) |t| t.join();
                         for (work_items) |wi| allocator.free(wi.registry_url);
                         break;
+                    };
+                }
+                if (npm_threads.items.len > 0) {
+                    if (reporter) |r| if (r.resolving_progress) |p| {
+                        total_resolve_tasks += npm_indices.items.len;
+                        p.total.store(total_resolve_tasks, .monotonic);
                     };
                 }
                 for (npm_threads.items) |t| t.join();
@@ -1093,10 +1110,6 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                             var next_atomic = std.atomic.Value(usize).init(0);
                             var jsr_arena = std.heap.ArenaAllocator.init(allocator);
                             defer jsr_arena.deinit();
-                            if (reporter) |r| if (r.resolving_progress) |p| {
-                                total_resolve_tasks += jsr_indices.items.len;
-                                p.total.store(total_resolve_tasks, .monotonic);
-                            };
                             var ctx = JsrResolveWorkerCtx{
                                 .items = jsr_items_buf,
                                 .results = jsr_results.ptr,
@@ -1114,6 +1127,12 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                                     if (first_error == null) first_error = map_install_err(e2);
                                     for (threads.items) |th| th.join();
                                     break :jsr_parallel;
+                                };
+                            }
+                            if (threads.items.len > 0) {
+                                if (reporter) |r| if (r.resolving_progress) |p| {
+                                    total_resolve_tasks += jsr_indices.items.len;
+                                    p.total.store(total_resolve_tasks, .monotonic);
                                 };
                             }
                             for (threads.items) |th| th.join();
@@ -1359,9 +1378,11 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
     defer jsr_tasks.deinit(allocator);
     var npm_tasks = std.ArrayList(NpmInstallTask).initCapacity(allocator, n_install) catch return error.OutOfMemory;
     defer npm_tasks.deinit(allocator);
-    // 同一 pkg_dest 只解压一次，避免 install_order 中同一包出现两次（deps+devDeps）时重复解压导致后一次覆盖或报错
+    // 同一 pkg_dest 只解压/下载一次，避免 install_order 中同一包出现两次（多包依赖同一包）时多 worker 争抢同一路径导致 PathAlreadyExists
     var pkg_dest_to_npm_idx = std.StringArrayHashMap(usize).init(a);
     defer pkg_dest_to_npm_idx.deinit();
+    var pkg_dest_to_jsr_idx = std.StringArrayHashMap(usize).init(a);
+    defer pkg_dest_to_jsr_idx.deinit();
     // pkg_dest/registry_url/registry_host 均由 arena (a) 分配，不在此 free，由 task_arena.deinit() 统一回收
     // 第一遍：已安装跳过；JSR 只收集任务（优化：并行阶段再下载）；npm 收集任务。
     for (install_order.items, already_installed_arr, jsr_task_idx_arr, npm_task_idx_arr) |name, *already_installed, *jsr_task_idx, *npm_task_idx| {
@@ -1409,12 +1430,16 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
             continue;
         }
         if (jsr_packages.contains(name)) {
-            // 池延后到循环后创建，以便注入专用 Io（避免与 npm worker 共享 process Io 导致 EISCONN）
+            if (pkg_dest_to_jsr_idx.get(pkg_dest)) |existing_idx| {
+                jsr_task_idx.* = existing_idx;
+                continue;
+            }
             jsr_tasks.append(allocator, .{ .name = name, .version = version, .pkg_dest = pkg_dest }) catch |e| {
                 if (first_error == null) first_error = map_install_err(e);
                 continue;
             };
             jsr_task_idx.* = jsr_tasks.items.len - 1;
+            pkg_dest_to_jsr_idx.put(pkg_dest, jsr_tasks.items.len - 1) catch {};
             continue;
         }
         if (pkg_dest_to_npm_idx.get(pkg_dest)) |existing_idx| {
