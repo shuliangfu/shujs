@@ -172,6 +172,8 @@ pub fn addSpecifiersThenInstall(allocator: std.mem.Allocator, cwd_owned: []const
         .onProgress = onInstallProgress,
         .onPackage = onInstallPackage,
         .onDone = onInstallDone,
+        .resolving_elapsed_ms = &progress_state.resolving_elapsed_ms,
+        .installing_elapsed_ms = &progress_state.installing_elapsed_ms,
         .onPackageAdded = onPackageAddedPrint,
     };
     pkg_install.install(allocator, cwd_owned, &reporter, added_names.items, null) catch |e| {
@@ -213,6 +215,8 @@ pub fn install(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional
             .onProgress = onInstallProgress,
             .onPackage = onInstallPackage,
             .onDone = onInstallDone,
+            .resolving_elapsed_ms = &progress_state.resolving_elapsed_ms,
+            .installing_elapsed_ms = &progress_state.installing_elapsed_ms,
         };
         var error_detail: pkg_install.InstallErrorDetail = .{};
         pkg_install.install(allocator, cwd_owned, &reporter, null, &error_detail) catch |e| {
@@ -291,7 +295,19 @@ const c_green = "\x1b[32m";
 const c_cyan = "\x1b[36m";
 
 /// 进度回调共享状态：总数、是否启用颜色、开始时间（毫秒）、解析/安装阶段是否首次、第二遍是否已打过换行；io 用于 Zig 0.16 stdout。
-const ProgressState = struct { total: usize, use_color: bool, start_time: i64, io: std.Io, resolving_first: bool = true, installing_first: bool = true, install_done_newline: bool = false };
+const ProgressState = struct {
+    total: usize,
+    use_color: bool,
+    start_time: i64,
+    io: std.Io,
+    resolving_first: bool = true,
+    installing_first: bool = true,
+    install_done_newline: bool = false,
+    /// 解析阶段耗时（ms），由 install 写入；-1 表示未设置
+    resolving_elapsed_ms: i64 = -1,
+    /// 安装阶段耗时（ms），由 install 写入；-1 表示未设置
+    installing_elapsed_ms: i64 = -1,
+};
 
 /// ANSI 清除从光标到行末，避免上次内容残留
 const c_erase_to_eol = "\x1b[K";
@@ -305,16 +321,54 @@ fn progressDisabled() bool {
     return std.c.getenv("SHU_NO_PROGRESS") != null;
 }
 
+/// 解析阶段两行进度绘制（进度条 + Resolving (N) name）；first 首次为 true 时输出换行+两行，否则 \x1b[1A 上移一行再重写，调用后 *first 置 false。
+fn drawResolvingTwoLines(io: std.Io, current: usize, total: usize, name: []const u8, use_color: bool, first: *bool) void {
+    const filled: usize = if (total > 0) (current * progress_bar_width) / total else 0;
+    var line1_buf: [80]u8 = undefined;
+    var w1 = std.Io.Writer.fixed(&line1_buf);
+    if (use_color) w1.print("{s}", .{c_cyan}) catch return;
+    w1.print("[", .{}) catch return;
+    var i: usize = 0;
+    while (i < progress_bar_width) : (i += 1) {
+        const ch: u8 = if (i < filled) '#' else ' ';
+        w1.print("{c}", .{ch}) catch return;
+    }
+    w1.print("] {d}/{d} {s}", .{ current, total, c_erase_to_eol }) catch return;
+    if (use_color) w1.print("{s}", .{c_reset}) catch return;
+    var line2_buf: [160]u8 = undefined;
+    var w2 = std.Io.Writer.fixed(&line2_buf);
+    if (use_color) w2.print("{s}", .{c_dim}) catch return;
+    w2.print("Resolving ({d}) {s}...{s}", .{ total, name, c_erase_to_eol }) catch return;
+    if (use_color) w2.print("{s}", .{c_reset}) catch return;
+    var out_buf: [280]u8 = undefined;
+    var stdout_w = std.Io.File.Writer.init(std.Io.File.stdout(), io, &out_buf);
+    if (first.*) {
+        first.* = false;
+        stdout_w.interface.print("\n{s}\n{s}", .{ std.Io.Writer.buffered(&w1), std.Io.Writer.buffered(&w2) }) catch return;
+    } else {
+        stdout_w.interface.print("{s}\r{s}\n{s}", .{ c_cursor_up_1, std.Io.Writer.buffered(&w1), std.Io.Writer.buffered(&w2) }) catch return;
+    }
+    stdout_w.flush() catch return;
+}
+
 /// 解析阶段某个包失败时在写 stderr 前调用：换行并刷新 stdout，使进度行「定稿」，后续 stderr 错误信息不会被进度条覆盖。SHU_NO_PROGRESS 时也换行，避免错误信息跟在 \r 行后挤在一起。
 fn onResolveFailure(ctx: ?*anyopaque) void {
     _ = ctx;
     _ = std.c.write(1, "\n".ptr, 1);
 }
 
-/// InstallReporter.onResolvingComplete：仅当本轮曾输出过 onResolving 时调用，在 Resolving 与 Installing 之间输出一个空行；跳过解析时不会调用，避免出现多余空行。
-fn onResolvingComplete(ctx: ?*anyopaque) void {
-    _ = ctx;
-    _ = std.c.write(1, "\n".ptr, 1);
+/// InstallReporter.onResolvingComplete：仅当本轮曾输出过 onResolving 时调用；在「Resolving (N) name」下输出 Resolving X ms（带颜色时标签 cyan、耗时 dim），再空一行后进入 Installing。
+fn onResolvingComplete(ctx: ?*anyopaque, resolving_elapsed_ms: i64) void {
+    const state = if (ctx) |c| @as(*ProgressState, @ptrCast(@alignCast(c))) else return;
+    if (resolving_elapsed_ms >= 0) {
+        if (state.use_color) {
+            printToStdout(state.io, "\n{s}Resolving{s} {d} ms{s}\n", .{ c_cyan, c_dim, resolving_elapsed_ms, c_reset }) catch return;
+        } else {
+            printToStdout(state.io, "\nResolving {d} ms\n", .{resolving_elapsed_ms}) catch return;
+        }
+    } else {
+        printToStdout(state.io, "\n", .{}) catch return;
+    }
 }
 
 /// InstallReporter.onResolving：有进度条时两行原地更新，进度条在上、Resolving (N) name 在下；SHU_NO_PROGRESS 时每包一行「Resolving (N) name...」。
@@ -327,46 +381,8 @@ fn onResolving(ctx: ?*anyopaque, name: []const u8, current_in_run: usize, total_
         _ = std.c.write(1, s.ptr, s.len);
         return;
     }
-    const use_color = if (ctx) |c| @as(*ProgressState, @ptrCast(@alignCast(c))).use_color else false;
-    const filled: usize = if (total_to_resolve > 0) (current_in_run * progress_bar_width) / total_to_resolve else 0;
-
-    // 第一行：进度条 [###...] current/total
-    var line1_buf: [80]u8 = undefined;
-    var w1 = std.Io.Writer.fixed(&line1_buf);
-    if (use_color) w1.print("{s}", .{c_cyan}) catch return;
-    w1.print("[", .{}) catch return;
-    var i: usize = 0;
-    while (i < progress_bar_width) : (i += 1) {
-        const ch: u8 = if (i < filled) '#' else ' ';
-        w1.print("{c}", .{ch}) catch return;
-    }
-    w1.print("] {d}/{d} {s}", .{ current_in_run, total_to_resolve, c_erase_to_eol }) catch return;
-    if (use_color) w1.print("{s}", .{c_reset}) catch return;
-    const line1 = std.Io.Writer.buffered(&w1);
-
-    // 第二行：Resolving (N) name...
-    var line2_buf: [160]u8 = undefined;
-    var w2 = std.Io.Writer.fixed(&line2_buf);
-    if (use_color) w2.print("{s}", .{c_dim}) catch return;
-    w2.print("Resolving ({d}) {s}...{s}", .{ total_to_resolve, name, c_erase_to_eol }) catch return;
-    if (use_color) w2.print("{s}", .{c_reset}) catch return;
-    const line2 = std.Io.Writer.buffered(&w2);
-
-    var out_buf: [280]u8 = undefined;
-    const io = if (ctx) |c| @as(*ProgressState, @ptrCast(@alignCast(c))).io else return;
-    var stdout_w = std.Io.File.Writer.init(std.Io.File.stdout(), io, &out_buf);
-    const first = if (ctx) |c| blk: {
-        const state = @as(*ProgressState, @ptrCast(@alignCast(c)));
-        const f = state.resolving_first;
-        if (f) state.resolving_first = false;
-        break :blk f;
-    } else true;
-    if (first) {
-        stdout_w.interface.print("\n{s}\n{s}", .{ line1, line2 }) catch return;
-    } else {
-        stdout_w.interface.print("{s}\r{s}\n{s}", .{ c_cursor_up_1, line1, line2 }) catch return;
-    }
-    stdout_w.flush() catch return;
+    const state = if (ctx) |c| @as(*ProgressState, @ptrCast(@alignCast(c))) else return;
+    drawResolvingTwoLines(state.io, current_in_run, total_to_resolve, name, state.use_color, &state.resolving_first);
 }
 
 /// 安装阶段第二行包名最大显示长度，避免终端折行
@@ -546,9 +562,8 @@ fn onPackageAddedPrint(ctx: ?*anyopaque, name: []const u8, ver: []const u8) void
     }
 }
 
-/// InstallReporter.onDone：换行结束进度条，打 "N new, M total packages" 或 "M packages installed"（无新装时）。
-/// elapsed_ms 由 package/install 从 install() 入口计时到 onDone 调用前，含 Resolving + Installing，不做虚假时间。
-/// 输出逻辑：进度条后 \n 接总结行（1 空行）；总结行末尾 \n\n 再 1 空行回到 shell。
+/// InstallReporter.onDone：换行结束进度条；若有安装则先打 Installing Xms（在包列表下），再打安装数量与总耗时。
+/// elapsed_ms 由 package/install 从 install() 入口计时到 onDone 调用前，含 Resolving + Installing。
 fn onInstallDone(ctx: ?*anyopaque, total_count: usize, new_count: usize, elapsed_ms: i64) void {
     const state = if (ctx) |c| @as(*ProgressState, @ptrCast(@alignCast(c))) else return;
     const use_color = state.use_color;
@@ -558,17 +573,27 @@ fn onInstallDone(ctx: ?*anyopaque, total_count: usize, new_count: usize, elapsed
         } else {
             printToStdout(state.io, "\nAlready up to date ({d} packages)\n\n", .{total_count}) catch {};
         }
-    } else if (new_count == total_count) {
-        if (use_color) {
-            printToStdout(state.io, "\n{s}{d} packages installed [{d}.00ms]{s}\n\n", .{ c_green, total_count, elapsed_ms, c_reset }) catch {};
-        } else {
-            printToStdout(state.io, "\n{d} packages installed [{d}.00ms]\n\n", .{ total_count, elapsed_ms }) catch {};
-        }
     } else {
-        if (use_color) {
-            printToStdout(state.io, "\n{s}{d} new, {d} total packages [{d}.00ms]{s}\n\n", .{ c_green, new_count, total_count, elapsed_ms, c_reset }) catch {};
+        // 先输出 Installing X ms（在包列表下方），空一行，再输出安装数量与总耗时；ms 前加空格，带颜色时标签 cyan、耗时 dim，总结行 green。
+        if (state.installing_elapsed_ms >= 0) {
+            if (use_color) {
+                printToStdout(state.io, "{s}Installing{s} {d} ms{s}\n\n", .{ c_cyan, c_dim, state.installing_elapsed_ms, c_reset }) catch {};
+            } else {
+                printToStdout(state.io, "Installing {d} ms\n\n", .{state.installing_elapsed_ms}) catch {};
+            }
+        }
+        if (new_count == total_count) {
+            if (use_color) {
+                printToStdout(state.io, "{s}{d} packages installed{s} [{d} ms]{s}\n\n", .{ c_green, total_count, c_dim, elapsed_ms, c_reset }) catch {};
+            } else {
+                printToStdout(state.io, "{d} packages installed [{d} ms]\n\n", .{ total_count, elapsed_ms }) catch {};
+            }
         } else {
-            printToStdout(state.io, "\n{d} new, {d} total packages [{d}.00ms]\n\n", .{ new_count, total_count, elapsed_ms }) catch {};
+            if (use_color) {
+                printToStdout(state.io, "{s}{d} new, {d} total packages{s} [{d} ms]{s}\n\n", .{ c_green, new_count, total_count, c_dim, elapsed_ms, c_reset }) catch {};
+            } else {
+                printToStdout(state.io, "{d} new, {d} total packages [{d} ms]\n\n", .{ new_count, total_count, elapsed_ms }) catch {};
+            }
         }
     }
 }
