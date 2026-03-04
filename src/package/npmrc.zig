@@ -40,7 +40,7 @@ fn loadProjectNpmrc(allocator: std.mem.Allocator, map: *std.StringArrayHashMap([
     parseInto(allocator, map, raw) catch return;
 }
 
-/// 从 dir 下 .npmrc 与可选 ~/.npmrc 合并解析出 key -> value 表；仅解析 registry 与 @scope:registry。先用户后项目，项目覆盖用户。
+/// [Allocates] 从 dir 下 .npmrc 与可选 ~/.npmrc 合并解析出 key -> value 表；仅解析 registry 与 @scope:registry。先用户后项目，项目覆盖用户。
 /// 返回的 map 由调用方 deinit；map 内 key/value 由本函数用 allocator 分配，调用方在 deinit 前须遍历并 free 每个 key 与 value。
 /// 若两个文件都不存在或为空则返回空 map（调用方用 DEFAULT_REGISTRY_URL）。
 pub fn load(allocator: std.mem.Allocator, dir: []const u8) !std.StringArrayHashMap([]const u8) {
@@ -84,7 +84,7 @@ fn parseInto(allocator: std.mem.Allocator, map: *std.StringArrayHashMap([]const 
     }
 }
 
-/// 从 registry URL（如 https://registry.npmjs.org/）解析出 host 部分（如 registry.npmjs.org），用于 cache key。返回的切片由调用方 free。
+/// [Allocates] 从 registry URL（如 https://registry.npmjs.org/）解析出 host 部分（如 registry.npmjs.org），用于 cache key。返回的切片由调用方 free。
 pub fn hostFromRegistryUrl(allocator: std.mem.Allocator, url: []const u8) ![]const u8 {
     const prefix = std.mem.indexOf(u8, url, "://") orelse return allocator.dupe(u8, "registry.npmjs.org");
     var i = prefix + 3;
@@ -92,7 +92,7 @@ pub fn hostFromRegistryUrl(allocator: std.mem.Allocator, url: []const u8) ![]con
     return allocator.dupe(u8, url[prefix + 3 .. i]);
 }
 
-/// 根据包名得到应使用的 registry URL。@jsr/ 包固定走 JSR npm 兼容 registry（除非 .npmrc 配置 @jsr:registry）；其它 @scope/pkg 查 @scope:registry；否则查 registry；无则返回默认。返回的切片由调用方 free。
+/// [Allocates] 根据包名得到应使用的 registry URL。@jsr/ 包固定走 JSR npm 兼容 registry（除非 .npmrc 配置 @jsr:registry）；其它 @scope/pkg 查 @scope:registry；否则查 registry；无则返回默认。返回的切片由调用方 free。
 pub fn getRegistryForPackage(allocator: std.mem.Allocator, cwd: []const u8, package_name: []const u8) ![]const u8 {
     var npmrc = load(allocator, cwd) catch return allocator.dupe(u8, DEFAULT_REGISTRY_URL);
     defer {
