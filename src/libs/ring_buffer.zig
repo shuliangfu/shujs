@@ -22,15 +22,17 @@ const CACHE_LINE = 64;
 
 /// 单生产者单消费者、固定容量、无锁环形缓冲区
 /// T 需为指针或 usize 等单字类型，保证原子读写
-/// head 与 tail 之间填充至不同 cache line，避免跨线程写同一行
+/// head 与 tail 显式 align(64)，各占独立缓存行，避免 False Sharing（00 §5.3）
 pub fn RingBuffer(comptime T: type) type {
     return struct {
         buffer: []T,
         mask: usize,
-        head: std.atomic.Value(usize),
-        /// 填充使 tail 与 head 不在同一缓存行（§5.3 跨线程原子隔离）
+        /// 生产者写；独占 cache line，与 tail 隔离
+        head: std.atomic.Value(usize) align(CACHE_LINE),
+        /// 填充使 tail 落在下一 cache line（§5.3）
         _pad_head_tail: [CACHE_LINE - @sizeOf(std.atomic.Value(usize))]u8 = undefined,
-        tail: std.atomic.Value(usize),
+        /// 消费者写；独占 cache line，与 head 隔离
+        tail: std.atomic.Value(usize) align(CACHE_LINE),
 
         const Self = @This();
 
@@ -52,6 +54,7 @@ pub fn RingBuffer(comptime T: type) type {
             self.* = undefined;
         }
 
+        // Hot-path
         /// 生产者：入队一元素，队满返回 false（§5.2 热路径 inline）
         pub inline fn push(self: *Self, value: T) bool {
             const tail = self.tail.load(.monotonic);
@@ -61,6 +64,7 @@ pub fn RingBuffer(comptime T: type) type {
             return true;
         }
 
+        // Hot-path
         /// 消费者：出队一元素，队空返回 null（§5.2 热路径 inline）
         pub inline fn pop(self: *Self) ?T {
             const head = self.head.load(.monotonic);
@@ -70,6 +74,7 @@ pub fn RingBuffer(comptime T: type) type {
             return value;
         }
 
+        // Hot-path
         /// 当前队列内元素数量（近似，多线程下可能瞬时不准）（§5.2 热路径 inline）
         pub inline fn count(self: *const Self) usize {
             const t = self.tail.load(.acquire);
