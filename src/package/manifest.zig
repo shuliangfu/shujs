@@ -8,7 +8,7 @@ const errors = @import("errors");
 const libs_io = @import("libs_io");
 const libs_process = @import("libs_process");
 
-/// 剥离 JSONC 注释（// 行注释与 /* */ 块注释），不剥离字符串字面量内的内容。返回的切片由调用方 free。
+/// [Allocates] 剥离 JSONC 注释（// 行注释与 /* */ 块注释），不剥离字符串字面量内的内容。返回的切片由调用方 free。
 fn stripJsoncComments(allocator: std.mem.Allocator, content: []const u8) ![]const u8 {
     var list = std.ArrayList(u8).initCapacity(allocator, content.len) catch return error.OutOfMemory;
     defer list.deinit(allocator);
@@ -100,7 +100,7 @@ pub const Manifest = struct {
         _ = allocator;
     }
 
-    /// 从目录 dir 读取 package.json / package.jsonc 与 deno.json/deno.jsonc。与 Deno 兼容：可有 package.json、或仅 deno.json、或两者同时存在；至少需其一。
+    /// [Allocates] 从目录 dir 读取 package.json / package.jsonc 与 deno.json/deno.jsonc。与 Deno 兼容：可有 package.json、或仅 deno.json、或两者同时存在；至少需其一。
     /// 使用 Arena 分配，返回的 Manifest 与 arena 绑定；调用方 deinit arena 前不得使用 Manifest。
     /// 返回的 arena 由调用方 deinit；Manifest 内字段均指向 arena 内存。
     pub fn load(allocator: std.mem.Allocator, dir: []const u8) !struct { arena: std.heap.ArenaAllocator, manifest: Manifest } {
@@ -311,7 +311,7 @@ pub const Manifest = struct {
         return error.ManifestNotFound;
     }
 
-    /// 从目录 dir 仅加载 package.json / package.jsonc（用于包目录内解析 main/exports），不读 deno.json。
+    /// [Allocates] 从目录 dir 仅加载 package.json / package.jsonc（用于包目录内解析 main/exports），不读 deno.json。
     /// 返回的 arena 由调用方 deinit；Manifest 内字段指向 arena 内存。
     pub fn loadPackageOnly(allocator: std.mem.Allocator, dir: []const u8) !struct { arena: std.heap.ArenaAllocator, manifest: Manifest } {
         var arena = std.heap.ArenaAllocator.init(allocator);
