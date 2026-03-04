@@ -164,6 +164,8 @@ pub fn deleteTreeAbsolute(allocator: std.mem.Allocator, absolute_path: []const u
                 try deleteTreeAbsoluteFromDir(allocator, io, &sub);
                 try entry.dir.deleteDir(io, entry.basename);
             },
+            // 符号链接：用 deleteFile 删除链接本身，否则目录非空导致 deleteDir 报 DirNotEmpty
+            .sym_link => try entry.dir.deleteFile(io, entry.basename),
             else => {},
         }
     }
@@ -180,6 +182,8 @@ fn deleteTreeAbsoluteFromDir(allocator: std.mem.Allocator, io: std.Io, dir: *std
                 try deleteTreeAbsoluteFromDir(allocator, io, &sub);
                 try entry.dir.deleteDir(io, entry.basename);
             },
+            // 符号链接：用 deleteFile 删除链接本身，否则目录非空导致 deleteDir 报 DirNotEmpty
+            .sym_link => try entry.dir.deleteFile(io, entry.basename),
             else => {},
         }
     }
@@ -210,16 +214,17 @@ pub fn pathIsAbsolute(path: []const u8) bool {
 }
 
 /// 将多段路径用分隔符连接；返回切片由调用方 free。与 std.fs.path.join 语义一致。
+/// [Allocates] 路径拼接；返回切片由调用方 free。
 pub fn pathJoin(allocator: std.mem.Allocator, paths: []const []const u8) ![]const u8 {
     return std.fs.path.join(allocator, paths);
 }
 
-/// 解析为绝对路径；返回切片由调用方 free。与 std.fs.path.resolve 语义一致。
+/// [Allocates] 解析为绝对路径；返回切片由调用方 free。与 std.fs.path.resolve 语义一致。
 pub fn pathResolve(allocator: std.mem.Allocator, paths: []const []const u8) ![]const u8 {
     return std.fs.path.resolve(allocator, paths);
 }
 
-/// 计算 from 到 to 的相对路径；返回切片由调用方 free。与 std.fs.path.relative 语义一致。
+/// [Allocates] 计算 from 到 to 的相对路径；返回切片由调用方 free。与 std.fs.path.relative 语义一致。
 pub fn pathRelative(allocator: std.mem.Allocator, from: []const u8, to: []const u8) ![]const u8 {
     return std.fs.path.relative(allocator, from, to);
 }
@@ -228,9 +233,16 @@ pub fn pathRelative(allocator: std.mem.Allocator, from: []const u8, to: []const 
 // Stream Reader 辅助（std.Io.Reader 分块读取，供 HTTP 解压流等使用，避免 allocRemaining 触发 Writer.rebase）
 // -----------------------------------------------------------------------------
 
-/// 从 reader 读取最多 max_bytes 到新分配切片；内部用 std.Io.Reader.readVec 分块读，避免 gzip 等解压流触发 Writer.rebase（allocRemaining 会 unreachable）。
-/// 若实际长度超过 max_bytes 返回 error.ResponseTooLarge。调用方 free 返回的切片。
-pub fn readReaderUpTo(allocator: std.mem.Allocator, reader: *std.Io.Reader, max_bytes: usize) ![]const u8 {
+/// 本模块可返回的窄化错误（01 §2.1）；Reader 底层错误统一映射为 ReadFailed，利于跳转表与分支预测
+pub const ReadReaderUpToError = error{
+    OutOfMemory,
+    ResponseTooLarge,
+    ReadFailed,
+};
+
+/// [Allocates] 从 reader 读取最多 max_bytes 到新分配切片；内部用 std.Io.Reader.readVec 分块读，避免 gzip 等解压流触发 Writer.rebase（allocRemaining 会 unreachable）。
+/// 若实际长度超过 max_bytes 返回 error.ResponseTooLarge。调用方 free 返回的切片。Reader 读错误统一返回 error.ReadFailed。
+pub fn readReaderUpTo(allocator: std.mem.Allocator, reader: *std.Io.Reader, max_bytes: usize) ReadReaderUpToError![]const u8 {
     var list = std.ArrayList(u8).initCapacity(allocator, @min(65536, max_bytes)) catch return error.OutOfMemory;
     defer list.deinit(allocator);
     var buf: [8192]u8 = undefined;
@@ -240,7 +252,7 @@ pub fn readReaderUpTo(allocator: std.mem.Allocator, reader: *std.Io.Reader, max_
         var vec: [1][]u8 = .{buf[0..to_read]};
         const n = std.Io.Reader.readVec(reader, &vec) catch |e| switch (e) {
             error.EndOfStream => break,
-            else => return e, // 传播底层错误（连接断开、解压失败等），便于排查
+            else => return error.ReadFailed,
         };
         if (n == 0) break;
         list.appendSlice(allocator, buf[0..n]) catch return error.OutOfMemory;
@@ -491,13 +503,14 @@ const AsyncFileIODarwin = struct {
     job_mutex: std.Io.Mutex = std.Io.Mutex.init,
     job_ring: FileJobRing(FileJobDarwin, MAX_FILE_PENDING_DARWIN) = .{},
     done_mutex: std.Io.Mutex = std.Io.Mutex.init,
-    done_list: std.ArrayList(api.Completion) = undefined,
+    /// 已完成项列表（01 §1.2 Unmanaged）
+    done_list: std.ArrayListUnmanaged(api.Completion) = undefined,
     cond: std.Io.Condition = std.Io.Condition.init,
     worker: ?std.Thread = null,
     shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn init(allocator: std.mem.Allocator) !AsyncFileIODarwin {
-        const done_list = std.ArrayList(api.Completion).initCapacity(allocator, MAX_FILE_PENDING_DARWIN) catch return error.OutOfMemory;
+        const done_list = std.ArrayListUnmanaged(api.Completion).initCapacity(allocator, MAX_FILE_PENDING_DARWIN) catch return error.OutOfMemory;
         const completion_buffer = try allocator.alloc(api.Completion, MAX_FILE_PENDING_DARWIN);
         var self = AsyncFileIODarwin{
             .allocator = allocator,
@@ -665,13 +678,14 @@ const AsyncFileIOWindows = struct {
     job_mutex: std.Io.Mutex = std.Io.Mutex.init,
     job_ring: FileJobRing(FileJobWin, MAX_FILE_PENDING_WIN) = .{},
     done_mutex: std.Io.Mutex = std.Io.Mutex.init,
-    done_list: std.ArrayList(api.Completion) = undefined,
+    /// 已完成项列表（01 §1.2 Unmanaged）
+    done_list: std.ArrayListUnmanaged(api.Completion) = undefined,
     cond: std.Io.Condition = std.Io.Condition.init,
     worker: ?std.Thread = null,
     shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn init(allocator: std.mem.Allocator) !AsyncFileIOWindows {
-        const done_list = std.ArrayList(api.Completion).initCapacity(allocator, MAX_FILE_PENDING_WIN) catch return error.OutOfMemory;
+        const done_list = std.ArrayListUnmanaged(api.Completion).initCapacity(allocator, MAX_FILE_PENDING_WIN) catch return error.OutOfMemory;
         const completion_buffer = try allocator.alloc(api.Completion, MAX_FILE_PENDING_WIN);
         var self = AsyncFileIOWindows{
             .allocator = allocator,
