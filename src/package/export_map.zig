@@ -12,7 +12,7 @@ pub const ResolveExportResult = struct { path: []const u8, caller_owns: bool };
 
 /// 根据 package.json 的 exports 值与请求子路径、条件，解析出包内相对路径（以 ./ 开头）。
 /// subpath 为空表示包主入口（即 "."）；否则为子路径且不含前导 "."，如 "utils" 表示 "./utils"。
-/// 未找到返回 null；否则返回 ResolveExportResult，caller_owns 为 true 时调用方须 free result.path。
+/// 未找到返回 null。否则：caller_owns 为 true 时 [Allocates] result.path，调用方须 free；caller_owns 为 false 时 [Borrows]，调用方无需 free。
 pub fn resolve(
     allocator: std.mem.Allocator,
     exports_value: std.json.Value,
