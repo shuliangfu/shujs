@@ -163,8 +163,10 @@ pub fn addSpecifiersThenInstall(allocator: std.mem.Allocator, cwd_owned: []const
     // add 已在 add.zig 打印 "shu add v..."，此处仅 install 带 specifier 时打印
     if (std.mem.eql(u8, msg_prefix, "shu install")) try version.printCommandHeader(io, "install");
     var progress_state = ProgressState{ .total = 0, .use_color = use_color, .start_time = std.Io.Clock.now(.awake, io).toMilliseconds(), .io = io };
+    var resolving_progress = pkg_install.ResolvingProgress{};
     const reporter = pkg_install.InstallReporter{
         .ctx = &progress_state,
+        .resolving_progress = &resolving_progress,
         .onResolving = onResolving,
         .onResolvingComplete = onResolvingComplete,
         .onResolveFailure = onResolveFailure,
@@ -176,6 +178,10 @@ pub fn addSpecifiersThenInstall(allocator: std.mem.Allocator, cwd_owned: []const
         .installing_elapsed_ms = &progress_state.installing_elapsed_ms,
         .onPackageAdded = onPackageAddedPrint,
     };
+    const progress_thread = std.Thread.spawn(.{}, resolvingProgressLoop, .{ &resolving_progress, &progress_state }) catch |e2| {
+        return e2;
+    };
+    defer progress_thread.join();
     pkg_install.install(allocator, cwd_owned, &reporter, added_names.items, null) catch |e| {
         if (e == error.NoManifest) {}
         try printToStdout(io, "{s}: dependencies written to manifest but install failed (run shu install to retry): {s}\n", .{ msg_prefix, @errorName(e) });
@@ -206,8 +212,10 @@ pub fn install(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional
         const use_color = std.c.isatty(1) != 0;
         try version.printCommandHeader(io, "install");
         var progress_state = ProgressState{ .total = 0, .use_color = use_color, .start_time = std.Io.Clock.now(.awake, io).toMilliseconds(), .io = io };
+        var resolving_progress = pkg_install.ResolvingProgress{};
         const reporter = pkg_install.InstallReporter{
             .ctx = &progress_state,
+            .resolving_progress = &resolving_progress,
             .onResolving = onResolving,
             .onResolvingComplete = onResolvingComplete,
             .onResolveFailure = onResolveFailure,
@@ -218,6 +226,10 @@ pub fn install(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional
             .resolving_elapsed_ms = &progress_state.resolving_elapsed_ms,
             .installing_elapsed_ms = &progress_state.installing_elapsed_ms,
         };
+        const progress_thread = std.Thread.spawn(.{}, resolvingProgressLoop, .{ &resolving_progress, &progress_state }) catch |e2| {
+            return e2;
+        };
+        defer progress_thread.join();
         var error_detail: pkg_install.InstallErrorDetail = .{};
         pkg_install.install(allocator, cwd_owned, &reporter, null, &error_detail) catch |e| {
             if (e == error.NoManifest) {
@@ -321,9 +333,37 @@ fn progressDisabled() bool {
     return std.c.getenv("SHU_NO_PROGRESS") != null;
 }
 
-/// 解析阶段两行进度绘制（进度条 + Resolving (N) name）；first 首次为 true 时输出换行+两行，否则 \x1b[1A 上移一行再重写，调用后 *first 置 false。
+/// 解析阶段进度线程：每 80ms 轮询 resolving_progress（与 Installing 轮询间隔一致），重绘两行进度；worker 每完成一个包即更新 count/name，此处固定间隔刷新实现平滑推进。
+fn resolvingProgressLoop(progress: *pkg_install.ResolvingProgress, state: *ProgressState) void {
+    if (progressDisabled()) return;
+    const io = state.io;
+    while (!progress.resolving_done.load(.monotonic)) {
+        const total = progress.total.load(.monotonic);
+        const count = progress.count.load(.monotonic);
+        var name_buf: [64]u8 = undefined;
+        progress.name_mutex.lock(io) catch {};
+        const len = progress.name_len.load(.monotonic);
+        if (len > 0 and len <= 63) @memcpy(name_buf[0..len], progress.name_buf[0..len]);
+        progress.name_mutex.unlock(io);
+        const name_slice = if (len > 0) name_buf[0..len] else "...";
+        drawResolvingTwoLines(io, count, total, name_slice, state.use_color, &state.resolving_first);
+        std.Io.sleep(io, std.Io.Duration.fromNanoseconds(80_000_000), .awake) catch {};
+    }
+    const total = progress.total.load(.monotonic);
+    const count = progress.count.load(.monotonic);
+    var name_buf: [64]u8 = undefined;
+    progress.name_mutex.lock(io) catch {};
+    const len = progress.name_len.load(.monotonic);
+    if (len > 0 and len <= 63) @memcpy(name_buf[0..len], progress.name_buf[0..len]);
+    progress.name_mutex.unlock(io);
+    const name_slice = if (len > 0) name_buf[0..len] else "...";
+    drawResolvingTwoLines(io, count, total, name_slice, state.use_color, &state.resolving_first);
+}
+
+/// 解析阶段两行进度绘制（进度条 + Resolving (current) name）；first 首次为 true 时输出换行+两行，否则 \x1b[1A 上移一行再重写，调用后 *first 置 false。total 为 0 时不输出（如锁文件已齐、无解析任务时）。
 fn drawResolvingTwoLines(io: std.Io, current: usize, total: usize, name: []const u8, use_color: bool, first: *bool) void {
-    const filled: usize = if (total > 0) (current * progress_bar_width) / total else 0;
+    if (total == 0) return;
+    const filled: usize = (current * progress_bar_width) / total;
     var line1_buf: [80]u8 = undefined;
     var w1 = std.Io.Writer.fixed(&line1_buf);
     if (use_color) w1.print("{s}", .{c_cyan}) catch return;
@@ -338,7 +378,7 @@ fn drawResolvingTwoLines(io: std.Io, current: usize, total: usize, name: []const
     var line2_buf: [160]u8 = undefined;
     var w2 = std.Io.Writer.fixed(&line2_buf);
     if (use_color) w2.print("{s}", .{c_dim}) catch return;
-    w2.print("Resolving ({d}) {s}...{s}", .{ total, name, c_erase_to_eol }) catch return;
+    w2.print("Resolving ({d}) {s}...{s}", .{ current, name, c_erase_to_eol }) catch return;
     if (use_color) w2.print("{s}", .{c_reset}) catch return;
     var out_buf: [280]u8 = undefined;
     var stdout_w = std.Io.File.Writer.init(std.Io.File.stdout(), io, &out_buf);
@@ -357,7 +397,7 @@ fn onResolveFailure(ctx: ?*anyopaque) void {
     _ = std.c.write(1, "\n".ptr, 1);
 }
 
-/// InstallReporter.onResolvingComplete：仅当本轮曾输出过 onResolving 时调用；在「Resolving (N) name」下输出 Resolving X ms（带颜色时标签 cyan、耗时 dim），再空一行后进入 Installing。
+/// InstallReporter.onResolvingComplete：仅当本轮曾输出过 onResolving 时调用；在「Resolving (current) name」下输出 Resolving X ms（带颜色时标签 cyan、耗时 dim），再空一行后进入 Installing。
 fn onResolvingComplete(ctx: ?*anyopaque, resolving_elapsed_ms: i64) void {
     const state = if (ctx) |c| @as(*ProgressState, @ptrCast(@alignCast(c))) else return;
     if (resolving_elapsed_ms >= 0) {
@@ -371,12 +411,13 @@ fn onResolvingComplete(ctx: ?*anyopaque, resolving_elapsed_ms: i64) void {
     }
 }
 
-/// InstallReporter.onResolving：有进度条时两行原地更新，进度条在上、Resolving (N) name 在下；SHU_NO_PROGRESS 时每包一行「Resolving (N) name...」。
+/// InstallReporter.onResolving：有进度条时两行原地更新，进度条在上、Resolving (current) name 在下；SHU_NO_PROGRESS 时每包一行「Resolving (current) name...」。total_to_resolve 为 0 时不输出。
 fn onResolving(ctx: ?*anyopaque, name: []const u8, current_in_run: usize, total_to_resolve: usize) void {
+    if (total_to_resolve == 0) return;
     if (progressDisabled()) {
         var buf: [256]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
-        w.print("Resolving ({d}) {s}...\n", .{ total_to_resolve, name }) catch return;
+        w.print("Resolving ({d}) {s}...\n", .{ current_in_run, name }) catch return;
         const s = std.Io.Writer.buffered(&w);
         _ = std.c.write(1, s.ptr, s.len);
         return;
