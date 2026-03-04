@@ -123,6 +123,32 @@ pub fn getCachedPackageDir(allocator: std.mem.Allocator, cache_root: []const u8,
     return allocator.dupe(u8, dir_path) catch return null;
 }
 
+// -----------------------------------------------------------------------------
+// JSR 包缓存：与 npm 一致，存已下载的包目录，路径为 content/jsr/<scope>/<name>/<version>/（含 deno.json 或 package.json）
+// -----------------------------------------------------------------------------
+
+/// [Allocates] 若缓存中已有该 key 的 JSR 包目录（且含 deno.json 或 package.json），返回其绝对路径；否则返回 null。key 由调用方按 jsr/<scope>/<name>/<version> 格式构造。返回的路径由调用方 free。
+pub fn getCachedJsrPackageDir(allocator: std.mem.Allocator, cache_root: []const u8, key: []const u8) ?[]const u8 {
+    const dir_path = libs_io.pathJoin(allocator, &.{ cache_root, CONTENT_DIR, key }) catch return null;
+    defer allocator.free(dir_path);
+    const io = libs_process.getProcessIo() orelse return null;
+    var d = libs_io.openDirAbsolute(dir_path, .{}) catch return null;
+    defer d.close(io);
+    const deno_json = libs_io.pathJoin(allocator, &.{ dir_path, "deno.json" }) catch return null;
+    defer allocator.free(deno_json);
+    const pkg_json = libs_io.pathJoin(allocator, &.{ dir_path, "package.json" }) catch return null;
+    defer allocator.free(pkg_json);
+    if (libs_io.openFileAbsolute(deno_json, .{}) catch null) |f| {
+        f.close(io);
+        return allocator.dupe(u8, dir_path) catch return null;
+    }
+    if (libs_io.openFileAbsolute(pkg_json, .{}) catch null) |f| {
+        f.close(io);
+        return allocator.dupe(u8, dir_path) catch return null;
+    }
+    return null;
+}
+
 /// 从 URL 中截取路径部分（首个 / 至 ? 或 # 或结尾），再取扩展名（如 .ts、.js）
 fn urlPathExtension(url: []const u8) []const u8 {
     const proto_end = std.mem.indexOf(u8, url, "://") orelse return "";
