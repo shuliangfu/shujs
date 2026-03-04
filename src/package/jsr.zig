@@ -62,7 +62,7 @@ pub const InitOptions = struct {
 
 /// 全局 JSR 下载线程池：固定 N 个 fetcher + 1 个 writer；fetcher 只拉取并入写盘队列，writer 写盘，实现网络/磁盘流水线。
 /// 可由调用方创建并在适当时机 deinit 以避免 GPA 泄漏。内部 queue/threads/write_queue 使用 Unmanaged 容器（01 §1.2），减少指针占用、提升 Cache 命中。
-/// io_list 非 null 时每 worker 使用独立 Io（worker i 用 io_list[i]），消除多线程竞争同一事件环导致的 EISCONN 与锁竞争（00 §3.5/§3.6）。
+/// io_list/io_override 非 null 时使用传入的 Io；均为 null 时与 npm 一致，各 worker 与 writer 在本线程内创建 std.Io.Threaded（每线程一个 Io 环，根除 EISCONN）。
 pub const JsrDownloadPool = struct {
     allocator: std.mem.Allocator,
     io_list: ?[]const std.Io = null,
@@ -87,9 +87,14 @@ pub const JsrDownloadPool = struct {
         return pool.io_override orelse libs_process.getProcessIo();
     }
 
-    /// 每 worker 持有一个 std.http.Client；使用 getIo(pool, worker_index) 得到本 worker 专用 Io，避免并发 connect 时 EISCONN。
+    /// 每 worker 持有一个 std.http.Client；io_list/io_override 已设时用 getIo，否则本线程内创建 Threaded（与 npm install worker 一致）。
     fn worker(pool: *JsrDownloadPool, worker_index: usize) void {
-        const io = pool.getIo(worker_index) orelse return;
+        var threaded: ?std.Io.Threaded = null;
+        defer if (threaded) |*t| t.deinit();
+        const io = pool.getIo(worker_index) orelse blk: {
+            threaded = std.Io.Threaded.init(pool.allocator, .{ .environ = std.process.Environ.empty });
+            break :blk threaded.?.io();
+        };
         var zig_client = std.http.Client{ .allocator = pool.allocator, .io = io };
         defer zig_client.deinit();
         while (true) {
@@ -140,7 +145,12 @@ pub const JsrDownloadPool = struct {
     }
 
     fn writerLoop(pool: *JsrDownloadPool) void {
-        const io = pool.getIo(null) orelse return;
+        var threaded: ?std.Io.Threaded = null;
+        defer if (threaded) |*t| t.deinit();
+        const io = pool.getIo(null) orelse blk: {
+            threaded = std.Io.Threaded.init(pool.allocator, .{ .environ = std.process.Environ.empty });
+            break :blk threaded.?.io();
+        };
         while (true) {
             pool.write_mutex.lock(io) catch return;
             while (pool.write_head >= pool.write_queue.items.len and pool.shutdown.load(.monotonic) == false) {
@@ -211,10 +221,10 @@ pub const JsrDownloadPool = struct {
         return pool;
     }
 
-    /// 将一批任务入队并阻塞直到全部完成。tasks 的 url/dest_path 在返回前必须有效（通常由调用方 arena 持有）。任一步失败则返回 job.first_error。使用 pool.getIo() 与 worker 一致。
-    fn submit(pool: *JsrDownloadPool, tasks: []const JsrFileTask) !void {
+    /// 将一批任务入队并阻塞直到全部完成。tasks 的 url/dest_path 在返回前必须有效（通常由调用方 arena 持有）。caller_io 非 null 时用其做 mutex/cond（如 install worker 传入本线程 Io），否则用 pool.getIo(null)。
+    fn submit(pool: *JsrDownloadPool, tasks: []const JsrFileTask, caller_io: ?std.Io) !void {
         if (tasks.len == 0) return;
-        const io = pool.getIo(null) orelse return error.ProcessIoNotSet;
+        const io = caller_io orelse pool.getIo(null) orelse return error.ProcessIoNotSet;
         var job: JsrDownloadJob = .{ .remaining = std.atomic.Value(usize).init(tasks.len) };
         pool.mutex.lock(io) catch return error.ProcessIoNotSet;
         for (tasks) |t| {
@@ -547,18 +557,31 @@ fn parseImportsFromContent(allocator: std.mem.Allocator, content: []const u8) !s
 /// 单个文件下载任务：url 与 dest_path 由调用方分配，生命周期覆盖并行下载全程
 const JsrFileTask = struct { url: []const u8, dest_path: []const u8 };
 
-/// 将指定版本的 JSR 包按 jsr.io 原生 API 下载到 dest_dir：先拉 version_meta.json 得到 manifest，再并行 GET 所有文件（多线程）。scope_name 为 @scope/name。
+/// 将指定版本的 JSR 包按 jsr.io 原生 API 下载到 dest_dir：先查 ~/.shu/cache 是否已有该包，命中则直接软链；未命中则拉 version_meta.json、并行下载到缓存目录再软链到 dest_dir。
 /// pool 非 null 时使用传入的池（调用方负责在适当时机 deinit）；为 null 时使用全局 getOrCreatePool(allocator)。
+/// fetch_io 非 null 时用其拉取 _meta.json，避免多线程共享 process Io 导致 EISCONN；为 null 时使用 libs_process.getProcessIo()（单线程或兼容旧调用方）。
 /// 单包内解析与 task 列表使用 ArenaAllocator，结束时一次 deinit，减少碎片化分配。首包 version_meta 用 std.http.Client（Zig 路径）拉取。
-pub fn downloadPackageToDir(allocator: std.mem.Allocator, pool: ?*JsrDownloadPool, scope_name: []const u8, version: []const u8, dest_dir: []const u8) !void {
+pub fn downloadPackageToDir(allocator: std.mem.Allocator, pool: ?*JsrDownloadPool, scope_name: []const u8, version: []const u8, dest_dir: []const u8, fetch_io: ?std.Io) !void {
     libs_io.makePathAbsolute(dest_dir) catch {};
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
     const sn = try scopeNameFromAtScopeName(a, scope_name);
+    const cache_root = cache.getCacheRoot(a) catch null;
+    if (cache_root) |cr| {
+        const key = try std.fmt.allocPrint(a, "jsr/{s}/{s}/{s}", .{ sn.scope, sn.name, version });
+        if (cache.getCachedJsrPackageDir(a, cr, key)) |cached_dir| {
+            if (libs_io.pathDirname(dest_dir)) |parent| libs_io.makePathAbsolute(parent) catch {};
+            var link_target_buf: [libs_io.max_path_bytes]u8 = undefined;
+            const link_target = libs_io.realpath(cached_dir, &link_target_buf) catch cached_dir;
+            libs_io.symLinkAbsolute(link_target, dest_dir, .{}) catch |e| return e;
+            return;
+        }
+    }
+
     const version_meta_url = try std.fmt.allocPrint(a, "{s}/@{s}/{s}/{s}_meta.json", .{ JSR_META_BASE, sn.scope, sn.name, version });
-    const io = libs_process.getProcessIo() orelse return error.ProcessIoNotSet;
+    const io = fetch_io orelse libs_process.getProcessIo() orelse return error.ProcessIoNotSet;
     var zig_client = std.http.Client{ .allocator = a, .io = io };
     defer zig_client.deinit();
     const body = registry.fetchUrlForJsrMetaWithClient(&zig_client, a, version_meta_url, JSR_FETCH_MAX_BYTES) catch |e| return e;
@@ -575,6 +598,17 @@ pub fn downloadPackageToDir(allocator: std.mem.Allocator, pool: ?*JsrDownloadPoo
     if (manifest_ptr != .object) return error.JsrMetaNoManifest;
     const base_url = try std.fmt.allocPrint(a, "{s}/@{s}/{s}/{s}", .{ JSR_META_BASE, sn.scope, sn.name, version });
 
+    // 有缓存根则下载到缓存目录，再软链到 dest_dir；无则直接下载到 dest_dir（兼容旧行为）
+    const base_dir: []const u8 = blk: {
+        if (cache_root) |cr| {
+            const key = try std.fmt.allocPrint(a, "jsr/{s}/{s}/{s}", .{ sn.scope, sn.name, version });
+            const cache_dir_path = try cache.getCachedPackageDirPath(a, cr, key);
+            libs_io.makePathAbsolute(cache_dir_path) catch {};
+            break :blk cache_dir_path;
+        }
+        break :blk dest_dir;
+    };
+
     var tasks = std.ArrayList(JsrFileTask).initCapacity(a, 64) catch return error.OutOfMemory;
     defer tasks.deinit(a);
     var it = manifest_ptr.object.iterator();
@@ -583,7 +617,7 @@ pub fn downloadPackageToDir(allocator: std.mem.Allocator, pool: ?*JsrDownloadPoo
         if (path_key.len == 0 or path_key[0] != '/') continue;
         const rel = path_key[1..];
         const file_url = if (rel.len == 0) base_url else try std.fmt.allocPrint(a, "{s}/{s}", .{ base_url, rel });
-        const dest_path = try libs_io.pathJoin(a, &.{ dest_dir, rel });
+        const dest_path = try libs_io.pathJoin(a, &.{ base_dir, rel });
         if (libs_io.pathDirname(dest_path)) |parent| {
             libs_io.makePathAbsolute(parent) catch {};
         }
@@ -592,6 +626,13 @@ pub fn downloadPackageToDir(allocator: std.mem.Allocator, pool: ?*JsrDownloadPoo
     if (tasks.items.len == 0) return;
 
     const p = if (pool) |pp| pp else try getOrCreatePool(allocator);
-    try p.submit(tasks.items);
+    try p.submit(tasks.items, fetch_io);
+
+    if (cache_root != null and base_dir.ptr != dest_dir.ptr) {
+        if (libs_io.pathDirname(dest_dir)) |parent| libs_io.makePathAbsolute(parent) catch {};
+        var link_target_buf: [libs_io.max_path_bytes]u8 = undefined;
+        const link_target = libs_io.realpath(base_dir, &link_target_buf) catch base_dir;
+        libs_io.symLinkAbsolute(link_target, dest_dir, .{}) catch |e| return e;
+    }
     // task 的 url/dest_path 均在 arena 内，由 defer arena.deinit() 统一释放
 }
