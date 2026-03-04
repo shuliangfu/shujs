@@ -56,7 +56,7 @@ fn debugLogRegistryCache(path: []const u8, ok: bool, url: ?[]const u8) void {
     w.flush() catch return;
 }
 
-/// 从 ~/.shu/registry 读取上次可用的 registry URL（一行，trim）；不存在或读失败返回 null。调用方 free 返回的切片。供 install 在存在缓存时优先使用，覆盖 .npmrc 的 registry。
+/// [Allocates] 从 ~/.shu/registry 读取上次可用的 registry URL（一行，trim）；不存在或读失败返回 null。调用方 free 返回的切片。供 install 在存在缓存时优先使用，覆盖 .npmrc 的 registry。
 pub fn getCachedRegistry(allocator: std.mem.Allocator) ?[]const u8 {
     const shu_home = cache.getShuHome(allocator) catch {
         if (std.c.getenv("SHU_DEBUG_REGISTRY")) |e| {
@@ -125,7 +125,7 @@ pub const TarballAndDepsResult = struct {
     dependencies: std.StringArrayHashMap([]const u8),
 };
 
-/// 用「包请求」探测镜像：对 REGISTRY_LIST 顺序发 GET /包名、记时，选响应最快且含 "versions" 的镜像写入缓存，返回该镜像的 body。调用方 free 返回的 body。供 ping 全部失败时兜底。全部不可达时返回 error.AllRegistriesUnreachable。
+/// [Allocates] 用「包请求」探测镜像：对 REGISTRY_LIST 顺序发 GET /包名、记时，选响应最快且含 "versions" 的镜像写入缓存，返回该镜像的 body。调用方 free 返回的 body。供 ping 全部失败时兜底。全部不可达时返回 error.AllRegistriesUnreachable。
 fn probeRegistriesByPackageRequestAndSetCache(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
     var results: [REGISTRY_LIST.len]ProbeResult = undefined;
     for (&results) |*r| r.* = .{ .elapsed_ns = 0, .body = null };
@@ -192,8 +192,7 @@ fn probeRegistriesByPackageRequestAndSetCache(allocator: std.mem.Allocator, name
     return error.AllRegistriesUnreachable;
 }
 
-/// 用「ping」探测镜像再解析包：无缓存时对 REGISTRY_LIST 顺序请求 GET base/-/ping、记时，选延时最短的镜像写入缓存，再只对缓存 URL 发一次包请求并返回解析结果；全部 ping 失败则退化为「包请求探测」。
-/// 供 install 在「无缓存时先完成探测再发后续请求」时调用；也供 resolveVersionTarballAndDeps 无缓存路径复用。调用方须 free 返回的 version、tarball_url，以及 dependencies 的 key/value 并 deinit(dependencies)。
+/// [Allocates] 用「ping」探测镜像再解析包：无缓存时对 REGISTRY_LIST 顺序请求 GET base/-/ping、记时，选延时最短的镜像写入缓存，再只对缓存 URL 发一次包请求并返回解析结果；全部 ping 失败则退化为「包请求探测」。供 install 在「无缓存时先完成探测再发后续请求」时调用。调用方须 free 返回的 version、tarball_url，以及 dependencies 的 key/value 并 deinit(dependencies)。
 pub fn probeRegistriesWithPingThenResolvePackage(
     allocator: std.mem.Allocator,
     name: []const u8,
@@ -258,12 +257,7 @@ pub fn probeRegistriesWithPingThenResolvePackage(
     return .{ .version = parsed.version, .tarball_url = parsed.tarball_url, .dependencies = parsed.dependencies };
 }
 
-/// 从 registry 获取包元数据（GET /<name>），解析出 dist-tags.latest 与 versions[].dist.tarball。
-/// 当 registry_base 为 DEFAULT_REGISTRY 时：先读 ~/.shu/registry 用缓存的 URL；
-/// 若缓存不存在或缓存的 URL 不可用，则对 REGISTRY_LIST 用 GET base/-/ping 探测、记时，选延时最短的镜像写入缓存后只对该 URL 发一次包请求；
-/// 全部 ping 失败再退化为发包请求探测、记时选最快。
-/// 非默认 registry 时仅使用传入的 registry_base。返回的 version 与 tarball_url 由调用方 free。
-/// client 非 null 时在单 URL 路径（缓存的 URL、非默认 registry）用其复用连接。
+/// [Allocates] 从 registry 获取包元数据（GET /<name>），解析出 dist-tags.latest 与 versions[].dist.tarball。当 registry_base 为 DEFAULT_REGISTRY 时：先读 ~/.shu/registry 用缓存的 URL；若缓存不存在或不可用则对 REGISTRY_LIST 用 ping 探测、选最快镜像；全部 ping 失败再退化为发包请求探测。非默认 registry 时仅使用传入的 registry_base。返回的 version 与 tarball_url 由调用方 free。client 非 null 时在单 URL 路径用其复用连接。
 pub fn resolveVersionAndTarball(
     allocator: std.mem.Allocator,
     registry_base: []const u8,
@@ -386,8 +380,7 @@ pub fn resolveVersionAndTarball(
     return .{ .version = parsed.version, .tarball_url = parsed.tarball_url };
 }
 
-/// 与 resolveVersionAndTarball 相同，但额外返回该版本的 dependencies（用于传递依赖）。client 非 null 时在单 URL 路径复用连接。
-/// 调用方须 free version、tarball_url，并 free dependencies 的 key/value 且 deinit(dependencies)。
+/// [Allocates] 与 resolveVersionAndTarball 相同，但额外返回该版本的 dependencies（用于传递依赖）。client 非 null 时在单 URL 路径复用连接。调用方须 free version、tarball_url，并 free dependencies 的 key/value 且 deinit(dependencies)。
 pub fn resolveVersionTarballAndDeps(
     allocator: std.mem.Allocator,
     registry_base: []const u8,
@@ -471,7 +464,7 @@ pub fn resolveVersionTarballAndDeps(
     return .{ .version = parsed.version, .tarball_url = parsed.tarball_url, .dependencies = parsed.dependencies };
 }
 
-/// 从已获取的 registry JSON 切片解析 version 与 tarball_url；body_trimmed 为 trim 后的响应体。调用方 free 返回的 version、tarball_url。
+/// [Allocates] 从已获取的 registry JSON 切片解析 version 与 tarball_url；body_trimmed 为 trim 后的响应体。调用方 free 返回的 version、tarball_url。
 fn parseRegistryResponse(
     allocator: std.mem.Allocator,
     body_trimmed: []const u8,
@@ -568,7 +561,7 @@ fn parseRegistryResponse(
     return .{ .version = version, .tarball_url = tarball_url };
 }
 
-/// 从已获取的 registry JSON 解析 version、tarball_url 及该版本的 dependencies（package 的 dependencies 字段）；用于传递依赖收集。调用方 free 返回的 version、tarball_url，以及 dependencies 的 key/value 并 deinit map。
+/// [Allocates] 从已获取的 registry JSON 解析 version、tarball_url 及该版本的 dependencies；用于传递依赖收集。调用方 free 返回的 version、tarball_url，以及 dependencies 的 key/value 并 deinit map。
 fn parseRegistryResponseWithDeps(
     allocator: std.mem.Allocator,
     body_trimmed: []const u8,
@@ -690,7 +683,7 @@ fn satisfiesRange(ver: []const u8, spec: []const u8) bool {
     return false;
 }
 
-/// 从 registry 的 versions 对象中选出满足 spec 的最大版本；stable_only 为 true 时仅考虑稳定版（排除 -canary、-beta 等）。返回的切片由调用方 free，无满足版本返回 null。
+/// [Allocates] 从 registry 的 versions 对象中选出满足 spec 的最大版本；stable_only 为 true 时仅考虑稳定版（排除 -canary、-beta 等）。返回的切片由调用方 free，无满足版本返回 null。
 fn maxSatisfyingVersion(allocator: std.mem.Allocator, versions_obj: std.json.ObjectMap, spec: []const u8, stable_only: bool) ?[]const u8 {
     var best: ?[]const u8 = null;
     var it = versions_obj.iterator();
@@ -710,7 +703,7 @@ fn maxSatisfyingVersion(allocator: std.mem.Allocator, versions_obj: std.json.Obj
     return best;
 }
 
-/// 从 registry 的 versions 对象中选出满足 ">=version_spec" 的最小版本（比请求版本稍新）；stable_only 为 true 时仅考虑稳定版。返回的切片由调用方 free，无满足版本返回 null。
+/// [Allocates] 从 registry 的 versions 对象中选出满足 ">=version_spec" 的最小版本（比请求版本稍新）；stable_only 为 true 时仅考虑稳定版。返回的切片由调用方 free，无满足版本返回 null。
 fn minSatisfyingVersion(allocator: std.mem.Allocator, versions_obj: std.json.ObjectMap, version_spec: []const u8, stable_only: bool) ?[]const u8 {
     const spec = std.fmt.allocPrint(allocator, ">={s}", .{version_spec}) catch return null;
     defer allocator.free(spec);
@@ -732,7 +725,7 @@ fn minSatisfyingVersion(allocator: std.mem.Allocator, versions_obj: std.json.Obj
     return best;
 }
 
-/// 从 registry 的 versions 对象中选出严格小于 version_spec 的最大版本（比请求版本稍旧）；stable_only 为 true 时仅考虑稳定版。返回的切片由调用方 free，无满足版本返回 null。
+/// [Allocates] 从 registry 的 versions 对象中选出严格小于 version_spec 的最大版本（比请求版本稍旧）；stable_only 为 true 时仅考虑稳定版。返回的切片由调用方 free，无满足版本返回 null。
 fn maxVersionLessThan(allocator: std.mem.Allocator, versions_obj: std.json.ObjectMap, version_spec: []const u8, stable_only: bool) ?[]const u8 {
     var best: ?[]const u8 = null;
     var it = versions_obj.iterator();
@@ -752,8 +745,7 @@ fn maxVersionLessThan(allocator: std.mem.Allocator, versions_obj: std.json.Objec
     return best;
 }
 
-/// 根据 registry_base、包名、版本构造 npm tarball 的 URL；与 npm 约定一致，无需请求元数据。
-/// 格式：{registry_base}/{name}/-/{tarball_filename}.tgz；scoped 包 @scope/name 的 tarball 文件名为 name-version.tgz（仅取 / 后一段），与 registry.npmjs.org 一致。调用方 free 返回值。
+/// [Allocates] 根据 registry_base、包名、版本构造 npm tarball 的 URL；与 npm 约定一致，无需请求元数据。格式：{registry_base}/{name}/-/{tarball_filename}.tgz；scoped 包 tarball 文件名为 name-version.tgz。调用方 free 返回值。
 pub fn buildTarballUrl(allocator: std.mem.Allocator, registry_base: []const u8, name: []const u8, version: []const u8) ![]const u8 {
     var base = registry_base;
     if (base.len > 0 and base[base.len - 1] == '/') base = base[0 .. base.len - 1];
@@ -783,6 +775,7 @@ pub fn buildTarballUrl(allocator: std.mem.Allocator, registry_base: []const u8, 
 
 /// 构建 GET 包元数据的 URL：registry_base 无末尾斜杠，name 可为 @scope/pkg。
 /// 与 Bun 一致：部分 registry（如 AWS CodeArtifact）只认 path 里 / 编码为 %2F，故对 name 中的 / 做编码。
+/// [Allocates] 构建 registry 包 URL；返回的切片由调用方 free。内部用。
 fn buildRegistryUrl(allocator: std.mem.Allocator, registry_base: []const u8, name: []const u8) ![]const u8 {
     const encoded_name = if (std.mem.indexOf(u8, name, "/")) |_|
         try std.mem.replaceOwned(u8, allocator, name, "/", "%2F")
@@ -848,8 +841,7 @@ fn debugLogRegistryResponse(url: []const u8, body_trimmed: []const u8) void {
     w.flush() catch return;
 }
 
-/// 使用 libs_io.http 发 GET，带 npm registry 的 Accept 与 User-Agent。timeout_sec 保留为 API 兼容，Zig 路径未实现超时，一律走 registryGetWithClient。
-/// 使用 accept_encoding = "identity" 避免 npm CDN 回 br 导致 Zig Head.parse 报错；JSR 单独用 gzip/deflate（fetchUrlForJsrMetaWithClient）。调用方 free 返回的切片。
+/// [Allocates] 使用 libs_io.http 发 GET，带 npm registry 的 Accept 与 User-Agent。timeout_sec 保留为 API 兼容，Zig 路径未实现超时，一律走 registryGetWithClient。accept_encoding = "identity" 避免 npm CDN 回 br 导致解压报错。调用方 free 返回的切片。
 fn registryGet(allocator: std.mem.Allocator, url: []const u8, max_bytes: usize, timeout_sec: u32) ![]const u8 {
     _ = timeout_sec;
     const io = libs_process.getProcessIo() orelse return error.ProcessIoNotSet;
@@ -858,7 +850,7 @@ fn registryGet(allocator: std.mem.Allocator, url: []const u8, max_bytes: usize, 
     return registryGetWithClient(&client, allocator, url, max_bytes);
 }
 
-/// 与 registryGet 相同，但使用已有 Client 以复用连接；走 Zig 路径、无超时。identity 避免 npm CDN 回 br 导致解压失败。
+/// [Allocates] 与 registryGet 相同，但使用已有 Client 以复用连接；走 Zig 路径、无超时。调用方 free 返回的切片。
 fn registryGetWithClient(client: *std.http.Client, allocator: std.mem.Allocator, url: []const u8, max_bytes: usize) ![]const u8 {
     return libs_io.http.getWithClient(client, allocator, url, .{
         .accept = REGISTRY_ACCEPT,
@@ -870,14 +862,14 @@ fn registryGetWithClient(client: *std.http.Client, allocator: std.mem.Allocator,
     });
 }
 
-/// 使用自定义 Accept 头 GET url（供 JSR 等非 npm registry 使用）；Zig 路径、一次性 Client。调用方 free 返回的切片。
+/// [Allocates] 使用自定义 Accept 头 GET url（供 JSR 等非 npm registry 使用）；Zig 路径、一次性 Client。调用方 free 返回的切片。
 pub fn fetchUrlWithAccept(allocator: std.mem.Allocator, url: []const u8, accept_value: []const u8, max_bytes: usize) ![]const u8 {
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
     return fetchUrlWithAcceptWithClient(&client, allocator, url, accept_value, max_bytes);
 }
 
-/// 与 fetchUrlWithAccept 相同，但使用已有 Client 以复用连接；走 Zig 路径、无超时。
+/// [Allocates] 与 fetchUrlWithAccept 相同，但使用已有 Client 以复用连接；走 Zig 路径、无超时。调用方 free 返回的切片。
 pub fn fetchUrlWithAcceptWithClient(client: *std.http.Client, allocator: std.mem.Allocator, url: []const u8, accept_value: []const u8, max_bytes: usize) ![]const u8 {
     return libs_io.http.getWithClient(client, allocator, url, .{
         .accept = accept_value,
@@ -887,7 +879,7 @@ pub fn fetchUrlWithAcceptWithClient(client: *std.http.Client, allocator: std.mem
     });
 }
 
-/// 使用 Zig 路径（一次性 std.http.Client）GET url，Accept application/json；供 JSR 元数据拉取。
+/// [Allocates] 使用 Zig 路径（一次性 std.http.Client）GET url，Accept application/json；供 JSR 元数据拉取。返回的切片由调用方 free。
 pub fn fetchUrlForJsrMeta(allocator: std.mem.Allocator, url: []const u8, max_bytes: usize) ![]const u8 {
     const io = libs_process.getProcessIo() orelse return error.ProcessIoNotSet;
     var client = std.http.Client{ .allocator = allocator, .io = io };
@@ -895,7 +887,7 @@ pub fn fetchUrlForJsrMeta(allocator: std.mem.Allocator, url: []const u8, max_byt
     return fetchUrlForJsrMetaWithClient(&client, allocator, url, max_bytes);
 }
 
-/// 与 fetchUrlForJsrMeta 相同，但使用已有 std.http.Client 以复用连接（Keep-Alive）；走 Zig 路径、无超时。供 JSR 下载 worker 多请求复用同一连接。
+/// [Allocates] 与 fetchUrlForJsrMeta 相同，但使用已有 std.http.Client 以复用连接（Keep-Alive）；走 Zig 路径、无超时。供 JSR 下载 worker 多请求复用同一连接。返回的切片由调用方 free。
 /// JSR (jsr.io) 返回 Transfer-Encoding: chunked + Content-Encoding: gzip，npm 镜像多返回 Content-Length，故 JSR 易触发 Zig chunked 读 0 字节、npm 不报错。
 /// 使用 accept_encoding = "identity" 时 CDN 常回 Content-Length，走 content-length 路径可避免 chunked 导致的 ReadFailed；用 gzip 则需接受偶发 ReadFailed。
 pub fn fetchUrlForJsrMetaWithClient(client: *std.http.Client, allocator: std.mem.Allocator, url: []const u8, max_bytes: usize) ![]const u8 {
