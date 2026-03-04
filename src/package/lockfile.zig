@@ -15,7 +15,7 @@ pub const lock_file_name = "shu.lock";
 /// 锁文件读入字节上限，防止损坏或恶意大文件导致 OOM（§ 性能规则）
 const load_max_bytes = 1024 * 1024;
 
-/// 从 "name@version" 解析出 name（最后一个 @ 之前）与 version（之后）；scoped 包如 @dreamer/view@1.0 正确拆为 name=@dreamer/view, version=1.0。调用方 free 返回的 name、version。
+/// [Allocates] 从 "name@version" 解析出 name（最后一个 @ 之前）与 version（之后）；scoped 包如 @dreamer/view@1.0 正确拆为 name=@dreamer/view, version=1.0。调用方 free 返回的 name、version。
 pub fn parseNameAtVersion(allocator: std.mem.Allocator, name_at_version: []const u8) !struct { name: []const u8, version: []const u8 } {
     const last_at = std.mem.lastIndexOfScalar(u8, name_at_version, '@') orelse return error.InvalidNameAtVersion;
     if (last_at == 0) return error.InvalidNameAtVersion;
@@ -25,21 +25,21 @@ pub fn parseNameAtVersion(allocator: std.mem.Allocator, name_at_version: []const
     };
 }
 
-/// 带 name@version 图与根依赖的锁文件加载结果；支持同包多版本。调用方须 free packages 的 key/value 与各 list 的 item 并 deinit，再 free root_dependencies、jsr_packages 各 item 并 deinit。
+/// 带 name@version 图与根依赖的锁文件加载结果；支持同包多版本。使用 Unmanaged 容器（01 §1.2），调用方须 free packages 的 key/value 与各 list 的 item 并 deinit(allocator)，再 free root_dependencies、jsr_packages 各 item 并 deinit(allocator)。
 pub const LoadWithDepsResult = struct {
     /// 包身份为 name@version；值为该包的依赖列表（每项为 depName@depVersion）
-    packages: std.StringArrayHashMap(std.ArrayList([]const u8)),
+    packages: std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)),
     /// 项目直接依赖的 name@version 列表，用于安装顺序与 node_modules 顶层
-    root_dependencies: std.ArrayList([]const u8),
+    root_dependencies: std.ArrayListUnmanaged([]const u8),
     /// 来自 JSR 的 name@version 列表，安装时走 jsr_tasks
-    jsr_packages: std.ArrayList([]const u8),
+    jsr_packages: std.ArrayListUnmanaged([]const u8),
 };
 
-/// 从 path 读取锁文件。格式：packages 为 name@version -> { dependencies: [depName@depVersion] }，rootDependencies、jsrPackages 为 name@version 数组。文件不存在或非 object 则返回空结构。
+/// [Allocates] 从 path 读取锁文件。格式：packages 为 name@version -> { dependencies: [depName@depVersion] }，rootDependencies、jsrPackages 为 name@version 数组。文件不存在或非 object 则返回空结构。调用方须 free/deinit(allocator) 返回的 LoadWithDepsResult（Unmanaged，01 §1.2）。
 pub fn loadWithDeps(allocator: std.mem.Allocator, path: []const u8) !LoadWithDepsResult {
-    var packages = std.StringArrayHashMap(std.ArrayList([]const u8)).init(allocator);
-    var root_dependencies = std.ArrayList([]const u8).initCapacity(allocator, 0) catch return error.OutOfMemory;
-    var jsr_packages = std.ArrayList([]const u8).initCapacity(allocator, 0) catch return error.OutOfMemory;
+    var packages = std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)){};
+    var root_dependencies = std.ArrayListUnmanaged([]const u8).initCapacity(allocator, 0) catch return error.OutOfMemory;
+    var jsr_packages = std.ArrayListUnmanaged([]const u8).initCapacity(allocator, 0) catch return error.OutOfMemory;
     errdefer {
         var it = packages.iterator();
         while (it.next()) |e| {
@@ -47,7 +47,7 @@ pub fn loadWithDeps(allocator: std.mem.Allocator, path: []const u8) !LoadWithDep
             for (e.value_ptr.*.items) |p| allocator.free(p);
             e.value_ptr.*.deinit(allocator);
         }
-        packages.deinit();
+        packages.deinit(allocator);
         for (root_dependencies.items) |p| allocator.free(p);
         root_dependencies.deinit(allocator);
         for (jsr_packages.items) |p| allocator.free(p);
@@ -76,7 +76,7 @@ pub fn loadWithDeps(allocator: std.mem.Allocator, path: []const u8) !LoadWithDep
                 const key = entry.key_ptr.*;
                 const val = entry.value_ptr.*;
                 const key_dup = try allocator.dupe(u8, key);
-                var deps_list = std.ArrayList([]const u8).initCapacity(allocator, 0) catch return error.OutOfMemory;
+                var deps_list = std.ArrayListUnmanaged([]const u8).initCapacity(allocator, 0) catch return error.OutOfMemory;
                 if (val == .object) {
                     if (val.object.get("dependencies")) |d| {
                         if (d == .array) {
@@ -86,7 +86,7 @@ pub fn loadWithDeps(allocator: std.mem.Allocator, path: []const u8) !LoadWithDep
                         }
                     }
                 }
-                try packages.put(key_dup, deps_list);
+                try packages.put(allocator, key_dup, deps_list);
             }
         }
     }
@@ -107,7 +107,7 @@ pub fn loadWithDeps(allocator: std.mem.Allocator, path: []const u8) !LoadWithDep
     return .{ .packages = packages, .root_dependencies = root_dependencies, .jsr_packages = jsr_packages };
 }
 
-/// 从 path 读取锁文件，解析出 name -> version 映射（多版本时每 name 只保留一个 version，供 update 等使用）。调用方负责 free 返回的 map 的 key/value 并 deinit。
+/// [Allocates] 从 path 读取锁文件，解析出 name -> version 映射（多版本时每 name 只保留一个 version，供 update 等使用）。调用方负责 free 返回的 map 的 key/value 并 deinit。
 pub fn load(allocator: std.mem.Allocator, path: []const u8) !std.StringArrayHashMap([]const u8) {
     var result = try loadWithDeps(allocator, path);
     defer {
@@ -117,7 +117,7 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !std.StringArrayHash
             for (e.value_ptr.*.items) |p| allocator.free(p);
             e.value_ptr.*.deinit(allocator);
         }
-        result.packages.deinit();
+        result.packages.deinit(allocator);
         for (result.root_dependencies.items) |p| allocator.free(p);
         result.root_dependencies.deinit(allocator);
         for (result.jsr_packages.items) |p| allocator.free(p);
@@ -161,13 +161,13 @@ fn appendJsonEscaped(allocator: std.mem.Allocator, list: *std.ArrayList(u8), s: 
     }
 }
 
-/// 将 name@version 图写入 path（新格式：packages、rootDependencies、jsrPackages）。若目录不存在则创建父目录。不拥有 packages/root_dependencies/jsr_packages 内存。
+/// 将 name@version 图写入 path（新格式：packages、rootDependencies、jsrPackages）。若目录不存在则创建父目录。不拥有 packages/root_dependencies/jsr_packages 内存；接受 Unmanaged 容器（01 §1.2）。
 pub fn save(
     allocator: std.mem.Allocator,
     path: []const u8,
-    packages: std.StringArrayHashMap(std.ArrayList([]const u8)),
-    root_dependencies: std.ArrayList([]const u8),
-    jsr_packages: ?std.ArrayList([]const u8),
+    packages: std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)),
+    root_dependencies: std.ArrayListUnmanaged([]const u8),
+    jsr_packages: ?std.ArrayListUnmanaged([]const u8),
 ) !void {
     var list = std.ArrayList(u8).initCapacity(allocator, 8192) catch return error.OutOfMemory;
     defer list.deinit(allocator);
@@ -222,15 +222,15 @@ pub fn save(
     try file.writeStreamingAll(io, list.items);
 }
 
-/// 从旧式 resolved(name->version) + 可选 deps_of(name->deps 名字) 与 jsr 包名集合，构建新格式并写入 path；供 update 等只持有 resolved 的调用方使用。调用方不释放传入的 map/list。
+/// 从旧式 resolved(name->version) + 可选 deps_of(name->deps 名字) 与 jsr 包名集合，构建新格式并写入 path；供 update 等只持有 resolved 的调用方使用。调用方不释放传入的 map/list。deps_of 为 Unmanaged 类型（01 §1.2）。
 pub fn saveFromResolved(
     allocator: std.mem.Allocator,
     path: []const u8,
     resolved: std.StringArrayHashMap([]const u8),
-    deps_of: ?*const std.StringArrayHashMap(std.ArrayList([]const u8)),
+    deps_of: ?*const std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)),
     jsr_packages: ?*const std.StringArrayHashMap(void),
 ) !void {
-    var packages = std.StringArrayHashMap(std.ArrayList([]const u8)).init(allocator);
+    var packages = std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)){};
     defer {
         var it = packages.iterator();
         while (it.next()) |e| {
@@ -238,14 +238,14 @@ pub fn saveFromResolved(
             for (e.value_ptr.*.items) |p| allocator.free(p);
             e.value_ptr.*.deinit(allocator);
         }
-        packages.deinit();
+        packages.deinit(allocator);
     }
-    var root_deps = std.ArrayList([]const u8).initCapacity(allocator, resolved.count()) catch return error.OutOfMemory;
+    var root_deps = std.ArrayListUnmanaged([]const u8).initCapacity(allocator, resolved.count()) catch return error.OutOfMemory;
     defer {
         for (root_deps.items) |p| allocator.free(p);
         root_deps.deinit(allocator);
     }
-    var jsr_list = std.ArrayList([]const u8).initCapacity(allocator, 0) catch return error.OutOfMemory;
+    var jsr_list = std.ArrayListUnmanaged([]const u8).initCapacity(allocator, 0) catch return error.OutOfMemory;
     defer {
         for (jsr_list.items) |p| allocator.free(p);
         jsr_list.deinit(allocator);
@@ -253,16 +253,16 @@ pub fn saveFromResolved(
     var it = resolved.iterator();
     while (it.next()) |e| {
         const name_at_ver = try std.fmt.allocPrint(allocator, "{s}@{s}", .{ e.key_ptr.*, e.value_ptr.* });
-        var deps_list = std.ArrayList([]const u8).initCapacity(allocator, 0) catch return error.OutOfMemory;
+        var deps_list = std.ArrayListUnmanaged([]const u8).initCapacity(allocator, 0) catch return error.OutOfMemory;
         if (deps_of) |d| {
-            if (d.get(e.key_ptr.*)) |arr| {
+            if (d.get(e.key_ptr.*)) |*arr| {
                 for (arr.items) |dep_name| {
                     const ver = resolved.get(dep_name) orelse "";
                     deps_list.append(allocator, try std.fmt.allocPrint(allocator, "{s}@{s}", .{ dep_name, ver })) catch return error.OutOfMemory;
                 }
             }
         }
-        try packages.put(name_at_ver, deps_list);
+        try packages.put(allocator, name_at_ver, deps_list);
         root_deps.append(allocator, try allocator.dupe(u8, name_at_ver)) catch return error.OutOfMemory;
     }
     if (jsr_packages) |jsr| {
