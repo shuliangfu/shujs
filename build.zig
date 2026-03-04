@@ -39,6 +39,18 @@ pub fn build(b: *std.Build) void {
     // Windows IOCP：目标为 Windows 时默认用 I/O 完成端口做 accept，可 -Duse_iocp=false 回退到 poll。
     const use_iocp = b.option(bool, "use_iocp", "Use IOCP on Windows for accept (default: true when targeting Windows)") orelse (target.result.os.tag == .windows);
 
+    // 00 §7.1 A：ReleaseFast 且 x86/x86_64 时要求 AVX2，避免 SIMD 静默退化为标量（libs/simd_scan 等依赖 @Vector）
+    const is_x86 = target.result.cpu.arch == .x86_64 or target.result.cpu.arch == .x86;
+    const has_avx2 = if (is_x86) std.Target.x86.featureSetHas(target.result.cpu.features, .avx2) else true;
+    if (optimize == .ReleaseFast and is_x86 and !has_avx2) {
+        const fail_step = b.addSystemCommand(&.{
+            "sh",
+            "-c",
+            "echo 'error: ReleaseFast build for x86/x86_64 requires AVX2 to avoid silent SIMD scalar fallback (00 §7.1 A). Use -Dcpu=x86_64_v3 or -Dcpu=native.' >&2; exit 1",
+        });
+        b.getInstallStep().dependOn(&fail_step.step);
+    }
+
     // 生成 build_options.zig，供 runtime/engine.zig 判断是否初始化 JSC；have_tls 供 server/tls.zig；use_io_uring/use_iocp 供 server/mod.zig
     const build_options_content = b.fmt(
         "// 由 build.zig 生成，勿手改\npub const have_webkit_jsc = {};\npub const have_tls = {};\npub const use_io_uring = {};\npub const use_iocp = {};\n",
@@ -62,12 +74,21 @@ pub fn build(b: *std.Build) void {
     });
     root_module.addImport("build_options", build_options_module);
 
-    // 进程级状态（io / environ），main 设置，CLI、io、runtime 等共用
+    // 系统状态（平台、CPU/内存/磁盘/网络），供并发上限等使用；先创建以便 libs_process 依赖
+    const libs_os_module = b.createModule(.{
+        .root_source_file = b.path("src/libs/os.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    root_module.addImport("libs_os", libs_os_module);
+
+    // 进程级状态（io / environ），main 设置，CLI、io、runtime 等共用；依赖 libs_os 做并发上限的运行时探测
     const libs_process_module = b.createModule(.{
         .root_source_file = b.path("src/libs/process.zig"),
         .target = target,
         .optimize = optimize,
     });
+    libs_process_module.addImport("libs_os", libs_os_module);
     root_module.addImport("libs_process", libs_process_module);
 
     // 统一错误码与 reportToStderr，CLI、package、runtime 等共用；依赖 libs_process
@@ -216,6 +237,9 @@ pub fn build(b: *std.Build) void {
         .macos => exe.root_module.addCMacro("OS_MACOSX", "1"),
         else => {},
     }
+
+    // Windows：libs_os 的 getProcessRssKb 需要 psapi（GetProcessMemoryInfo）
+    if (target.result.os.tag == .windows) exe.root_module.linkSystemLibrary("psapi", .{});
 
     // macOS：链接系统 JavaScriptCore 框架
     if (is_macos) exe.root_module.linkFramework("JavaScriptCore", .{});
