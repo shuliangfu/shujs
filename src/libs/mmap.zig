@@ -98,7 +98,7 @@ pub const MappedFileWritable = struct {
     }
 };
 
-/// 将路径对应的文件以只读方式映射进进程地址空间；调用方负责 deinit
+/// [Allocates] 将路径对应的文件以只读方式映射进进程地址空间；调用方负责 deinit。
 /// 任意大小、任意格式均可；大文件时可避免 readToEndAlloc 的整文件分配与多次拷贝（§1.7）
 pub fn mapFileReadOnly(path: []const u8) !MappedFile {
     return switch (builtin.os.tag) {
@@ -108,7 +108,7 @@ pub fn mapFileReadOnly(path: []const u8) !MappedFile {
     };
 }
 
-/// 将路径对应的文件以可读可写方式映射进进程地址空间；调用方负责 deinit
+/// [Allocates] 将路径对应的文件以可读可写方式映射进进程地址空间；调用方负责 deinit。
 /// 任意格式；使用 MAP_SHARED，写入会同步到文件；适用于已存在且非空文件
 pub fn mapFileReadWrite(path: []const u8) !MappedFileWritable {
     return switch (builtin.os.tag) {
