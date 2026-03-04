@@ -330,6 +330,7 @@ pub const HighPerfIO = struct {
         _ = self.ring.submit() catch {};
     }
 
+    // Hot-path（01 §3.3）：修改时检查汇编无意外 call/逃逸
     /// 收割已完成项：copy_cqes，区分 accept CQE（内部提交 recv）与 recv CQE（填 completion_buffer）；返回切片有效至下次 poll。
     /// 循环前预取 slot 各字段切片为局部变量并传入 handle*，使 ptr+len 更易常驻寄存器（寄存器传参优化）。
     pub fn pollCompletions(self: *HighPerfIO, timeout_ns: i64) []api.Completion {
@@ -533,6 +534,7 @@ pub const HighPerfIO = struct {
         self.completion_count += 1;
     }
 
+    // Hot-path
     /// 在连接上提交一次 recv；数据由内核写入 provide_buffers 池，完成时 tag=recv、chunk_index 为 buffer_id（releaseChunk 在 Linux 为 no-op）
     pub fn submitRecv(self: *HighPerfIO, stream: std.Io.net.Stream, user_data: usize) void {
         const idx = self.slot_cache.take() orelse return;
@@ -558,11 +560,13 @@ pub const HighPerfIO = struct {
         };
     }
 
+    // Hot-path
     /// 归还 recv 完成项占用的池块；Linux provide_buffers 由内核自动复用，本调用为 no-op
     pub fn releaseChunk(self: *HighPerfIO, _: usize) void {
         _ = self;
     }
 
+    // Hot-path
     /// 在连接上提交 send；data 在完成前须保持有效
     pub fn submitSend(self: *HighPerfIO, stream: std.Io.net.Stream, data: []const u8, user_data: usize) void {
         if (data.len == 0) return;
