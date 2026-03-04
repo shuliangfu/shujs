@@ -1,7 +1,7 @@
 // 依赖缓存：npm 包按 (registry, name, version) 存已解压目录（不压缩，与 Deno/Bun 一致）；HTTPS URL 单文件按 URL 哈希缓存
 // 参考：docs/PACKAGE_DESIGN.md §7
-// 约定：调用方负责 free 返回的路径字符串（getCacheRoot、getCachedPackageDirPath/getCachedPackageDir、getCachedUrlPath、urlCachePath 的返回值）
-// 文件/目录与路径经 io_core（§3.0）
+// 约定（01 §1.3）：返回路径/切片的 pub fn 均标 [Allocates]，调用方负责 free。
+// 文件/目录与路径经 libs_io（00 §3.0）
 
 const std = @import("std");
 const errors = @import("errors");
@@ -15,7 +15,7 @@ const URL_CACHE_DIR = "url";
 /// Registry 元数据缓存子目录名（位于 getCacheRoot() 下），按 registry_host/包名.json 存 GET /<name> 的 JSON，避免重复请求
 const METADATA_DIR = "metadata";
 
-/// 返回 shu 配置/缓存根目录（~/.shu 或 %LOCALAPPDATA%\\shu）；用于存放 registry 等配置。优先 SHU_HOME，否则 HOME/USERPROFILE + /.shu。调用方 free。
+/// [Allocates] 返回 shu 配置/缓存根目录（~/.shu 或 %LOCALAPPDATA%\\shu）；用于存放 registry 等配置。优先 SHU_HOME，否则 HOME/USERPROFILE + /.shu。调用方 free。
 pub fn getShuHome(allocator: std.mem.Allocator) ![]const u8 {
     if (std.c.getenv("SHU_HOME")) |v| return allocator.dupe(u8, std.mem.span(v));
     const home_z = std.c.getenv("HOME") orelse std.c.getenv("USERPROFILE") orelse return error.NoHomeDir;
@@ -23,7 +23,7 @@ pub fn getShuHome(allocator: std.mem.Allocator) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}/.shu", .{home});
 }
 
-/// 返回依赖缓存根目录；优先读环境变量 SHU_CACHE 或 SHU_CACHE_DIR，否则用 getShuHome()/cache。调用方负责 free。§7：用 writer 替代 allocPrint 减少热路径临时分配。
+/// [Allocates] 返回依赖缓存根目录；优先读环境变量 SHU_CACHE 或 SHU_CACHE_DIR，否则用 getShuHome()/cache。调用方 free。
 pub fn getCacheRoot(allocator: std.mem.Allocator) ![]const u8 {
     if (std.c.getenv("SHU_CACHE")) |v| return allocator.dupe(u8, std.mem.span(v));
     if (std.c.getenv("SHU_CACHE_DIR")) |v| return allocator.dupe(u8, std.mem.span(v));
@@ -45,7 +45,7 @@ fn sanitizeName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
     return list.toOwnedSlice(allocator);
 }
 
-/// 生成缓存键：registry_host 与 name、version 组成唯一键；name 会做安全化。调用方负责 free。§7：用 writer 替代 allocPrint 减少热路径临时分配。
+/// [Allocates] 生成缓存键：registry_host 与 name、version 组成唯一键；name 会做安全化。调用方 free。
 pub fn cacheKey(allocator: std.mem.Allocator, registry_host: []const u8, name: []const u8, version: []const u8) ![]const u8 {
     const safe_name = try sanitizeName(allocator, name);
     defer allocator.free(safe_name);
@@ -63,7 +63,7 @@ fn metadataCachePath(allocator: std.mem.Allocator, cache_root: []const u8, regis
     return libs_io.pathJoin(allocator, &.{ dir, json_name });
 }
 
-/// 若该包在元数据缓存中已有 GET /<name> 的 JSON，则读取并返回；否则返回 null。返回的切片由调用方 free。
+/// [Allocates] 若该包在元数据缓存中已有 GET /<name> 的 JSON，则读取并返回；否则返回 null。返回的切片由调用方 free。
 pub fn getCachedMetadata(allocator: std.mem.Allocator, cache_root: []const u8, registry_host: []const u8, name: []const u8) ?[]const u8 {
     const path = metadataCachePath(allocator, cache_root, registry_host, name) catch return null;
     defer allocator.free(path);
@@ -104,12 +104,12 @@ pub fn putCachedMetadata(allocator: std.mem.Allocator, cache_root: []const u8, r
 // npm 包缓存：与 Deno/Bun 一致，存已解压目录（不存 .tgz 压缩），路径为 content/<key>/（含 package.json 等）
 // -----------------------------------------------------------------------------
 
-/// 返回缓存包目录的绝对路径（用于解压或复制）；key 如 npm/registry.npmjs.org/name/version。调用方 free。
+/// [Allocates] 返回缓存包目录的绝对路径（用于解压或复制）；key 如 npm/registry.npmjs.org/name/version。调用方 free。
 pub fn getCachedPackageDirPath(allocator: std.mem.Allocator, cache_root: []const u8, key: []const u8) ![]const u8 {
     return libs_io.pathJoin(allocator, &.{ cache_root, CONTENT_DIR, key });
 }
 
-/// 若缓存中已有该 key 的已解压包目录（且含 package.json），返回其绝对路径；否则返回 null。返回的路径由调用方 free。
+/// [Allocates] 若缓存中已有该 key 的已解压包目录（且含 package.json），返回其绝对路径；否则返回 null。返回的路径由调用方 free。
 pub fn getCachedPackageDir(allocator: std.mem.Allocator, cache_root: []const u8, key: []const u8) ?[]const u8 {
     const dir_path = libs_io.pathJoin(allocator, &.{ cache_root, CONTENT_DIR, key }) catch return null;
     defer allocator.free(dir_path);
@@ -150,7 +150,7 @@ fn urlCacheFilename(allocator: std.mem.Allocator, url: []const u8) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}{s}", .{ &hex, ext });
 }
 
-/// 返回 URL 在缓存中的绝对路径（用于写入或读取）；仅接受 https://，http:// 返回 error.HttpNotSupported。调用方 free。
+/// [Allocates] 返回 URL 在缓存中的绝对路径（用于写入或读取）；仅接受 https://，http:// 返回 error.HttpNotSupported。调用方 free。
 pub fn urlCachePath(allocator: std.mem.Allocator, cache_root: []const u8, url: []const u8) ![]const u8 {
     if (std.mem.startsWith(u8, url, "http://")) return error.HttpNotSupported;
     if (!std.mem.startsWith(u8, url, "https://")) return error.InvalidUrl;
@@ -159,7 +159,7 @@ pub fn urlCachePath(allocator: std.mem.Allocator, cache_root: []const u8, url: [
     return libs_io.pathJoin(allocator, &.{ cache_root, URL_CACHE_DIR, name });
 }
 
-/// 若该 https:// URL 已缓存则返回其绝对路径，否则返回 null；http:// 返回 null。调用方 free 返回的路径。
+/// [Allocates] 若该 https:// URL 已缓存则返回其绝对路径，否则返回 null；http:// 返回 null。调用方 free 返回的路径。
 pub fn getCachedUrlPath(allocator: std.mem.Allocator, cache_root: []const u8, url: []const u8) ?[]const u8 {
     const io = libs_process.getProcessIo() orelse return null;
     const path = urlCachePath(allocator, cache_root, url) catch return null;
