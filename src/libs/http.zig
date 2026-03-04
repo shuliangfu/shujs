@@ -157,13 +157,13 @@ const tarball_default_accept_encoding = "gzip";
 /// ReadFailed 或 2xx 空 body 时 Zig 路径最大重试次数（每次间隔 1 秒），用于连接瞬断等场景。
 const read_failed_retries = 3;
 
-/// 释放 Response 的 body，以及当 status_text_is_allocated 时的 status_text；供调用方统一释放，避免漏放或误 free 静态 status_text。
+/// 释放 request/get 返回的 [Allocates] 资源：body 与（当 status_text_is_allocated 时）status_text；供调用方统一释放，避免漏放或误 free 静态 status_text。
 pub fn freeResponse(allocator: std.mem.Allocator, resp: *const Response) void {
     allocator.free(resp.body);
     if (resp.status_text_is_allocated) allocator.free(resp.status_text);
 }
 
-/// 同步发起任意方法的 HTTP 请求，返回完整响应。调用方用 freeResponse(allocator, &resp) 释放。
+/// [Allocates] 同步发起任意方法的 HTTP 请求，返回完整响应。调用方用 freeResponse(allocator, &resp) 释放。
 /// ReadFailed 或 GET 返回 2xx 但 body 为空时，用 Zig 路径重试最多 read_failed_retries 次，仍失败则返回 error.HttpFailed。
 pub fn request(allocator: std.mem.Allocator, url: []const u8, options: RequestOptions) !Response {
     var last_err: anyerror = error.ReadFailed;
@@ -186,7 +186,7 @@ pub fn request(allocator: std.mem.Allocator, url: []const u8, options: RequestOp
     return if (last_err == error.ReadFailed) error.HttpFailed else last_err;
 }
 
-/// 便捷 GET：仅返回响应体，非 2xx 时返回 error.BadStatus。调用方 free 返回的切片。
+/// [Allocates] 便捷 GET：仅返回响应体，非 2xx 时返回 error.BadStatus。调用方 free 返回的切片。
 pub fn get(allocator: std.mem.Allocator, url: []const u8, options: GetOptions) ![]const u8 {
     var headers: [16]Header = undefined;
     var n: usize = 0;
@@ -271,7 +271,7 @@ fn debugLogResponseHeaders(url: []const u8, status: u16, head: std.http.Client.R
 }
 
 /// 使用已有 Client 做 GET，便于同一 host 连接复用（Keep-Alive）。仅 Zig 路径；若 ReadFailed 或 2xx 空 body 则重试最多 read_failed_retries 次、每次间隔 1 秒，仍失败返回 error.HttpFailed。调用方负责 client 生命周期。
-/// 重试时若上次为 ReadFailed（如 chunked 在复用连接下读得 0 字节），改用一次性 Client 重试一次以换新连接，避免同一连接反复失败；其余请求仍复用原 client。
+/// [Allocates] 使用已有 std.http.Client 做 GET；返回的 body 由调用方 free。重试时若上次为 ReadFailed 则改用一次性 Client 重试一次以换新连接。
 pub fn getWithClient(client: *std.http.Client, allocator: std.mem.Allocator, url: []const u8, options: GetOptions) ![]const u8 {
     var headers: [16]Header = undefined;
     var n: usize = 0;
