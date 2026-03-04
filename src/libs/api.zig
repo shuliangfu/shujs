@@ -109,7 +109,7 @@ pub const BufferPool = struct {
     allocator: std.mem.Allocator,
     backing: BufferPoolBacking = .allocator,
 
-    /// 分配 64-byte 对齐的 buffer 池；调用方负责 deinit
+    /// [Allocates] 分配 64-byte 对齐的 buffer 池；调用方负责 deinit。
     pub fn allocAligned(allocator: std.mem.Allocator, size: usize) !BufferPool {
         const ptr = try allocator.alignedAlloc(u8, .@"64", size);
         return .{
@@ -120,7 +120,7 @@ pub const BufferPool = struct {
         };
     }
 
-    /// [仅 Linux] 使用 MAP_HUGETLB 分配大页池（2MB 页），减少 TLB 未命中；size 会对齐到 2MB；调用方负责 deinit
+    /// [Allocates] [仅 Linux] 使用 MAP_HUGETLB 分配大页池（2MB 页），减少 TLB 未命中；size 会对齐到 2MB；调用方负责 deinit。
     /// 池较大（如数百 MB）时推荐使用；需系统预留大页（如 echo 128 > /proc/sys/vm/nr_hugepages）
     pub fn allocHugePages(allocator: std.mem.Allocator, size: usize) !BufferPool {
         if (builtin.os.tag != .linux) return error.Unsupported;
@@ -148,7 +148,7 @@ pub const BufferPool = struct {
         };
     }
 
-    /// [仅 Windows] 使用 VirtualAlloc MEM_LARGE_PAGES 分配大页池（2MB/1GB 等），减少 TLB 未命中；size 会对齐到 GetLargePageMinimum()；调用方负责 deinit
+    /// [Allocates] [仅 Windows] 使用 VirtualAlloc MEM_LARGE_PAGES 分配大页池（2MB/1GB 等），减少 TLB 未命中；size 会对齐到 GetLargePageMinimum()；调用方负责 deinit。
     /// 需进程具备 SeLockMemoryPrivilege（锁定内存页）；64KB CHUNK 布局下大页可显著提升内存密集型性能
     pub fn allocLargePagesWindows(allocator: std.mem.Allocator, size: usize) !BufferPool {
         if (builtin.os.tag != .windows) return error.Unsupported;
@@ -208,12 +208,13 @@ pub const BufferPool = struct {
 // 申请时先看本地栈，释放时先放回本地栈；空/满时与 ChunkAllocator 做批量交换（如 16 块），
 // 使 90%+ 操作无锁、在 L1/L2 内完成。Chunk 地址 64 字节对齐，按 Cache Line 填充防伪共享。
 
-/// 基于 BufferPool 的块级分配器：按 chunk_size 将池切块，take/release 以块索引为单位；与 HighPerfIO 的 free_list 语义兼容，可供上层或后续平台层分片化使用
+/// 基于 BufferPool 的块级分配器：按 chunk_size 将池切块，take/release 以块索引为单位；与 HighPerfIO 的 free_list 语义兼容，可供上层或后续平台层分片化使用。
+/// 使用 ArrayListUnmanaged 存空闲块索引，结构体更紧凑、单 Cache Line 可容纳更多有效数据（01 §1.2）。
 pub const ChunkAllocator = struct {
     pool: *const BufferPool,
     chunk_size: usize,
-    /// 空闲块索引栈；生产版此处为「全局 Slab」，每线程另有本地栈并与此批量交换
-    free_stack: std.ArrayList(usize),
+    /// 空闲块索引栈（Unmanaged：不存 allocator 指针，release/releaseBatch/deinit 时由调用方传 allocator）
+    free_stack: std.ArrayListUnmanaged(usize),
     allocator: std.mem.Allocator,
 
     /// 初始化：以 pool 与 chunk_size 切块，所有块索引入栈；调用方负责在 ChunkAllocator 生命周期内保持 pool 有效，deinit 时归还栈内存
@@ -221,7 +222,7 @@ pub const ChunkAllocator = struct {
         const slice = pool.slice();
         if (slice.len < chunk_size or chunk_size == 0) return error.OutOfMemory;
         const n = slice.len / chunk_size;
-        var free_stack = try std.ArrayList(usize).initCapacity(allocator, n);
+        var free_stack = try std.ArrayListUnmanaged(usize).initCapacity(allocator, n);
         for (0..n) |i| {
             free_stack.appendAssumeCapacity(i);
         }
@@ -245,10 +246,10 @@ pub const ChunkAllocator = struct {
 
     /// 归还块索引
     pub fn release(self: *ChunkAllocator, chunk_index: usize) void {
-        _ = self.free_stack.append(self.allocator, chunk_index) catch {};
+        self.free_stack.append(self.allocator, chunk_index) catch {};
     }
 
-    /// 根据块索引返回池内该块的只读切片；调用方不得在 release 后继续使用
+    /// [Borrows] 根据块索引返回池内该块的只读切片；调用方不得在 release 后继续使用。
     pub fn chunkSlice(self: *const ChunkAllocator, chunk_index: usize) []const u8 {
         const start = chunk_index * self.chunk_size;
         const end = @min(start + self.chunk_size, self.pool.len);
@@ -268,7 +269,7 @@ pub const ChunkAllocator = struct {
 
     /// 批量归还块索引；用于线程本地缓存 flush
     pub fn releaseBatch(self: *ChunkAllocator, indices: []const usize) void {
-        for (indices) |idx| _ = self.free_stack.append(self.allocator, idx) catch {};
+        for (indices) |idx| self.free_stack.append(self.allocator, idx) catch {};
     }
 };
 
@@ -278,15 +279,15 @@ pub const ChunkAllocator = struct {
 const CHUNK_CACHE_STACK_SIZE = 128;
 const CHUNK_CACHE_BATCH = 16;
 
-/// 每 I/O 线程持有一个，包装全局 free_list；take/release 绝大多数命中本地栈，空/满时与全局批量交换
+/// 每 I/O 线程持有一个，包装全局 free_list；take/release 绝大多数命中本地栈，空/满时与全局批量交换（01 §1.2 Unmanaged）
 pub const ThreadLocalChunkCache = struct {
     stack: [CHUNK_CACHE_STACK_SIZE]usize = undefined,
     len: usize = 0,
-    global: *std.ArrayList(usize),
+    global: *std.ArrayListUnmanaged(usize),
     allocator: std.mem.Allocator,
 
     /// 绑定到全局池（通常为 HighPerfIO.free_list）与 allocator；registerBufferPool 后调用
-    pub fn init(global: *std.ArrayList(usize), allocator: std.mem.Allocator) ThreadLocalChunkCache {
+    pub fn init(global: *std.ArrayListUnmanaged(usize), allocator: std.mem.Allocator) ThreadLocalChunkCache {
         return .{ .global = global, .allocator = allocator };
     }
 
