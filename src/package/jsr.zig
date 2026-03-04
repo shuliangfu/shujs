@@ -171,6 +171,7 @@ pub const JsrDownloadPool = struct {
             }
             pool.write_mutex.unlock(io);
             defer pool.allocator.free(item.body);
+            libs_io.deleteFileAbsolute(item.dest_path) catch {};
             var f = libs_io.createFileAbsolute(item.dest_path, .{}) catch |e| {
                 item.job.done_mutex.lock(io) catch continue;
                 if (item.job.first_error == null) item.job.first_error = e;
@@ -557,22 +558,24 @@ fn parseImportsFromContent(allocator: std.mem.Allocator, content: []const u8) !s
 /// 单个文件下载任务：url 与 dest_path 由调用方分配，生命周期覆盖并行下载全程
 const JsrFileTask = struct { url: []const u8, dest_path: []const u8 };
 
-/// 将指定版本的 JSR 包按 jsr.io 原生 API 下载到 dest_dir：先查 ~/.shu/cache 是否已有该包，命中则直接软链；未命中则拉 version_meta.json、并行下载到缓存目录再软链到 dest_dir。
-/// pool 非 null 时使用传入的池（调用方负责在适当时机 deinit）；为 null 时使用全局 getOrCreatePool(allocator)。
-/// fetch_io 非 null 时用其拉取 _meta.json，避免多线程共享 process Io 导致 EISCONN；为 null 时使用 libs_process.getProcessIo()（单线程或兼容旧调用方）。
-/// 单包内解析与 task 列表使用 ArenaAllocator，结束时一次 deinit，减少碎片化分配。首包 version_meta 用 std.http.Client（Zig 路径）拉取。
+/// 将指定版本的 JSR 包按 jsr.io 原生 API 安装到 dest_dir。流程：先读缓存目录，存在则直接软链；不存在则下载后写入缓存目录再软链。
+/// - 读缓存：cache_root/content/jsr/<scope>/<name>/<version> 存在且含 deno.json 或 package.json → 视为命中，dest_dir 软链到该目录后返回。
+/// - 写缓存：未命中时拉 _meta.json、并行下载所有文件到上述缓存目录，再 dest_dir 软链到该目录。
+/// pool 非 null 时使用传入的池；fetch_io 非 null 时用其拉取 _meta，避免多线程共享 process Io 导致 EISCONN。
+/// 不在入口创建 dest_dir，避免「先建目录再删再建链」在 worker 线程中删除失败导致 PathAlreadyExists；仅在建链前确保父目录存在。
 pub fn downloadPackageToDir(allocator: std.mem.Allocator, pool: ?*JsrDownloadPool, scope_name: []const u8, version: []const u8, dest_dir: []const u8, fetch_io: ?std.Io) !void {
-    libs_io.makePathAbsolute(dest_dir) catch {};
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
     const sn = try scopeNameFromAtScopeName(a, scope_name);
     const cache_root = cache.getCacheRoot(a) catch null;
+    // 1) 先读缓存目录：存在且完整则直接软链
     if (cache_root) |cr| {
         const key = try std.fmt.allocPrint(a, "jsr/{s}/{s}/{s}", .{ sn.scope, sn.name, version });
         if (cache.getCachedJsrPackageDir(a, cr, key)) |cached_dir| {
             if (libs_io.pathDirname(dest_dir)) |parent| libs_io.makePathAbsolute(parent) catch {};
+            libs_io.deleteFileAbsolute(dest_dir) catch |err| if (err == error.IsDir) libs_io.deleteTreeAbsolute(a, dest_dir) catch {};
             var link_target_buf: [libs_io.max_path_bytes]u8 = undefined;
             const link_target = libs_io.realpath(cached_dir, &link_target_buf) catch cached_dir;
             libs_io.symLinkAbsolute(link_target, dest_dir, .{}) catch |e| return e;
@@ -598,11 +601,12 @@ pub fn downloadPackageToDir(allocator: std.mem.Allocator, pool: ?*JsrDownloadPoo
     if (manifest_ptr != .object) return error.JsrMetaNoManifest;
     const base_url = try std.fmt.allocPrint(a, "{s}/@{s}/{s}/{s}", .{ JSR_META_BASE, sn.scope, sn.name, version });
 
-    // 有缓存根则下载到缓存目录，再软链到 dest_dir；无则直接下载到 dest_dir（兼容旧行为）
+    // 2) 未命中：下载到缓存目录（有 cache_root）或直接到 dest_dir（无则兼容旧行为）。写缓存前清空该目录，避免 writer 写文件时 PathAlreadyExists。
     const base_dir: []const u8 = blk: {
         if (cache_root) |cr| {
             const key = try std.fmt.allocPrint(a, "jsr/{s}/{s}/{s}", .{ sn.scope, sn.name, version });
             const cache_dir_path = try cache.getCachedPackageDirPath(a, cr, key);
+            libs_io.deleteFileAbsolute(cache_dir_path) catch |err| if (err == error.IsDir) libs_io.deleteTreeAbsolute(a, cache_dir_path) catch {};
             libs_io.makePathAbsolute(cache_dir_path) catch {};
             break :blk cache_dir_path;
         }
@@ -630,6 +634,7 @@ pub fn downloadPackageToDir(allocator: std.mem.Allocator, pool: ?*JsrDownloadPoo
 
     if (cache_root != null and base_dir.ptr != dest_dir.ptr) {
         if (libs_io.pathDirname(dest_dir)) |parent| libs_io.makePathAbsolute(parent) catch {};
+        libs_io.deleteFileAbsolute(dest_dir) catch |err| if (err == error.IsDir) libs_io.deleteTreeAbsolute(a, dest_dir) catch {};
         var link_target_buf: [libs_io.max_path_bytes]u8 = undefined;
         const link_target = libs_io.realpath(base_dir, &link_target_buf) catch base_dir;
         libs_io.symLinkAbsolute(link_target, dest_dir, .{}) catch |e| return e;
