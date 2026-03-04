@@ -25,6 +25,33 @@ pub const ResolveResult = struct {
 /// 解析条件：require 用于 CJS，import 用于 ESM
 pub const Condition = export_map.Condition;
 
+/// 窄化错误集（01 §2.1）：resolve 可能返回的语义错误，利于跳转表与分支预测
+pub const ResolveError = error{
+    ModuleNotFound,
+    InvalidJsrSpecifier,
+    HttpNotSupported,
+    HttpsUrlNotCached,
+    ManifestNotFound,
+    PackagePathNotExported,
+    OutOfMemory,
+    /// I/O 或 manifest/export 等下层错误
+    SystemError,
+};
+
+/// 将下层 anyerror 映射为 ResolveError，供 resolve 统一返回窄错误集
+fn translateResolveError(e: anyerror) ResolveError {
+    return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.ModuleNotFound => error.ModuleNotFound,
+        error.InvalidJsrSpecifier => error.InvalidJsrSpecifier,
+        error.HttpNotSupported => error.HttpNotSupported,
+        error.HttpsUrlNotCached => error.HttpsUrlNotCached,
+        error.ManifestNotFound => error.ManifestNotFound,
+        error.PackagePathNotExported => error.PackagePathNotExported,
+        else => error.SystemError,
+    };
+}
+
 /// 从 start_dir 向上查找包含 package.json / package.jsonc 或 deno.json 的目录，返回其绝对路径；未找到返回 null。调用方负责 free。
 fn findProjectRoot(allocator: std.mem.Allocator, start_dir: []const u8) ?[]const u8 {
     var dir = allocator.dupe(u8, start_dir) catch return null;
@@ -92,7 +119,7 @@ fn findNodeModulesPackage(allocator: std.mem.Allocator, parent_dir: []const u8, 
     return null;
 }
 
-/// 从 jsr:@scope/name 或 jsr:@scope/name@version 提取 @scope/name（不含 jsr: 与版本），与 Deno 写法一致；供 install 与 resolver 查找 node_modules/@scope/name。返回的切片由调用方 free。
+/// [Allocates] 从 jsr:@scope/name 或 jsr:@scope/name@version 提取 @scope/name（不含 jsr: 与版本），与 Deno 写法一致；供 install 与 resolver 查找 node_modules/@scope/name。返回的切片由调用方 free。
 pub fn jsrSpecToScopeName(allocator: std.mem.Allocator, jsr_spec: []const u8) ![]const u8 {
     if (!std.mem.startsWith(u8, jsr_spec, prefix_jsr)) return error.InvalidJsrSpecifier;
     var rest = jsr_spec[prefix_jsr.len..];
@@ -128,14 +155,15 @@ fn resolvePackageEntry(
     return libs_io.pathJoin(allocator, &.{ pkg_dir, "index.js" });
 }
 
-/// 解析说明符为绝对文件路径。顺序：协议/内置不处理；import map；相对/绝对路径；https:（仅支持，从缓存解析）；jsr:；裸说明符 node_modules + main/exports。http:// 不支持。
+/// [Allocates] 解析说明符为绝对文件路径。顺序：协议/内置不处理；import map；相对/绝对路径；https:（仅支持，从缓存解析）；jsr:；裸说明符 node_modules + main/exports。http:// 不支持。
 /// project_root 可选，为 null 时从 parent_dir 向上查找。返回的 ResolveResult 中 file_path、cache_key 由 allocator 分配，调用方负责 free。
+/// 返回窄错误集 ResolveError（01 §2.1），利于跳转表与分支预测。
 pub fn resolve(
     allocator: std.mem.Allocator,
     parent_dir: []const u8,
     specifier: []const u8,
     condition: Condition,
-) !ResolveResult {
+) ResolveError!ResolveResult {
     const path_part = if (std.mem.indexOfScalar(u8, specifier, '?')) |q_pos| specifier[0..q_pos] else specifier;
     const query = if (std.mem.indexOfScalar(u8, specifier, '?')) |q_pos| specifier[q_pos..] else "";
 
@@ -147,7 +175,7 @@ pub fn resolve(
         if (proj) |p| {
             defer p.arena.deinit();
             if (p.manifest.imports.get(path_part)) |mapped| {
-                const sub = try resolve(allocator, parent_dir, mapped, condition);
+                const sub = resolve(allocator, parent_dir, mapped, condition) catch |e| return translateResolveError(e);
                 errdefer allocator.free(sub.file_path);
                 errdefer if (sub.cache_key.ptr != sub.file_path.ptr) allocator.free(sub.cache_key);
                 return sub;
@@ -156,9 +184,9 @@ pub fn resolve(
     }
 
     if (path_part.len >= 1 and (path_part[0] == '.' or libs_io.pathIsAbsolute(path_part))) {
-        const file_path = try libs_io.pathResolve(allocator, &.{ parent_dir, path_part });
+        const file_path = libs_io.pathResolve(allocator, &.{ parent_dir, path_part }) catch |e| return translateResolveError(e);
         errdefer allocator.free(file_path);
-        const cache_key = if (query.len == 0) file_path else try std.mem.concat(allocator, u8, &.{ file_path, query });
+        const cache_key = if (query.len == 0) file_path else std.mem.concat(allocator, u8, &.{ file_path, query }) catch |e| return translateResolveError(e);
         return .{ .file_path = file_path, .cache_key = cache_key };
     }
 
@@ -167,7 +195,7 @@ pub fn resolve(
         defer allocator.free(cache_root);
         const file_path = cache.getCachedUrlPath(allocator, cache_root, path_part) orelse return error.HttpsUrlNotCached;
         errdefer allocator.free(file_path);
-        const cache_key = if (query.len == 0) file_path else try std.mem.concat(allocator, u8, &.{ file_path, query });
+        const cache_key = if (query.len == 0) file_path else std.mem.concat(allocator, u8, &.{ file_path, query }) catch |e| return translateResolveError(e);
         return .{ .file_path = file_path, .cache_key = cache_key };
     }
     if (std.mem.startsWith(u8, path_part, prefix_http)) return error.HttpNotSupported;
@@ -177,9 +205,9 @@ pub fn resolve(
         defer allocator.free(scope_name);
         const pkg_dir = findNodeModulesPackage(allocator, parent_dir, scope_name) orelse return error.ModuleNotFound;
         defer allocator.free(pkg_dir);
-        const file_path = try resolvePackageEntry(allocator, pkg_dir, "", condition);
+        const file_path = resolvePackageEntry(allocator, pkg_dir, "", condition) catch |e| return translateResolveError(e);
         errdefer allocator.free(file_path);
-        const cache_key = if (query.len == 0) file_path else try std.mem.concat(allocator, u8, &.{ file_path, query });
+        const cache_key = if (query.len == 0) file_path else std.mem.concat(allocator, u8, &.{ file_path, query }) catch |e| return translateResolveError(e);
         return .{ .file_path = file_path, .cache_key = cache_key };
     }
 
@@ -201,8 +229,8 @@ pub fn resolve(
         "";
     const pkg_dir = findNodeModulesPackage(allocator, parent_dir, pkg_name) orelse return error.ModuleNotFound;
     defer allocator.free(pkg_dir);
-    const file_path = try resolvePackageEntry(allocator, pkg_dir, subpath, condition);
+    const file_path = resolvePackageEntry(allocator, pkg_dir, subpath, condition) catch |e| return translateResolveError(e);
     errdefer allocator.free(file_path);
-    const cache_key = if (query.len == 0) file_path else try std.mem.concat(allocator, u8, &.{ file_path, query });
+    const cache_key = if (query.len == 0) file_path else std.mem.concat(allocator, u8, &.{ file_path, query }) catch |e| return translateResolveError(e);
     return .{ .file_path = file_path, .cache_key = cache_key };
 }
