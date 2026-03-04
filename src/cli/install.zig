@@ -360,7 +360,7 @@ fn resolvingProgressLoop(progress: *pkg_install.ResolvingProgress, state: *Progr
     drawResolvingTwoLines(io, count, total, name_slice, state.use_color, &state.resolving_first);
 }
 
-/// 解析阶段两行进度绘制（进度条 + Resolving (current) name）；first 首次为 true 时输出换行+两行，否则 \x1b[1A 上移一行再重写，调用后 *first 置 false。total 为 0 时不输出（如锁文件已齐、无解析任务时）。
+/// 解析阶段两行进度绘制（进度条 + Resolving (current/total) name）；first 首次为 true 时输出换行+两行，否则 \x1b[1A 上移一行再重写，调用后 *first 置 false。total 为 0 时不输出（如锁文件已齐、无解析任务时）。
 fn drawResolvingTwoLines(io: std.Io, current: usize, total: usize, name: []const u8, use_color: bool, first: *bool) void {
     if (total == 0) return;
     const filled: usize = (current * progress_bar_width) / total;
