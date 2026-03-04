@@ -162,7 +162,8 @@ pub const HighPerfIO = struct {
 
     pool_ptr: [*]const u8 = undefined,
     chunk_count: usize = 0,
-    free_list: std.ArrayList(usize),
+    /// 空闲块索引（01 §1.2 Unmanaged）
+    free_list: std.ArrayListUnmanaged(usize),
     /// 线程本地块缓存，take/release 绝大多数命中本地栈，空/满时与 free_list 批量交换
     chunk_cache: api.ThreadLocalChunkCache = undefined,
 
@@ -170,16 +171,18 @@ pub const HighPerfIO = struct {
     listen_socket: ?ws2.SOCKET = null,
     /// 槽位 SoA；completion_key 存 accept_idx，overlapped 以缓存行隔离
     slot_data: std.MultiArrayList(AcceptFields),
-    accept_free: std.ArrayList(usize),
+    /// 空闲 accept 槽位索引（01 §1.2 Unmanaged）
+    accept_free: std.ArrayListUnmanaged(usize),
 
     /// GQCSEx 预分配条目数组，一次系统调用取回多完成项
     completion_entries: []OverlappedEntry,
 
-    /// windows_socket_reuse 为 true 时：DisconnectEx 完成后可复用的 socket 池；submitAcceptWithBuffer 优先从此取
-    free_sockets: std.ArrayList(ws2.SOCKET),
+    /// windows_socket_reuse 为 true 时：DisconnectEx 完成后可复用的 socket 池；submitAcceptWithBuffer 优先从此取（01 §1.2 Unmanaged）
+    free_sockets: std.ArrayListUnmanaged(ws2.SOCKET),
     /// DisconnectEx 投递上下文；完成时由 lpOverlapped 判定为 disconnect 并取 socket 入 free_sockets
     disconnect_ctxs: []DisconnectCtx,
-    disconnect_free: std.ArrayList(usize),
+    /// 空闲 disconnect 槽位索引（01 §1.2 Unmanaged）
+    disconnect_free: std.ArrayListUnmanaged(usize),
     /// DisconnectEx 函数指针；registerListenSocket 时通过 WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER) 加载
     disconnect_ex: ?LPFN_DISCONNECTEX = null,
     socket_reuse: bool = false,
@@ -188,7 +191,8 @@ pub const HighPerfIO = struct {
 
     /// 连接 recv/send 槽位池；completion_key = max_connections + slot_index 区分 AcceptEx
     conn_io_slots: []ConnIoSlot = undefined,
-    conn_io_free: std.ArrayList(usize) = undefined,
+    /// 空闲 conn_io 槽位索引（01 §1.2 Unmanaged）
+    conn_io_free: std.ArrayListUnmanaged(usize) = undefined,
 
     pub fn init(allocator: std.mem.Allocator, options: api.InitOptions) !HighPerfIO {
         const port = kernel32.CreateIoCompletionPort(win.INVALID_HANDLE_VALUE, null, 0, 0) orelse return error.SystemResources;
@@ -197,7 +201,7 @@ pub const HighPerfIO = struct {
         const completion_buffer = try allocator.alloc(api.Completion, options.max_completions);
         errdefer allocator.free(completion_buffer);
 
-        var free_list = std.ArrayList(usize).init(allocator);
+        var free_list = std.ArrayListUnmanaged(usize).init(allocator);
         errdefer free_list.deinit(allocator);
 
         var slot_data = std.MultiArrayList(AcceptFields){};
@@ -207,9 +211,9 @@ pub const HighPerfIO = struct {
             slot_data.appendAssumeCapacity(.{ .accept_socket = ws2.INVALID_SOCKET });
         }
 
-        var accept_free = std.ArrayList(usize).init(allocator);
+        var accept_free = std.ArrayListUnmanaged(usize).init(allocator);
         errdefer accept_free.deinit(allocator);
-        try accept_free.ensureTotalCapacity(options.max_connections);
+        try accept_free.ensureTotalCapacity(allocator, options.max_connections);
         for (0..options.max_connections) |i| {
             accept_free.appendAssumeCapacity(i);
         }
@@ -217,16 +221,16 @@ pub const HighPerfIO = struct {
         const completion_entries = try allocator.alloc(OverlappedEntry, options.max_completions);
         errdefer allocator.free(completion_entries);
 
-        var free_sockets = std.ArrayList(ws2.SOCKET).init(allocator);
+        var free_sockets = std.ArrayListUnmanaged(ws2.SOCKET).init(allocator);
         errdefer free_sockets.deinit(allocator);
 
         const disconnect_ctxs = try allocator.alloc(DisconnectCtx, options.max_connections);
         errdefer allocator.free(disconnect_ctxs);
         for (disconnect_ctxs) |*ctx| ctx.socket = ws2.INVALID_SOCKET;
 
-        var disconnect_free = std.ArrayList(usize).init(allocator);
+        var disconnect_free = std.ArrayListUnmanaged(usize).init(allocator);
         errdefer disconnect_free.deinit(allocator);
-        try disconnect_free.ensureTotalCapacity(options.max_connections);
+        try disconnect_free.ensureTotalCapacity(allocator, options.max_connections);
         for (0..options.max_connections) |i| {
             disconnect_free.appendAssumeCapacity(i);
         }
@@ -234,9 +238,9 @@ pub const HighPerfIO = struct {
         const conn_io_slots = try allocator.alloc(ConnIoSlot, options.max_connections);
         errdefer allocator.free(conn_io_slots);
 
-        var conn_io_free = std.ArrayList(usize).init(allocator);
+        var conn_io_free = std.ArrayListUnmanaged(usize).init(allocator);
         errdefer conn_io_free.deinit(allocator);
-        try conn_io_free.ensureTotalCapacity(options.max_connections);
+        try conn_io_free.ensureTotalCapacity(allocator, options.max_connections);
         for (0..options.max_connections) |i| {
             conn_io_free.appendAssumeCapacity(i);
         }
@@ -332,7 +336,7 @@ pub const HighPerfIO = struct {
         const listen_sock = self.listen_socket orelse return;
         const idx = self.accept_free.popOrNull() orelse return;
         const chunk_idx = self.chunk_cache.take() orelse {
-            _ = self.accept_free.append(idx) catch {};
+            _ = self.accept_free.append(self.allocator, idx) catch {};
             return;
         };
 
@@ -351,13 +355,13 @@ pub const HighPerfIO = struct {
         };
         if (accept_socket == ws2.INVALID_SOCKET) {
             self.chunk_cache.release(chunk_idx);
-            _ = self.accept_free.append(idx) catch {};
+            _ = self.accept_free.append(self.allocator, idx) catch {};
             return;
         }
         if (kernel32.CreateIoCompletionPort(accept_socket, self.port, @intCast(idx), 0) == null) {
             _ = ws2.closesocket(accept_socket);
             self.chunk_cache.release(chunk_idx);
-            _ = self.accept_free.append(idx) catch {};
+            _ = self.accept_free.append(self.allocator, idx) catch {};
             return;
         }
 
@@ -390,11 +394,12 @@ pub const HighPerfIO = struct {
             if (err != ws2.WSA_IO_PENDING) {
                 _ = ws2.closesocket(accept_socket);
                 self.chunk_cache.release(chunk_idx);
-                _ = self.accept_free.append(idx) catch {};
+                _ = self.accept_free.append(self.allocator, idx) catch {};
             }
         }
     }
 
+    // Hot-path
     /// 收割完成项：GetQueuedCompletionStatusEx 一次取回多完成项；timeout_ns 转为 ms，<0 表示阻塞等待
     pub fn pollCompletions(self: *HighPerfIO, timeout_ns: i64) []api.Completion {
         self.completion_count = 0;
@@ -431,8 +436,8 @@ pub const HighPerfIO = struct {
                 if (dix < self.disconnect_ctxs.len and ov_ptr.Internal == 0) {
                     const sock = self.disconnect_ctxs[dix].socket;
                     self.disconnect_ctxs[dix].socket = ws2.INVALID_SOCKET;
-                    _ = self.disconnect_free.append(dix) catch {};
-                    _ = self.free_sockets.append(sock) catch {};
+                    _ = self.disconnect_free.append(self.allocator, dix) catch {};
+                    _ = self.free_sockets.append(self.allocator, sock) catch {};
                 }
                 continue;
             }
@@ -470,7 +475,7 @@ pub const HighPerfIO = struct {
                     .Union = .{ .Pointer = null },
                     .hEvent = null,
                 };
-                _ = self.conn_io_free.append(slot_index) catch {};
+                _ = self.conn_io_free.append(self.allocator, slot_index) catch {};
                 continue;
             }
 
@@ -501,7 +506,7 @@ pub const HighPerfIO = struct {
         bytes_transferred: win.DWORD,
     ) void {
         self.slot_data.items(.accept_socket)[accept_idx] = ws2.INVALID_SOCKET;
-        _ = self.accept_free.append(accept_idx) catch {};
+        _ = self.accept_free.append(self.allocator, accept_idx) catch {};
         defer self.chunk_cache.release(chunk_index);
 
         if (!success) {
@@ -571,18 +576,19 @@ pub const HighPerfIO = struct {
         self.completion_count += 1;
     }
 
+    // Hot-path
     /// 在连接上提交一次 recv：从池取块、占 conn_io 槽位、associate socket 后 WSARecv；完成时 tag=recv、chunk_index 有效，用毕须 releaseChunk
     pub fn submitRecv(self: *HighPerfIO, stream: std.Io.net.Stream, user_data: usize) void {
         const slot_index = self.conn_io_free.popOrNull() orelse return;
         const chunk_index = self.chunk_cache.acquire() orelse {
-            _ = self.conn_io_free.append(slot_index) catch {};
+            _ = self.conn_io_free.append(self.allocator, slot_index) catch {};
             return;
         };
         const socket: ws2.SOCKET = @ptrCast(stream.handle);
         const key: win.ULONG_PTR = @intCast(self.max_connections + slot_index);
         if (kernel32.CreateIoCompletionPort(socket, self.port, key, 0) == null) {
             self.chunk_cache.release(chunk_index);
-            _ = self.conn_io_free.append(slot_index) catch {};
+            _ = self.conn_io_free.append(self.allocator, slot_index) catch {};
             return;
         }
         const slot = &self.conn_io_slots[slot_index];
@@ -605,16 +611,18 @@ pub const HighPerfIO = struct {
             if (err != ws2.WSA_IO_PENDING) {
                 self.chunk_cache.release(chunk_index);
                 slot.overlapped = .{ .Internal = 0, .InternalHigh = 0, .Union = .{ .Pointer = null }, .hEvent = null };
-                _ = self.conn_io_free.append(slot_index) catch {};
+                _ = self.conn_io_free.append(self.allocator, slot_index) catch {};
             }
         }
     }
 
+    // Hot-path
     /// 归还 recv 完成项占用的池块
     pub fn releaseChunk(self: *HighPerfIO, chunk_index: usize) void {
         self.chunk_cache.release(chunk_index);
     }
 
+    // Hot-path
     /// 在连接上提交 send：占 conn_io 槽位、存 buf 引用、associate 后 WSASend；完成前 data 须保持有效，完成时 tag=send、len=已发送字节数
     pub fn submitSend(self: *HighPerfIO, stream: std.Io.net.Stream, data: []const u8, user_data: usize) void {
         if (data.len == 0) return;
@@ -622,7 +630,7 @@ pub const HighPerfIO = struct {
         const socket: ws2.SOCKET = @ptrCast(stream.handle);
         const key: win.ULONG_PTR = @intCast(self.max_connections + slot_index);
         if (kernel32.CreateIoCompletionPort(socket, self.port, key, 0) == null) {
-            _ = self.conn_io_free.append(slot_index) catch {};
+            _ = self.conn_io_free.append(self.allocator, slot_index) catch {};
             return;
         }
         const slot = &self.conn_io_slots[slot_index];
@@ -644,7 +652,7 @@ pub const HighPerfIO = struct {
             const err = ws2.WSAGetLastError();
             if (err != ws2.WSA_IO_PENDING) {
                 slot.overlapped = .{ .Internal = 0, .InternalHigh = 0, .Union = .{ .Pointer = null }, .hEvent = null };
-                _ = self.conn_io_free.append(slot_index) catch {};
+                _ = self.conn_io_free.append(self.allocator, slot_index) catch {};
             }
         }
     }
