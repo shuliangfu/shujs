@@ -30,7 +30,7 @@ fn logResolveCacheHit(allocator: std.mem.Allocator, kind: []const u8, key: []con
 }
 
 const JSR_META_BASE = "https://jsr.io";
-/// 单包内文件并行下载的并发上限；实际 worker 数 = min(本值, 任务数)。线程池固定 worker 数也取此值。16 对一般项目足够且不压垮网络。
+/// 单包内文件并行下载的并发上限（静态上限）；实际 worker 数由 libs_process.getConcurrencyCap 按 CPU/内存/磁盘/网络计算（下载落盘场景）。
 const JSR_DOWNLOAD_MAX_CONCURRENCY = 16;
 /// meta.json / deno.json 等单次 GET 最大响应体字节数；与 registry 一致不做严限，256MB 避免大包 ResponseTooLarge。
 const JSR_FETCH_MAX_BYTES = 256 * 1024 * 1024;
@@ -50,24 +50,46 @@ const JsrDownloadJob = struct {
 var g_jsr_pool: ?*JsrDownloadPool = null;
 var g_jsr_pool_mutex: std.Io.Mutex = std.Io.Mutex.init;
 
-/// 全局 JSR 下载线程池：固定 N 个 fetcher + 1 个 writer；fetcher 只拉取并入写盘队列，writer 写盘，实现网络/磁盘流水线。可由调用方创建并在适当时机 deinit 以避免 GPA 泄漏。
+/// 初始化选项：io_override 指定专用 Io；http_mutex 可选，用于串行化同组内 HTTP 请求以避 EISCONN 且仅用 1 个 Io 省内存。
+pub const InitOptions = struct {
+    /// 若设置，worker i 使用 io_list[i]（每 worker 独立 Io，省锁但占内存）；与 io_override 二选一，io_list 优先。
+    io_list: ?[]const std.Io = null,
+    /// 若设置且 io_list 为 null，所有 worker 与 writer 共用此 Io；未设置则使用 libs_process.getProcessIo()。
+    io_override: ?std.Io = null,
+    /// 若设置，每次 HTTP 请求前 lock、请求后 unlock，使同组内仅单请求在飞，避免同一 Io 并发 connect 导致 EISCONN；配合单 io_override 可只建 1 个 Io 节省内存。
+    http_mutex: ?*std.Io.Mutex = null,
+};
+
+/// 全局 JSR 下载线程池：固定 N 个 fetcher + 1 个 writer；fetcher 只拉取并入写盘队列，writer 写盘，实现网络/磁盘流水线。
+/// 可由调用方创建并在适当时机 deinit 以避免 GPA 泄漏。内部 queue/threads/write_queue 使用 Unmanaged 容器（01 §1.2），减少指针占用、提升 Cache 命中。
+/// io_list 非 null 时每 worker 使用独立 Io（worker i 用 io_list[i]），消除多线程竞争同一事件环导致的 EISCONN 与锁竞争（00 §3.5/§3.6）。
 pub const JsrDownloadPool = struct {
     allocator: std.mem.Allocator,
-    queue: std.ArrayList(JsrPoolTask),
+    io_list: ?[]const std.Io = null,
+    io_override: ?std.Io = null,
+    /// 非 null 时 worker 在每次 HTTP 请求前后 lock/unlock，串行化请求以避 EISCONN，可与单 io_override 配合省内存。
+    http_mutex: ?*std.Io.Mutex = null,
+    queue: std.ArrayListUnmanaged(JsrPoolTask),
     head: usize = 0,
     mutex: std.Io.Mutex = std.Io.Mutex.init,
     cond: std.Io.Condition = std.Io.Condition.init,
-    threads: std.ArrayList(std.Thread),
-    write_queue: std.ArrayList(JsrWriteItem),
+    threads: std.ArrayListUnmanaged(std.Thread),
+    write_queue: std.ArrayListUnmanaged(JsrWriteItem),
     write_head: usize = 0,
     write_mutex: std.Io.Mutex = std.Io.Mutex.init,
     write_cond: std.Io.Condition = std.Io.Condition.init,
     writer_thread: std.Thread,
     shutdown: std.atomic.Value(bool) = .{ .raw = false },
 
-    /// 每 worker 持有一个 std.http.Client，复用同 host 连接（Zig 路径、Keep-Alive）。Zig 0.16 使用 std.Io.Mutex/Condition，需传入 io。
-    fn worker(pool: *JsrDownloadPool) void {
-        const io = libs_process.getProcessIo() orelse return;
+    /// 返回当前上下文使用的 Io：worker_index 非 null 时用 io_list[worker_index]（若 io_list 已设），否则用 io_list[0] 或 io_override 或 process Io。
+    fn getIo(pool: *JsrDownloadPool, worker_index: ?usize) ?std.Io {
+        if (pool.io_list) |list| return list[worker_index orelse 0];
+        return pool.io_override orelse libs_process.getProcessIo();
+    }
+
+    /// 每 worker 持有一个 std.http.Client；使用 getIo(pool, worker_index) 得到本 worker 专用 Io，避免并发 connect 时 EISCONN。
+    fn worker(pool: *JsrDownloadPool, worker_index: usize) void {
+        const io = pool.getIo(worker_index) orelse return;
         var zig_client = std.http.Client{ .allocator = pool.allocator, .io = io };
         defer zig_client.deinit();
         while (true) {
@@ -85,11 +107,13 @@ pub const JsrDownloadPool = struct {
             const task = pool.queue.items[pool.head];
             pool.head += 1;
             if (pool.head >= pool.queue.items.len) {
-                pool.queue.clearRetainingCapacity();
+                pool.queue.clearRetainingCapacity(); // Unmanaged：仅清空长度，不释放内存
                 pool.head = 0;
             }
             pool.mutex.unlock(io);
+            if (pool.http_mutex) |m| m.lock(io) catch return;
             const content = registry.fetchUrlForJsrMetaWithClient(&zig_client, pool.allocator, task.url, JSR_FETCH_MAX_BYTES) catch |e| {
+                if (pool.http_mutex) |m| m.unlock(io);
                 task.job.done_mutex.lock(io) catch continue;
                 if (task.job.first_error == null) task.job.first_error = e;
                 _ = task.job.remaining.fetchSub(1, .monotonic);
@@ -97,6 +121,7 @@ pub const JsrDownloadPool = struct {
                 task.job.done_mutex.unlock(io);
                 continue;
             };
+            if (pool.http_mutex) |m| m.unlock(io);
             // 入写盘队列后立即继续拉取下一任务，不等待写盘（网络/磁盘流水线）
             pool.write_mutex.lock(io) catch return;
             pool.write_queue.append(pool.allocator, .{ .body = content, .dest_path = task.dest_path, .job = task.job }) catch {
@@ -115,7 +140,7 @@ pub const JsrDownloadPool = struct {
     }
 
     fn writerLoop(pool: *JsrDownloadPool) void {
-        const io = libs_process.getProcessIo() orelse return;
+        const io = pool.getIo(null) orelse return;
         while (true) {
             pool.write_mutex.lock(io) catch return;
             while (pool.write_head >= pool.write_queue.items.len and pool.shutdown.load(.monotonic) == false) {
@@ -131,7 +156,7 @@ pub const JsrDownloadPool = struct {
             const item = pool.write_queue.items[pool.write_head];
             pool.write_head += 1;
             if (pool.write_head >= pool.write_queue.items.len) {
-                pool.write_queue.clearRetainingCapacity();
+                pool.write_queue.clearRetainingCapacity(); // Unmanaged：仅清空长度
                 pool.write_head = 0;
             }
             pool.write_mutex.unlock(io);
@@ -163,28 +188,33 @@ pub const JsrDownloadPool = struct {
         }
     }
 
-    pub fn init(allocator: std.mem.Allocator) !*JsrDownloadPool {
+    /// 创建并启动 worker 与 writer 线程。若 options.io_list 非 null 则 worker 数 = io_list.len，否则由 getConcurrencyCap 决定；io_list 时 worker i 使用 io_list[i]，避免并发 connect 时 EISCONN。调用方负责在适当时机 deinit(pool, allocator)。
+    pub fn init(allocator: std.mem.Allocator, options: InitOptions) !*JsrDownloadPool {
+        const n_workers = if (options.io_list) |list| list.len else libs_process.getConcurrencyCap(JSR_DOWNLOAD_MAX_CONCURRENCY);
         const pool = try allocator.create(JsrDownloadPool);
         pool.* = .{
             .allocator = allocator,
-            .queue = std.ArrayList(JsrPoolTask).initCapacity(allocator, 0) catch return error.OutOfMemory,
-            .threads = std.ArrayList(std.Thread).initCapacity(allocator, JSR_DOWNLOAD_MAX_CONCURRENCY) catch return error.OutOfMemory,
-            .write_queue = std.ArrayList(JsrWriteItem).initCapacity(allocator, 0) catch return error.OutOfMemory,
+            .io_list = options.io_list,
+            .io_override = options.io_override,
+            .http_mutex = options.http_mutex,
+            .queue = std.ArrayListUnmanaged(JsrPoolTask).initCapacity(allocator, 0) catch return error.OutOfMemory,
+            .threads = std.ArrayListUnmanaged(std.Thread).initCapacity(allocator, n_workers) catch return error.OutOfMemory,
+            .write_queue = std.ArrayListUnmanaged(JsrWriteItem).initCapacity(allocator, 0) catch return error.OutOfMemory,
             .writer_thread = undefined,
         };
         var i: usize = 0;
-        while (i < JSR_DOWNLOAD_MAX_CONCURRENCY) : (i += 1) {
-            const th = try std.Thread.spawn(.{}, worker, .{pool});
+        while (i < n_workers) : (i += 1) {
+            const th = try std.Thread.spawn(.{}, worker, .{ pool, i });
             try pool.threads.append(allocator, th);
         }
         pool.writer_thread = try std.Thread.spawn(.{}, writerLoop, .{pool});
         return pool;
     }
 
-    /// 将一批任务入队并阻塞直到全部完成。tasks 的 url/dest_path 在返回前必须有效（通常由调用方 arena 持有）。任一步失败则返回 job.first_error。Zig 0.16 使用 std.Io.Mutex/Condition，需传入 io。
+    /// 将一批任务入队并阻塞直到全部完成。tasks 的 url/dest_path 在返回前必须有效（通常由调用方 arena 持有）。任一步失败则返回 job.first_error。使用 pool.getIo() 与 worker 一致。
     fn submit(pool: *JsrDownloadPool, tasks: []const JsrFileTask) !void {
         if (tasks.len == 0) return;
-        const io = libs_process.getProcessIo() orelse return error.ProcessIoNotSet;
+        const io = pool.getIo(null) orelse return error.ProcessIoNotSet;
         var job: JsrDownloadJob = .{ .remaining = std.atomic.Value(usize).init(tasks.len) };
         pool.mutex.lock(io) catch return error.ProcessIoNotSet;
         for (tasks) |t| {
@@ -204,9 +234,9 @@ pub const JsrDownloadPool = struct {
         if (err) |e| return e;
     }
 
-    /// 关闭池并释放资源：置 shutdown、唤醒并 join 所有 worker 与 writer，deinit 内部 ArrayList，最后 destroy 自身。调用方负责用创建池时的 allocator 调用。
+    /// 关闭池并释放资源：置 shutdown、唤醒并 join 所有 worker 与 writer，deinit 内部 ArrayList，最后 destroy 自身。使用 pool.getIo() 与 worker 一致。调用方负责用创建池时的 allocator 调用。
     pub fn deinit(pool: *JsrDownloadPool, allocator: std.mem.Allocator) void {
-        const io = libs_process.getProcessIo() orelse return;
+        const io = pool.getIo(null) orelse return;
         pool.shutdown.store(true, .monotonic);
         pool.cond.broadcast(io);
         pool.write_cond.broadcast(io);
@@ -225,7 +255,7 @@ fn getOrCreatePool(allocator: std.mem.Allocator) !*JsrDownloadPool {
     g_jsr_pool_mutex.lock(io) catch return error.ProcessIoNotSet;
     defer g_jsr_pool_mutex.unlock(io);
     if (g_jsr_pool) |p| return p;
-    const pool = try JsrDownloadPool.init(allocator);
+    const pool = try JsrDownloadPool.init(allocator, .{});
     g_jsr_pool = pool;
     return pool;
 }
@@ -263,13 +293,13 @@ fn debugLogJsrResponse(url: []const u8, body_trimmed: []const u8) void {
     w.flush() catch return;
 }
 
-/// 从 jsr.io 的 meta.json 解析版本。jsr_spec 为 jsr:@scope/name 或 jsr:@scope/name@version；version_spec 为 "latest" 时用 meta 的 "latest" 字段。返回的切片由调用方 free。
+/// [Allocates] 从 jsr.io 的 meta.json 解析版本。jsr_spec 为 jsr:@scope/name 或 jsr:@scope/name@version；version_spec 为 "latest" 时用 meta 的 "latest" 字段。返回的切片由调用方 free。
 pub fn resolveVersionFromMeta(allocator: std.mem.Allocator, jsr_spec: []const u8) ![]const u8 {
     return resolveVersionFromMetaWithClient(null, allocator, jsr_spec);
 }
 
-/// 与 resolveVersionFromMeta 相同；JSR meta 优先读 .shu/cache 下 jsr.io 元数据缓存，未命中再请求 jsr.io，避免无 lockfile 时重复拉 meta.json。
-/// 当 client 非 null 时用 fetchUrlForJsrMetaWithClient 复用连接，避免每请求新建 Client 导致多线程下 Zig Client 内部 proxy 等状态异常（如 connect 时 proxy.host 野指针 segfault）。
+/// [Allocates] 与 resolveVersionFromMeta 相同；JSR meta 优先读 .shu/cache 下 jsr.io 元数据缓存，未命中再请求 jsr.io，避免无 lockfile 时重复拉 meta.json。
+/// 当 client 非 null 时用 fetchUrlForJsrMetaWithClient 复用连接，避免每请求新建 Client 导致多线程下 Zig Client 内部 proxy 等状态异常（如 connect 时 proxy.host 野指针 segfault）。返回的切片由调用方 free。
 pub fn resolveVersionFromMetaWithClient(client: ?*std.http.Client, allocator: std.mem.Allocator, jsr_spec: []const u8) ![]const u8 {
     const scope_name = try jsrSpecToScopeAndName(allocator, jsr_spec);
     defer allocator.free(scope_name.scope);
@@ -383,7 +413,7 @@ fn specFromImportValue(value: []const u8) []const u8 {
 /// deno.json imports 中的一条依赖：name 为包名（@scope/name 或 npm 名），spec 为版本范围，is_jsr 表示是否走 JSR。name/spec 由调用方 free。
 pub const DenoImportDep = struct { name: []const u8, spec: []const u8, is_jsr: bool };
 
-/// 在解析阶段从 jsr.io 直接 GET deno.json（不下载整包），解析 imports。优先读 .shu/cache 下 jsr.io 元数据缓存，未命中再走 fetchUrlForJsrMeta 并写入缓存。
+/// [Allocates] 在解析阶段从 jsr.io 直接 GET deno.json（不下载整包），解析 imports。优先读 .shu/cache 下 jsr.io 元数据缓存，未命中再走 fetchUrlForJsrMeta 并写入缓存。返回的列表及项内 name/spec 由调用方 free 并 deinit。
 pub fn fetchDenoJsonImportsFromRegistryWithClient(client: ?*std.http.Client, allocator: std.mem.Allocator, scope_name: []const u8, version: []const u8) !?std.ArrayList(DenoImportDep) {
     _ = client;
     const cache_key = try std.fmt.allocPrint(allocator, "deno/{s}/{s}", .{ scope_name, version });
@@ -412,7 +442,7 @@ pub fn fetchDenoJsonImportsFromRegistryWithClient(client: ?*std.http.Client, all
     return list;
 }
 
-/// 同上，若 deno.json 不存在则尝试 deno.jsonc；deno.json 路径已带缓存，deno.jsonc 拉取前也先查同一 cache key，拉取成功后写入缓存。
+/// [Allocates] 同上，若 deno.json 不存在则尝试 deno.jsonc；deno.json 路径已带缓存，deno.jsonc 拉取前也先查同一 cache key，拉取成功后写入缓存。返回的列表及项内 name/spec 由调用方 free 并 deinit。
 pub fn fetchDenoJsonImportsFromRegistryOrJsoncWithClient(client: ?*std.http.Client, allocator: std.mem.Allocator, scope_name: []const u8, version: []const u8) !?std.ArrayList(DenoImportDep) {
     const from_json = fetchDenoJsonImportsFromRegistryWithClient(client, allocator, scope_name, version) catch null;
     if (from_json) |list| return list;
@@ -438,7 +468,7 @@ pub fn fetchDenoJsonImportsFromRegistryOrJsoncWithClient(client: ?*std.http.Clie
     return parseImportsFromContent(allocator, content) catch null;
 }
 
-/// 读取已安装 JSR 包目录下的 deno.json（或 deno.jsonc）的 imports，解析出 jsr: 与 npm: 依赖列表。（兜底用，优先用 fetchDenoJsonImportsFromRegistry）
+/// [Allocates] 读取已安装 JSR 包目录下的 deno.json（或 deno.jsonc）的 imports，解析出 jsr: 与 npm: 依赖列表。（兜底用，优先用 fetchDenoJsonImportsFromRegistry）
 /// 返回的列表中每项的 name、spec 由 allocator 分配，调用方负责 free 并 deinit 列表。
 pub fn getDenoJsonImports(allocator: std.mem.Allocator, pkg_dir: []const u8) !std.ArrayList(DenoImportDep) {
     const deno_path = try libs_io.pathJoin(allocator, &.{ pkg_dir, "deno.json" });
