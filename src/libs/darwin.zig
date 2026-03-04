@@ -67,17 +67,18 @@ pub const HighPerfIO = struct {
 
     pool_ptr: [*]const u8 = undefined,
     chunk_count: usize = 0,
-    free_list: std.ArrayList(usize),
+    /// 空闲块索引；Unmanaged 不存 allocator，init/deinit/append 显式传 allocator（01 §1.2）
+    free_list: std.ArrayListUnmanaged(usize),
     /// 线程本地块缓存，take/release 绝大多数命中本地栈，空/满时与 free_list 批量交换（见 api.ThreadLocalChunkCache）
     chunk_cache: api.ThreadLocalChunkCache = undefined,
 
-    /// 待处理 (listen_fd, user_data)；边缘触发时循环取一、accept、直至 EAGAIN
-    pending_accepts: std.ArrayList(PendingAccept),
+    /// 待处理 (listen_fd, user_data)；边缘触发时循环取一、accept、直至 EAGAIN（01 §1.2 Unmanaged）
+    pending_accepts: std.ArrayListUnmanaged(PendingAccept),
     listen_fds: std.AutoHashMap(i32, void),
     /// 槽位 SoA：ev.udata = slot_index，热路径只摸 client_fd 等连续数组（与 Linux 版一致）
     slot_data: std.MultiArrayList(ClientFields),
-    /// 空闲 client 槽位索引
-    free_slots: std.ArrayList(usize),
+    /// 空闲 client 槽位索引（01 §1.2 Unmanaged）
+    free_slots: std.ArrayListUnmanaged(usize),
 
     /// 预分配 changelist 缓冲区（固定大小，无扩容毛刺）；changelist_len 为当前有效长度
     changelist: []posix.Kevent,
@@ -105,7 +106,7 @@ pub const HighPerfIO = struct {
             slot_data.appendAssumeCapacity(.{ .op_kind = .accept_first_read, .client_fd = -1 });
         }
 
-        var free_slots = try std.ArrayList(usize).initCapacity(allocator, options.max_connections);
+        var free_slots = try std.ArrayListUnmanaged(usize).initCapacity(allocator, options.max_connections);
         errdefer free_slots.deinit(allocator);
         for (0..options.max_connections) |i| {
             free_slots.appendAssumeCapacity(i);
@@ -121,8 +122,8 @@ pub const HighPerfIO = struct {
             .completion_buffer = completion_buffer,
             .completion_count = 0,
             .max_connections = options.max_connections,
-            .free_list = try std.ArrayList(usize).initCapacity(allocator, 0),
-            .pending_accepts = try std.ArrayList(PendingAccept).initCapacity(allocator, 0),
+            .free_list = try std.ArrayListUnmanaged(usize).initCapacity(allocator, 0),
+            .pending_accepts = try std.ArrayListUnmanaged(PendingAccept).initCapacity(allocator, 0),
             .listen_fds = std.AutoHashMap(i32, void).init(allocator),
             .slot_data = slot_data,
             .free_slots = free_slots,
@@ -160,7 +161,7 @@ pub const HighPerfIO = struct {
         self.free_list.clearRetainingCapacity();
         self.free_list.ensureTotalCapacity(self.allocator, self.chunk_count) catch return;
         for (0..self.chunk_count) |i| {
-            self.free_list.appendAssumeCapacity(@intCast(i));
+            self.free_list.appendAssumeCapacity(@as(usize, @intCast(i)));
         }
         self.chunk_cache = api.ThreadLocalChunkCache.init(&self.free_list, self.allocator);
     }
@@ -199,6 +200,7 @@ pub const HighPerfIO = struct {
         return false;
     }
 
+    // Hot-path
     /// 收割已完成项：先一次 kevent(changelist, events) 批量提交并取事件，再处理 listen/client；返回切片有效至下次 poll
     pub fn pollCompletions(self: *HighPerfIO, timeout_ns: i64) []api.Completion {
         self.completion_count = 0;
@@ -379,6 +381,7 @@ pub const HighPerfIO = struct {
         self.pushCompletionRecv(user_data, buf.ptr, @as(usize, @intCast(n)), null, chunk_index);
     }
 
+    // Hot-path
     /// 在连接上提交一次 recv；数据写入池块，完成时 tag=recv、chunk_index 有效，用毕须 releaseChunk
     pub fn submitRecv(self: *HighPerfIO, stream: std.Io.net.Stream, user_data: usize) void {
         const client_fd = stream.socket.handle;
@@ -398,11 +401,13 @@ pub const HighPerfIO = struct {
         });
     }
 
+    // Hot-path
     /// 归还 recv 完成项占用的池块；须在下次 pollCompletions 前调用
     pub fn releaseChunk(self: *HighPerfIO, chunk_index: usize) void {
         self.chunk_cache.release(chunk_index);
     }
 
+    // Hot-path
     /// 在连接上提交 send；data 在完成前须保持有效；完成时 tag=send、len=已发送字节数（暂为桩，后续实现 EVFILT_WRITE + write）
     pub fn submitSend(self: *HighPerfIO, _: std.Io.net.Stream, _: []const u8, _: usize) void {
         _ = self;
