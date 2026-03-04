@@ -32,12 +32,12 @@ fn isDefaultRegistryUrl(url: []const u8) bool {
     return std.mem.eql(u8, t, "https://registry.npmjs.org");
 }
 
-/// 优化 C：lockfile 是否已包含 manifest 全部直接依赖及传递闭包；若 true 可跳过整段解析循环。
+/// 优化 C：lockfile 是否已包含 manifest 全部直接依赖及传递闭包；若 true 可跳过整段解析循环。deps_of 为 Unmanaged（01 §1.2）。
 fn canSkipResolution(
     allocator: std.mem.Allocator,
     direct_set: std.StringArrayHashMap(void),
     resolved: std.StringArrayHashMap([]const u8),
-    deps_of: std.StringArrayHashMap(std.ArrayList([]const u8)),
+    deps_of: std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)),
 ) bool {
     var seen = std.StringArrayHashMap(void).init(allocator);
     defer seen.deinit();
@@ -56,7 +56,7 @@ fn canSkipResolution(
     while (qidx < queue.items.len) {
         const name = queue.items[qidx];
         qidx += 1;
-        const deps = deps_of.get(name) orelse return false;
+        const deps = deps_of.getPtr(name) orelse return false;
         for (deps.items) |dep| {
             if (!resolved.contains(dep) or !deps_of.contains(dep)) return false;
             if (!seen.contains(dep)) {
@@ -68,10 +68,17 @@ fn canSkipResolution(
     return true;
 }
 
-/// 解析阶段每层 JSR 并发数上限（deno.json 拉取 + version 解析）
+/// 解析/安装阶段 worker 或并发数的**静态上限**；实际使用上限在运行时由 getPackageConcurrencyCap()
+/// 根据 CPU 核心数计算（见下），避免单核机开过多线程。网络速度、当前 I/O 状态暂无自动探测，可后续通过环境变量或配置扩展。
 const JSR_RESOLVE_MAX_WORKERS = 16;
 
-/// JSR 并发解析单条结果：version/imports 由 worker 用 page_allocator 分配，主线程合并后须用 page_allocator 释放。
+/// 每批请求数：超过后重建 Client，避免同一连接复用过多导致服务端关闭或返回非 JSON（常见于「最后一包」报 JsrMetaNoJsonObject）。与 CPU 无关，保持常量。
+const JSR_RESOLVE_CLIENT_REUSE_LIMIT = 32;
+
+/// npm 解析阶段每层并发 worker 数；与 JSR 对齐，实际上限由 libs_process.getConcurrencyCapForRequests 按 CPU/内存/网络决定（不考虑磁盘）。
+const NPM_RESOLVE_MAX_WORKERS = 16;
+
+/// JSR 并发解析单条结果：version/imports 由 worker 用本批 Arena 分配，主线程合并后 Arena deinit 统一释放（00 §1.2）。
 const JsrResolveResult = struct {
     version: []const u8 = "",
     imports: ?[]const jsr.DenoImportDep = null,
@@ -81,20 +88,15 @@ const JsrResolveResult = struct {
 /// 单条 JSR 待解析项（仅 name/spec，指针指向 to_process 内有效内存）
 const JsrResolveItem = struct { name: []const u8, spec: []const u8 };
 
-/// Worker 线程上下文：items 与 results 在 join 前有效；next_index 原子递增取任务下标。
+/// Worker 线程上下文：items 与 results 在 join 前有效；next_index 原子递增取任务下标。allocator 为 per-batch Arena，join 后主线程 deinit（00 §1.2）。
 const JsrResolveWorkerCtx = struct {
     items: []const JsrResolveItem,
     results: [*]JsrResolveResult,
     next_index: *std.atomic.Value(usize),
+    allocator: std.mem.Allocator,
 };
 
-/// 每批请求数：超过后重建 Client，避免同一连接复用过多导致服务端关闭或返回非 JSON（常见于「最后一包」报 JsrMetaNoJsonObject）。
-const JSR_RESOLVE_CLIENT_REUSE_LIMIT = 32;
-
-/// npm 解析阶段每层并发 worker 数；与 JSR 对齐，避免过多连接压垮 registry。
-const NPM_RESOLVE_MAX_WORKERS = 16;
-
-/// npm 并发解析单条结果：version、tarball_url、dependencies 由 worker 用 page_allocator 分配，主线程合并后须用 page_allocator 释放。
+/// npm 并发解析单条结果：version、tarball_url、dependencies 由 worker 用本批 Arena 分配，主线程合并后 Arena deinit 统一释放（00 §1.2）。
 const NpmResolveResult = struct {
     version: ?[]const u8 = null,
     tarball_url: ?[]const u8 = null,
@@ -105,25 +107,25 @@ const NpmResolveResult = struct {
 /// 单条 npm 待解析项：name/spec/display_name 指向 to_process 内有效内存；registry_url 由主线程分配并在 join 后统一 free。
 const NpmResolveItem = struct { name: []const u8, spec: []const u8, display_name: ?[]const u8, registry_url: []const u8 };
 
-/// Worker 上下文：items 与 results 在 join 前有效；next_index 原子递增取任务下标。
+/// Worker 上下文：items 与 results 在 join 前有效；next_index 原子递增取任务下标。allocator 为 per-batch Arena，join 后主线程 deinit（00 §1.2）。
 const NpmResolveWorkerCtx = struct {
     items: []const NpmResolveItem,
     results: [*]NpmResolveResult,
     next_index: *std.atomic.Value(usize),
+    allocator: std.mem.Allocator,
 };
 
-/// npm 解析 worker：每 worker 持有一个 Client，循环取任务并调用 resolveVersionTarballAndDeps，结果写入 results[i]（page 分配，主线程释放）。
-/// 后续可考虑改为 per-worker Arena（§1.2），worker 结束时一次性 deinit，减少主线程逐项 free。
+/// npm 解析 worker：每 worker 持有一个 Client，循环取任务并调用 resolveVersionTarballAndDeps，结果写入 results[i]。使用 ctx.allocator（主线程提供的 Arena），join 后主线程一次 deinit（00 §1.2）。
 fn npmResolveWorker(ctx: *const NpmResolveWorkerCtx) void {
-    const page = std.heap.page_allocator;
+    const a = ctx.allocator;
     const io = libs_process.getProcessIo() orelse return;
-    var client = std.http.Client{ .allocator = page, .io = io };
+    var client = std.http.Client{ .allocator = a, .io = io };
     defer client.deinit();
     while (true) {
         const i = ctx.next_index.fetchAdd(1, .monotonic);
         if (i >= ctx.items.len) return;
         const item = ctx.items[i];
-        const r = registry.resolveVersionTarballAndDeps(page, item.registry_url, item.name, item.spec, &client) catch |e| {
+        const r = registry.resolveVersionTarballAndDeps(a, item.registry_url, item.name, item.spec, &client) catch |e| {
             ctx.results[i] = .{ .err = e };
             continue;
         };
@@ -225,7 +227,9 @@ fn setLastCompletedName(ln: *LastCompletedName, name: []const u8) void {
     ln.len = n;
 }
 
-/// npm 安装 worker 上下文：tasks/results 在 join 前有效；next_index 原子取任务下标；resolved_tarball_urls 只读；first_error 与 error_detail 由首次失败者写入（mutex 保护）。first_extract_failure_logged 保证首次解压失败时无条件打印一次诊断。install_completed_count 非 null 时每完成一包递增；last_completed_name 非 null 时写入最近完成包名。
+/// npm 安装 worker 上下文：每 worker 持独立 Io（ctx.io），即「每线程一个 Io 环」（00 §3.5/§4），根除 EISCONN、无锁、提升缓存局部性。
+/// tasks/results 在 join 前有效；next_index 原子取任务下标；resolved_tarball_urls 只读；first_error 与 error_detail 由首次失败者写入（mutex 保护）。
+/// allocator 为 per-worker Arena，join 后主线程 deinit（00 §1.2）。
 const NpmInstallWorkerCtx = struct {
     tasks: []const NpmInstallTask,
     results: [*]?anyerror,
@@ -238,38 +242,38 @@ const NpmInstallWorkerCtx = struct {
     error_detail: ?*InstallErrorDetail,
     main_allocator: std.mem.Allocator,
     worker_id: usize,
+    allocator: std.mem.Allocator,
+    /// 本 worker 专用 Io，不与其他 worker 共享，避免状态冲突与锁竞争（00 §3.5/§3.6）。
+    io: std.Io,
     install_completed_count: ?*std.atomic.Value(usize) = null,
     last_completed_name: ?*LastCompletedName = null,
 };
 
-/// npm 安装 worker：每 worker 持有一个 std.http.Client（Zig 路径）和独立临时文件路径；取任务后查缓存→未命中则下载（Zig client）→写缓存→解压；失败写 results[i] 并在 mutex 下写 first_error/error_detail。
+/// npm 安装 worker：每 worker 持有一个 std.http.Client（Zig 路径）和独立临时文件路径；取任务后查缓存→未命中则下载（Zig client）→写缓存→解压；失败写 results[i] 并在 mutex 下写 first_error/error_detail。使用 ctx.io（专用 Io）与 ctx.allocator（per-worker Arena），join 后主线程 deinit（00 §1.2）。
 fn npmInstallWorker(ctx: *const NpmInstallWorkerCtx) void {
-    const page = std.heap.page_allocator;
-    const io = libs_process.getProcessIo() orelse return;
-    var zig_client = std.http.Client{ .allocator = page, .io = io };
+    const a = ctx.allocator;
+    const io = ctx.io;
+    var zig_client = std.http.Client{ .allocator = a, .io = io };
     defer zig_client.deinit();
-    const temp_tgz = std.fmt.allocPrint(page, "{s}/.tmp-download-{d}.tgz", .{ ctx.cache_root, ctx.worker_id }) catch return;
-    defer page.free(temp_tgz);
+    const temp_tgz = std.fmt.allocPrint(a, "{s}/.tmp-download-{d}.tgz", .{ ctx.cache_root, ctx.worker_id }) catch return;
+    // Arena：不在此处 free，主线程 deinit 时统一释放
     while (true) {
         const i = ctx.next_index.fetchAdd(1, .monotonic);
         if (i >= ctx.tasks.len) return;
         const task = ctx.tasks[i];
-        const key = cache.cacheKey(page, task.registry_host, task.name, task.version) catch |e| {
+        const key = cache.cacheKey(a, task.registry_host, task.name, task.version) catch |e| {
             ctx.results[i] = e;
             setFirstError(ctx, e, task.name, task.version);
             continue;
         };
-        defer page.free(key);
-        const cache_dir_path = cache.getCachedPackageDirPath(page, ctx.cache_root, key) catch |e| {
+        const cache_dir_path = cache.getCachedPackageDirPath(a, ctx.cache_root, key) catch |e| {
             ctx.results[i] = e;
             setFirstError(ctx, e, task.name, task.version);
             continue;
         };
-        defer page.free(cache_dir_path);
         var invalid_gzip_retries: u32 = 0;
         retry_extract: while (invalid_gzip_retries < 2) : (invalid_gzip_retries += 1) {
-            if (cache.getCachedPackageDir(page, ctx.cache_root, key)) |hit_dir| {
-                defer page.free(hit_dir);
+            if (cache.getCachedPackageDir(a, ctx.cache_root, key)) |hit_dir| {
                 if (libs_io.pathDirname(task.pkg_dest)) |parent| libs_io.makePathAbsolute(parent) catch {};
                 var link_target_buf: [libs_io.max_path_bytes]u8 = undefined;
                 const link_target = libs_io.realpath(hit_dir, &link_target_buf) catch hit_dir;
@@ -283,7 +287,7 @@ fn npmInstallWorker(ctx: *const NpmInstallWorkerCtx) void {
             }
             const turl_opt = ctx.resolved_tarball_urls.get(task.name);
             const turl = turl_opt orelse blk: {
-                const u = registry.buildTarballUrl(page, task.registry_url, task.name, task.version) catch |e| {
+                const u = registry.buildTarballUrl(a, task.registry_url, task.name, task.version) catch |e| {
                     ctx.results[i] = e;
                     setFirstError(ctx, e, task.name, task.version);
                     if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
@@ -291,12 +295,11 @@ fn npmInstallWorker(ctx: *const NpmInstallWorkerCtx) void {
                 };
                 break :blk u;
             };
-            defer if (turl_opt == null) page.free(turl);
             var download_ok = false;
             var last_dl_err: anyerror = undefined;
             for (0..INSTALL_NETWORK_RETRIES) |ri| {
                 if (ri > 0) std.Io.sleep(io, std.Io.Duration.fromNanoseconds(INSTALL_NETWORK_RETRY_DELAYS_NS[ri - 1]), .awake) catch {};
-                registry.downloadToPathWithClient(&zig_client, page, turl, temp_tgz) catch |e| {
+                registry.downloadToPathWithClient(&zig_client, a, turl, temp_tgz) catch |e| {
                     last_dl_err = e;
                     continue;
                 };
@@ -317,8 +320,7 @@ fn npmInstallWorker(ctx: *const NpmInstallWorkerCtx) void {
                     // 其他 worker 已创建或正在解压；轮询等待 package.json 出现后当作缓存命中建链
                     libs_io.deleteFileAbsolute(temp_tgz) catch {};
                     for (0..60) |_| {
-                        if (cache.getCachedPackageDir(page, ctx.cache_root, key)) |hit_dir| {
-                            defer page.free(hit_dir);
+                        if (cache.getCachedPackageDir(a, ctx.cache_root, key)) |hit_dir| {
                             if (libs_io.pathDirname(task.pkg_dest)) |parent_dest| libs_io.makePathAbsolute(parent_dest) catch {};
                             var link_target_buf: [libs_io.max_path_bytes]u8 = undefined;
                             const link_target = libs_io.realpath(hit_dir, &link_target_buf) catch hit_dir;
@@ -339,11 +341,11 @@ fn npmInstallWorker(ctx: *const NpmInstallWorkerCtx) void {
                 }
                 break :retry_extract;
             };
-            extractTarballToDir(page, temp_tgz, cache_dir_path) catch |e| {
+            extractTarballToDir(a, temp_tgz, cache_dir_path) catch |e| {
                 logFirstTarballExtractFailure(ctx, temp_tgz, e, task.name, task.version);
                 debugLogTarballExtractFailed(temp_tgz, e);
                 libs_io.deleteFileAbsolute(temp_tgz) catch {};
-                libs_io.deleteTreeAbsolute(page, cache_dir_path) catch {};
+                libs_io.deleteTreeAbsolute(a, cache_dir_path) catch {};
                 if (e == error.InvalidGzip and invalid_gzip_retries < 1) {
                     continue :retry_extract;
                 }
@@ -355,12 +357,11 @@ fn npmInstallWorker(ctx: *const NpmInstallWorkerCtx) void {
             };
             libs_io.deleteFileAbsolute(temp_tgz) catch {};
             // 解压后必须存在 package.json，否则视为失败、不建链
-            const pkg_json_path = libs_io.pathJoin(page, &.{ cache_dir_path, "package.json" }) catch |e| {
+            const pkg_json_path = libs_io.pathJoin(a, &.{ cache_dir_path, "package.json" }) catch |e| {
                 ctx.results[i] = e;
                 setFirstError(ctx, e, task.name, task.version);
                 break :retry_extract;
             };
-            defer page.free(pkg_json_path);
             libs_io.accessAbsolute(pkg_json_path, .{}) catch {
                 // 解压未抛错但 package.json 不存在：打日志并列出解压出的前几项，便于判断是 tar 结构不符（无 package/）还是空解压
                 logInstallFailure("[shu install] extract ok but package.json missing: {s}@{s} dir={s}\n", .{ task.name, task.version, cache_dir_path });
@@ -380,7 +381,7 @@ fn npmInstallWorker(ctx: *const NpmInstallWorkerCtx) void {
                     }
                     if (n == 0) logInstallFailure("  (no entries)\n", .{});
                 } else logInstallFailure("  (could not list dir)\n", .{});
-                libs_io.deleteTreeAbsolute(page, cache_dir_path) catch {};
+                libs_io.deleteTreeAbsolute(a, cache_dir_path) catch {};
                 ctx.results[i] = error.TarballExtractFailed;
                 setFirstError(ctx, error.TarballExtractFailed, task.name, task.version);
                 if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
@@ -421,13 +422,12 @@ const INSTALL_NETWORK_RETRIES = 3;
 /// 第 2、3 次重试前等待的纳秒数（指数退避 0.5s、1s），在瞬断恢复与总耗时之间折中。
 const INSTALL_NETWORK_RETRY_DELAYS_NS = [_]u64{ 500_000_000, 1_000_000_000 };
 
-/// 解析阶段 JSR 单条 worker：每 worker 持有一个 Client 复用连接，每 JSR_RESOLVE_CLIENT_REUSE_LIMIT 次请求重建 Client 避免长连接异常；结果写入 results[i]。
-/// 当前用 page_allocator，主线程合并后释放；后续可考虑 per-worker Arena（§1.2）。
+/// 解析阶段 JSR 单条 worker：每 worker 持有一个 Client 复用连接，每 JSR_RESOLVE_CLIENT_REUSE_LIMIT 次请求重建 Client 避免长连接异常；结果写入 results[i]。使用 ctx.allocator（Arena），join 后主线程 deinit（00 §1.2）。
 fn jsrResolveWorker(ctx: *const JsrResolveWorkerCtx) void {
-    const page = std.heap.page_allocator;
+    const a = ctx.allocator;
     const io = libs_process.getProcessIo() orelse return;
     while (true) {
-        var client = std.http.Client{ .allocator = page, .io = io };
+        var client = std.http.Client{ .allocator = a, .io = io };
         var count: usize = 0;
         while (count < JSR_RESOLVE_CLIENT_REUSE_LIMIT) : (count += 1) {
             const i = ctx.next_index.fetchAdd(1, .monotonic);
@@ -436,18 +436,18 @@ fn jsrResolveWorker(ctx: *const JsrResolveWorkerCtx) void {
                 return;
             }
             const item = ctx.items[i];
-            const jsr_spec = std.fmt.allocPrint(page, "jsr:{s}@{s}", .{ item.name, item.spec }) catch {
+            const jsr_spec = std.fmt.allocPrint(a, "jsr:{s}@{s}", .{ item.name, item.spec }) catch {
                 ctx.results[i].err = error.OutOfMemory;
                 client.deinit();
                 return;
             };
-            defer page.free(jsr_spec);
-            const version = jsr.resolveVersionFromMetaWithClient(&client, page, jsr_spec) catch |e| blk: {
+            // Arena：不在此处 free，主线程 deinit 时统一释放
+            const version = jsr.resolveVersionFromMetaWithClient(&client, a, jsr_spec) catch |e| blk: {
                 // 空 body 或非 JSON 常因连接被关/限流导致，用新 client 重试一次
                 if (e == error.JsrMetaEmptyResponse or e == error.JsrMetaNoJsonObject) {
-                    var retry_client = std.http.Client{ .allocator = page, .io = io };
+                    var retry_client = std.http.Client{ .allocator = a, .io = io };
                     defer retry_client.deinit();
-                    break :blk jsr.resolveVersionFromMetaWithClient(&retry_client, page, jsr_spec) catch |e2| {
+                    break :blk jsr.resolveVersionFromMetaWithClient(&retry_client, a, jsr_spec) catch |e2| {
                         ctx.results[i].err = e2;
                         client.deinit();
                         return;
@@ -457,16 +457,14 @@ fn jsrResolveWorker(ctx: *const JsrResolveWorkerCtx) void {
                 client.deinit();
                 return;
             };
-            var imports_list = jsr.fetchDenoJsonImportsFromRegistryOrJsoncWithClient(&client, page, item.name, version) catch |e| {
-                page.free(version);
+            var imports_list = jsr.fetchDenoJsonImportsFromRegistryOrJsoncWithClient(&client, a, item.name, version) catch |e| {
                 ctx.results[i].err = e;
                 client.deinit();
                 return;
             };
             if (imports_list) |*lst| {
-                defer lst.deinit(page);
-                const slice = page.dupe(jsr.DenoImportDep, lst.items) catch |e| {
-                    page.free(version);
+                defer lst.deinit(a);
+                const slice = a.dupe(jsr.DenoImportDep, lst.items) catch |e| {
                     ctx.results[i].err = e;
                     client.deinit();
                     return;
@@ -493,8 +491,8 @@ pub const InstallErrorDetail = struct {
 pub const InstallReporter = struct {
     ctx: ?*anyopaque = null,
     onResolving: ?*const fn (?*anyopaque, []const u8, usize, usize) void = null,
-    /// 解析阶段曾输出过 onResolving 时，在 onStart 前调用一次（跳过解析时不调用），供 CLI 在 Resolving 与 Installing 间输出空行。
-    onResolvingComplete: ?*const fn (?*anyopaque) void = null,
+    /// 解析阶段曾输出过 onResolving 时，在 onStart 前调用一次；resolving_elapsed_ms 为解析阶段耗时（毫秒），供 CLI 在「Resolving (N) name」下输出 Resolving Xms。
+    onResolvingComplete: ?*const fn (?*anyopaque, i64) void = null,
     onResolveFailure: ?*const fn (?*anyopaque) void = null,
     onStart: ?*const fn (?*anyopaque, usize) void = null,
     /// 下载阶段主线程轮询调用，更新进度条与第二行文案；total 与 onStart 一致；last_completed_name 为最近完成的一包名（主线程从共享缓冲读出，可为 null）。
@@ -502,10 +500,15 @@ pub const InstallReporter = struct {
     onPackage: ?*const fn (?*anyopaque, usize, usize, []const u8, []const u8, bool) void = null,
     /// elapsed_ms 由 install 从函数入口计时到 onDone 调用前，含 Resolving + Installing，供 CLI 显示真实总耗时
     onDone: ?*const fn (?*anyopaque, usize, usize, i64) void = null,
+    /// 若非 null，install 在 onDone 前写入解析阶段耗时（毫秒），供 CLI 显示 Resolving/Installing 分段
+    resolving_elapsed_ms: ?*i64 = null,
+    /// 若非 null，install 在 onDone 前写入安装阶段耗时（毫秒）
+    installing_elapsed_ms: ?*i64 = null,
     onPackageAdded: ?*const fn (?*anyopaque, []const u8, []const u8) void = null,
 };
 
 /// 根据 manifest 与 lockfile 安装依赖到 cwd/node_modules。若 added_names 非 null（add 流程），install 结束后对其中在 resolved 的包调用 reporter.onPackageAdded。
+/// 内部使用 allocator 做临时分配，不向调用方返回需 free 的切片；reporter/error_detail 由调用方管理。
 /// 若 error_detail 非 null，安装失败时会填入最后一次失败的 err 及包 name/version（由 allocator 分配，调用方 free name/version）。
 /// §1.2：整次 install 用 Arena 分配临时路径与 key，仅 resolved map 的 key/value 用主 allocator（供 save 后释放），减少 alloc/free 与碎片。
 /// 耗时统计：从本函数入口计时，onDone 时传入 elapsed_ms（含 Resolving + Installing），避免 CLI 只统计安装阶段造成虚假时间。
@@ -516,6 +519,9 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
         std.Io.Clock.Timestamp.now(io, .awake)
     else
         null;
+    // 解析阶段耗时（纳秒）与是否记录；仅当本轮曾输出 onResolving 时在 onResolvingComplete 前写入，供 onDone 前填 reporter
+    var resolving_elapsed_ns: i64 = 0;
+    var resolving_phase_recorded: bool = false;
     var loaded = manifest.Manifest.load(allocator, cwd) catch |e| {
         if (e == error.ManifestNotFound) return error.NoManifest;
         return e;
@@ -542,7 +548,7 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
             for (e.value_ptr.*.items) |p| allocator.free(p);
             e.value_ptr.*.deinit(allocator);
         }
-        locked_result.packages.deinit();
+        locked_result.packages.deinit(allocator);
         for (locked_result.root_dependencies.items) |p| allocator.free(p);
         locked_result.root_dependencies.deinit(allocator);
         for (locked_result.jsr_packages.items) |p| allocator.free(p);
@@ -570,8 +576,8 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
         }
         resolved.deinit();
     }
-    // 每个包名 -> 其 dependencies 的包名列表（用于在包内建 node_modules/<dep> 符号链接；直接依赖在 node_modules，传递依赖在 .shu）
-    var deps_of = std.StringArrayHashMap(std.ArrayList([]const u8)).init(allocator);
+    // 每个包名 -> 其 dependencies 的包名列表（用于在包内建 node_modules/<dep> 符号链接；直接依赖在 node_modules，传递依赖在 .shu）。Unmanaged（01 §1.2）。
+    var deps_of = std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)){};
     defer {
         var it = deps_of.iterator();
         while (it.next()) |e| {
@@ -579,7 +585,7 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
             for (e.value_ptr.*.items) |p| allocator.free(p);
             e.value_ptr.*.deinit(allocator);
         }
-        deps_of.deinit();
+        deps_of.deinit(allocator);
     }
     // 解析阶段得到的 name -> tarball_url，供安装阶段未命中缓存时直接下载，避免重复解析（优化 D）
     var resolved_tarball_urls = std.StringArrayHashMap([]const u8).init(allocator);
@@ -604,7 +610,7 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
         defer allocator.free(parsed.name);
         defer allocator.free(parsed.version);
         if (!resolved.contains(parsed.name)) try resolved.put(try allocator.dupe(u8, parsed.name), try allocator.dupe(u8, parsed.version));
-        var list = std.ArrayList([]const u8).initCapacity(allocator, e.value_ptr.*.items.len) catch return error.OutOfMemory;
+        var list = std.ArrayListUnmanaged([]const u8).initCapacity(allocator, e.value_ptr.*.items.len) catch return error.OutOfMemory;
         for (e.value_ptr.*.items) |dep_at_ver| {
             const dp = lockfile.parseNameAtVersion(allocator, dep_at_ver) catch continue;
             defer allocator.free(dp.name);
@@ -612,7 +618,7 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
             try list.append(allocator, try allocator.dupe(u8, dp.name));
         }
         const name_dup = try allocator.dupe(u8, parsed.name);
-        const gop = try deps_of.getOrPut(name_dup);
+        const gop = try deps_of.getOrPut(allocator, name_dup);
         if (gop.found_existing) {
             allocator.free(name_dup);
             for (gop.value_ptr.*.items) |p| allocator.free(p);
@@ -749,7 +755,6 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
             }
         }
 
-        const page = std.heap.page_allocator;
         // 按层（wave）处理：每层先收集待处理项，npm 并行、JSR 并发拉 version + deno.json，再合并结果并扩展 to_process
         while (resolution_idx < to_process.items.len) {
             const wave_end = to_process.items.len;
@@ -808,7 +813,7 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                     continue;
                 };
                 defer allocator.free(npm_results);
-                const n_workers = @min(npm_indices.items.len, NPM_RESOLVE_MAX_WORKERS);
+                const n_workers = @min(npm_indices.items.len, libs_process.getConcurrencyCapForRequests(NPM_RESOLVE_MAX_WORKERS));
                 var npm_threads = std.ArrayList(std.Thread).initCapacity(allocator, n_workers) catch |e| {
                     if (first_error == null) first_error = map_install_err(e);
                     for (work_items) |wi| allocator.free(wi.registry_url);
@@ -816,7 +821,14 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                 };
                 defer npm_threads.deinit(allocator);
                 var npm_next = std.atomic.Value(usize).init(0);
-                const npm_ctx = NpmResolveWorkerCtx{ .items = work_items, .results = npm_results.ptr, .next_index = &npm_next };
+                var npm_arena = std.heap.ArenaAllocator.init(allocator);
+                defer npm_arena.deinit();
+                const npm_ctx = NpmResolveWorkerCtx{
+                    .items = work_items,
+                    .results = npm_results.ptr,
+                    .next_index = &npm_next,
+                    .allocator = npm_arena.allocator(),
+                };
                 for (0..n_workers) |_| {
                     npm_threads.append(allocator, std.Thread.spawn(.{}, npmResolveWorker, .{&npm_ctx}) catch |e2| {
                         if (first_error == null) first_error = map_install_err(e2);
@@ -885,7 +897,7 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                         allocator.free(old.value);
                         allocator.free(name_dup);
                     }
-                    var dep_names = std.ArrayList([]const u8).initCapacity(allocator, deps.count()) catch {
+                    var dep_names = std.ArrayListUnmanaged([]const u8).initCapacity(allocator, deps.count()) catch {
                         if (first_error == null) first_error = error.OutOfMemory;
                         if (from_probe) {
                             allocator.free(version);
@@ -897,13 +909,6 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                             }
                             @constCast(&deps).deinit();
                         } else {
-                            page.free(version);
-                            page.free(tarball_url);
-                            var dit = deps.iterator();
-                            while (dit.next()) |e| {
-                                page.free(e.key_ptr.*);
-                                page.free(e.value_ptr.*);
-                            }
                             @constCast(&deps).deinit();
                         }
                         continue;
@@ -925,13 +930,6 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                                 }
                                 @constCast(&deps).deinit();
                             } else {
-                                page.free(version);
-                                page.free(tarball_url);
-                                var dit = deps.iterator();
-                                while (dit.next()) |e2| {
-                                    page.free(e2.key_ptr.*);
-                                    page.free(e2.value_ptr.*);
-                                }
                                 @constCast(&deps).deinit();
                             }
                             if (first_error == null) first_error = error.OutOfMemory;
@@ -951,13 +949,6 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                                 }
                                 @constCast(&deps).deinit();
                             } else {
-                                page.free(version);
-                                page.free(tarball_url);
-                                var dit = deps.iterator();
-                                while (dit.next()) |e2| {
-                                    page.free(e2.key_ptr.*);
-                                    page.free(e2.value_ptr.*);
-                                }
                                 @constCast(&deps).deinit();
                             }
                             if (first_error == null) first_error = error.OutOfMemory;
@@ -977,13 +968,6 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                                     }
                                     @constCast(&deps).deinit();
                                 } else {
-                                    page.free(version);
-                                    page.free(tarball_url);
-                                    var dit = deps.iterator();
-                                    while (dit.next()) |e2| {
-                                        page.free(e2.key_ptr.*);
-                                        page.free(e2.value_ptr.*);
-                                    }
                                     @constCast(&deps).deinit();
                                 }
                                 if (first_error == null) first_error = error.OutOfMemory;
@@ -997,7 +981,7 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                         ptr.* = dep_names;
                     } else {
                         const name_key = try allocator.dupe(u8, item.name);
-                        deps_of.put(name_key, dep_names) catch {
+                        deps_of.put(allocator, name_key, dep_names) catch {
                             allocator.free(name_key);
                             for (dep_names.items) |p| allocator.free(p);
                             dep_names.deinit(allocator);
@@ -1011,13 +995,6 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                                 }
                                 @constCast(&deps).deinit();
                             } else {
-                                page.free(version);
-                                page.free(tarball_url);
-                                var dit = deps.iterator();
-                                while (dit.next()) |e2| {
-                                    page.free(e2.key_ptr.*);
-                                    page.free(e2.value_ptr.*);
-                                }
                                 @constCast(&deps).deinit();
                             }
                             if (first_error == null) first_error = error.OutOfMemory;
@@ -1033,25 +1010,9 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                             allocator.free(e.value_ptr.*);
                         }
                         @constCast(&deps).deinit();
-                        // 首包用了 probe 结果，worker 仍写入了 results[ni]，须释放避免泄漏
-                        if (npm_results[ni].version) |v| page.free(v);
-                        if (npm_results[ni].tarball_url) |tb| page.free(tb);
-                        if (npm_results[ni].dependencies) |*d| {
-                            var dit2 = d.iterator();
-                            while (dit2.next()) |e| {
-                                page.free(e.key_ptr.*);
-                                page.free(e.value_ptr.*);
-                            }
-                            d.deinit();
-                        }
+                        // 首包用了 probe 结果，worker 仍写入了 results[ni]，其内容来自 Arena，由 npm_arena.deinit 统一释放
+                        if (npm_results[ni].dependencies) |*d| d.deinit();
                     } else {
-                        page.free(version);
-                        page.free(tarball_url);
-                        var dit = deps.iterator();
-                        while (dit.next()) |e| {
-                            page.free(e.key_ptr.*);
-                            page.free(e.value_ptr.*);
-                        }
                         @constCast(&deps).deinit();
                     }
                 }
@@ -1080,7 +1041,7 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                     }
                     if (jsr_results_opt) |jsr_results| {
                         defer allocator.free(jsr_results);
-                        const n_workers = @min(jsr_indices.items.len, JSR_RESOLVE_MAX_WORKERS);
+                        const n_workers = @min(jsr_indices.items.len, libs_process.getConcurrencyCapForRequests(JSR_RESOLVE_MAX_WORKERS));
                         jsr_parallel: {
                             var threads = std.ArrayList(std.Thread).initCapacity(allocator, n_workers) catch |e| {
                                 if (first_error == null) first_error = map_install_err(e);
@@ -1088,10 +1049,13 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                             };
                             defer threads.deinit(allocator);
                             var next_atomic = std.atomic.Value(usize).init(0);
-                            const ctx = JsrResolveWorkerCtx{
+                            var jsr_arena = std.heap.ArenaAllocator.init(allocator);
+                            defer jsr_arena.deinit();
+                            var ctx = JsrResolveWorkerCtx{
                                 .items = jsr_items_buf,
                                 .results = jsr_results.ptr,
                                 .next_index = &next_atomic,
+                                .allocator = jsr_arena.allocator(),
                             };
                             var t: usize = 0;
                             while (t < n_workers) : (t += 1) {
@@ -1107,7 +1071,7 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                             }
                             for (threads.items) |th| th.join();
 
-                            // 主线程合并 JSR 结果到 resolved/deps_of/to_process，并释放 worker 用 page 分配的内存
+                            // 主线程合并 JSR 结果到 resolved/deps_of/to_process；worker 分配由 jsr_arena.deinit 统一释放（00 §1.2）
                             for (jsr_indices.items, jsr_results) |pi, res| {
                                 const item = to_process.items[pi];
                                 if (res.err) |e| {
@@ -1127,7 +1091,6 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                                     try allocator.dupe(u8, ver)
                                 else
                                     try allocator.dupe(u8, res.version);
-                                page.free(res.version);
                                 if (resolved.getPtr(item.name)) |vptr| {
                                     allocator.free(vptr.*);
                                     vptr.* = version_owned;
@@ -1144,7 +1107,7 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                                         continue;
                                     };
                                 }
-                                var dep_names = std.ArrayList([]const u8).initCapacity(allocator, 0) catch {
+                                var dep_names = std.ArrayListUnmanaged([]const u8).initCapacity(allocator, 0) catch {
                                     if (first_error == null) first_error = error.OutOfMemory;
                                     continue;
                                 };
@@ -1160,8 +1123,6 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                                     if (res.imports) |imports| {
                                         for (imports) |dep_entry| {
                                             const dep_name_dup = allocator.dupe(u8, dep_entry.name) catch {
-                                                page.free(dep_entry.name);
-                                                page.free(dep_entry.spec);
                                                 for (dep_names.items) |p| allocator.free(p);
                                                 dep_names.deinit(allocator);
                                                 freed_in_catch = true;
@@ -1170,8 +1131,6 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                                             };
                                             dep_names.append(allocator, dep_name_dup) catch {
                                                 allocator.free(dep_name_dup);
-                                                page.free(dep_entry.name);
-                                                page.free(dep_entry.spec);
                                                 for (dep_names.items) |p| allocator.free(p);
                                                 dep_names.deinit(allocator);
                                                 freed_in_catch = true;
@@ -1180,8 +1139,6 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                                             };
                                             if (!resolved.contains(dep_entry.name)) {
                                                 const tp_name = allocator.dupe(u8, dep_entry.name) catch {
-                                                    page.free(dep_entry.name);
-                                                    page.free(dep_entry.spec);
                                                     for (dep_names.items) |p| allocator.free(p);
                                                     dep_names.deinit(allocator);
                                                     freed_in_catch = true;
@@ -1190,8 +1147,6 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                                                 };
                                                 const tp_spec = allocator.dupe(u8, dep_entry.spec) catch {
                                                     allocator.free(tp_name);
-                                                    page.free(dep_entry.name);
-                                                    page.free(dep_entry.spec);
                                                     for (dep_names.items) |p| allocator.free(p);
                                                     dep_names.deinit(allocator);
                                                     freed_in_catch = true;
@@ -1206,8 +1161,6 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                                                 }) catch {
                                                     allocator.free(tp_name);
                                                     allocator.free(tp_spec);
-                                                    page.free(dep_entry.name);
-                                                    page.free(dep_entry.spec);
                                                     for (dep_names.items) |p| allocator.free(p);
                                                     dep_names.deinit(allocator);
                                                     freed_in_catch = true;
@@ -1215,10 +1168,7 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                                                     break :merge_jsr;
                                                 };
                                             }
-                                            page.free(dep_entry.name);
-                                            page.free(dep_entry.spec);
                                         }
-                                        page.free(imports);
                                     }
                                     const name_key = allocator.dupe(u8, item.name) catch {
                                         for (dep_names.items) |p| allocator.free(p);
@@ -1228,7 +1178,7 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                                         break :merge_jsr;
                                     };
                                     // 同一包名可能多轮出现，fetchPut 只更新 value 不替换 key，返回的旧 key 仍在 map 中，不能 free
-                                    const old_kv = deps_of.fetchPut(name_key, dep_names) catch {
+                                    const old_kv = deps_of.fetchPut(allocator, name_key, dep_names) catch {
                                         allocator.free(name_key);
                                         for (dep_names.items) |p| allocator.free(p);
                                         dep_names.deinit(allocator);
@@ -1238,7 +1188,7 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                                     };
                                     if (old_kv) |kv| {
                                         allocator.free(name_key); // map 保留旧 key，本次 dupe 的 key 未写入，须释放防泄漏
-                                        var old_list = kv.value;
+                                        var old_list = kv.value; // 拷贝出 value 以便 deinit（fetchPut 返回 const）
                                         for (old_list.items) |p| allocator.free(p);
                                         old_list.deinit(allocator);
                                         // 不释放 kv.key：fetchPut 仅更新 value，key 仍由 map 持有，defer 中会统一 free
@@ -1317,7 +1267,17 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
         };
         d.close(io);
     }
-    if (resolving_emitted) if (reporter) |r| if (r.onResolvingComplete) |cb| cb(r.ctx);
+    if (resolving_emitted and install_start_ts != null) {
+        if (libs_process.getProcessIo()) |prog_io| {
+            const dur = install_start_ts.?.untilNow(prog_io);
+            resolving_elapsed_ns = @intCast(dur.raw.nanoseconds);
+            resolving_phase_recorded = true;
+        }
+    }
+    if (resolving_emitted) if (reporter) |r| if (r.onResolvingComplete) |cb| {
+        const resolving_ms: i64 = if (resolving_phase_recorded) @intCast(@divTrunc(if (resolving_elapsed_ns < 0) 0 else resolving_elapsed_ns, 1_000_000)) else -1;
+        cb(r.ctx, resolving_ms);
+    };
     if (reporter) |r| {
         if (r.onStart) |cb| {
             // add 流程：进度条与统计只按「本次添加的包」数量，不按全量依赖数
@@ -1327,9 +1287,13 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
     }
 
     first_error = null;
-    // 本次 install 内创建并持有的 JSR 下载池，结束时 deinit 避免 GPA 泄漏（不再使用全局 getOrCreatePool 的池）
+    // 本次 install 内创建并持有的 JSR 下载池，结束时 deinit 避免 GPA 泄漏（不再使用全局 getOrCreatePool 的池）；io_list 由池使用，须在 deinit 后 free。
     var jsr_pool: ?*jsr.JsrDownloadPool = null;
-    defer if (jsr_pool) |p| p.deinit(allocator);
+    var jsr_io_list_owned: ?[]std.Io = null;
+    defer {
+        if (jsr_pool) |p| p.deinit(allocator);
+        if (jsr_io_list_owned) |s| allocator.free(s);
+    }
     var new_index: usize = 0;
     // add 流程下仅对 added 包报告进度，用 reported_index 作进度条 current，避免出现 326/1
     var reported_index: usize = 0;
@@ -1398,7 +1362,7 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
             continue;
         }
         if (jsr_packages.contains(name)) {
-            if (jsr_pool == null) jsr_pool = try jsr.JsrDownloadPool.init(allocator);
+            // 池延后到循环后创建，以便注入专用 Io（避免与 npm worker 共享 process Io 导致 EISCONN）
             jsr_tasks.append(allocator, .{ .name = name, .version = version, .pkg_dest = pkg_dest }) catch |e| {
                 if (first_error == null) first_error = map_install_err(e);
                 continue;
@@ -1431,17 +1395,44 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
     var last_completed_name = LastCompletedName{};
     const want_progress = total_work_items > 0 and reporter != null and reporter.?.onProgress != null;
 
-    // JSR 任务并行执行（多 worker 向共享 JsrDownloadPool 投递，池内并发拉取+写盘）
+    // 结果数组：第二遍按 install_order 报告时按 jsr_task_idx_arr/npm_task_idx_arr 索引，无任务时长度 0 即可。
     const jsr_results = allocator.alloc(?anyerror, jsr_tasks.items.len) catch return error.OutOfMemory;
     defer allocator.free(jsr_results);
-    if (jsr_tasks.items.len > 0 and jsr_pool != null) {
+    for (jsr_results) |*v| v.* = null;
+    const npm_results = allocator.alloc(?anyerror, npm_tasks.items.len) catch return error.OutOfMemory;
+    defer allocator.free(npm_results);
+    for (npm_results) |*v| v.* = null;
+
+    // 每 worker 独立 Io（每线程一个 Io 环，00 §3.5/§4）：根除 EISCONN、无锁、提升缓存局部性；Threaded 数组按 64 字节对齐分配减轻 False Sharing（00 §5.3）。
+    const have_jsr = jsr_tasks.items.len > 0;
+    const have_npm = npm_tasks.items.len > 0;
+    const n_jsr_workers: usize = if (have_jsr) @min(jsr_tasks.items.len, libs_process.getConcurrencyCap(JSR_INSTALL_MAX_WORKERS)) else 0;
+    const n_npm_workers: usize = if (have_npm) @min(npm_tasks.items.len, libs_process.getConcurrencyCap(NPM_INSTALL_MAX_WORKERS)) else 0;
+    var threaded_jsr_arr: []std.Io.Threaded = &.{};
+    var threaded_npm_arr: []std.Io.Threaded = &.{};
+    if (have_jsr and n_jsr_workers > 0) {
+        threaded_jsr_arr = allocator.alloc(std.Io.Threaded, n_jsr_workers) catch return error.OutOfMemory;
+        for (threaded_jsr_arr) |*t| t.* = std.Io.Threaded.init(allocator, .{ .environ = std.process.Environ.empty });
+    }
+    if (have_npm and n_npm_workers > 0) {
+        threaded_npm_arr = allocator.alloc(std.Io.Threaded, n_npm_workers) catch return error.OutOfMemory;
+        for (threaded_npm_arr) |*t| t.* = std.Io.Threaded.init(allocator, .{ .environ = std.process.Environ.empty });
+    }
+    if (have_jsr and threaded_jsr_arr.len > 0) {
+        const jsr_io_list = allocator.alloc(std.Io, n_jsr_workers) catch return error.OutOfMemory;
+        jsr_io_list_owned = jsr_io_list;
+        for (threaded_jsr_arr, jsr_io_list) |*t, *slot| slot.* = t.io();
+        jsr_pool = try jsr.JsrDownloadPool.init(allocator, .{ .io_list = jsr_io_list });
+    }
+
+    // JSR 与 npm 安装并行：先 spawn 两组 worker，再统一进度轮询，最后一起 join；总耗时 ≈ max(JSR 时间, npm 时间)。
+    var jsr_first_err: ?anyerror = null;
+    var jsr_err_mutex = std.Io.Mutex.init;
+    var jsr_threads = std.ArrayList(std.Thread).initCapacity(allocator, 0) catch return error.OutOfMemory;
+    defer jsr_threads.deinit(allocator);
+    if (have_jsr and jsr_pool != null) {
         const pool = jsr_pool.?;
-        for (jsr_results) |*v| v.* = null;
-        var jsr_first_err: ?anyerror = null;
-        var jsr_err_mutex = std.Io.Mutex.init;
-        const n_jsr_workers = @min(jsr_tasks.items.len, JSR_INSTALL_MAX_WORKERS);
-        var jsr_threads = std.ArrayList(std.Thread).initCapacity(allocator, n_jsr_workers) catch return error.OutOfMemory;
-        defer jsr_threads.deinit(allocator);
+        try jsr_threads.ensureTotalCapacity(allocator, n_jsr_workers);
         var jsr_next = std.atomic.Value(usize).init(0);
         const jsr_ctx = JsrInstallWorkerCtx{
             .tasks = jsr_tasks.items,
@@ -1460,44 +1451,36 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
         while (j < n_jsr_workers) : (j += 1) {
             jsr_threads.append(allocator, std.Thread.spawn(.{}, jsrInstallWorker, .{&jsr_ctx}) catch |e| {
                 for (jsr_threads.items) |th| th.join();
+                for (threaded_jsr_arr) |*t| t.deinit();
+                for (threaded_npm_arr) |*t| t.deinit();
+                if (threaded_jsr_arr.len > 0) allocator.free(threaded_jsr_arr);
+                if (threaded_npm_arr.len > 0) allocator.free(threaded_npm_arr);
                 return e;
             }) catch |e| {
                 for (jsr_threads.items) |th| th.join();
+                for (threaded_jsr_arr) |*t| t.deinit();
+                for (threaded_npm_arr) |*t| t.deinit();
+                if (threaded_jsr_arr.len > 0) allocator.free(threaded_jsr_arr);
+                if (threaded_npm_arr.len > 0) allocator.free(threaded_npm_arr);
                 return e;
             };
         }
-        while (want_progress and install_completed_count.load(.monotonic) < jsr_tasks.items.len) {
-            const cur = install_completed_count.load(.monotonic);
-            var name_buf: [64]u8 = undefined;
-            var name_slice: ?[]const u8 = null;
-            const prog_io = libs_process.getProcessIo() orelse break;
-            last_completed_name.mutex.lock(prog_io) catch break;
-            if (last_completed_name.len > 0) {
-                @memcpy(name_buf[0..last_completed_name.len], last_completed_name.buf[0..last_completed_name.len]);
-                name_slice = name_buf[0..last_completed_name.len];
-            }
-            last_completed_name.mutex.unlock(prog_io);
-            if (reporter.?.onProgress) |onProg| onProg(reporter.?.ctx, cur, total_work_items, name_slice);
-            std.Io.sleep(prog_io, std.Io.Duration.fromNanoseconds(80_000_000), .awake) catch {}; // 80ms
-        }
-        for (jsr_threads.items) |th| th.join();
-        if (jsr_first_err) |e| first_error = map_install_err(e);
     }
-    // 优化 B：npm 任务并行执行（worker 池）
-    const npm_results = allocator.alloc(?anyerror, npm_tasks.items.len) catch return error.OutOfMemory;
-    defer allocator.free(npm_results);
-    if (npm_tasks.items.len > 0) {
-        for (npm_results) |*v| v.* = null;
-        var npm_first_err: ?anyerror = null;
-        var npm_err_mutex = std.Io.Mutex.init;
-        var npm_first_extract_logged = std.atomic.Value(bool).init(false);
-        const n_workers = @min(npm_tasks.items.len, NPM_INSTALL_MAX_WORKERS);
-        var threads = std.ArrayList(std.Thread).initCapacity(allocator, n_workers) catch return error.OutOfMemory;
-        defer threads.deinit(allocator);
+    var npm_first_err: ?anyerror = null;
+    var npm_err_mutex = std.Io.Mutex.init;
+    var npm_first_extract_logged = std.atomic.Value(bool).init(false);
+    var npm_threads = std.ArrayList(std.Thread).initCapacity(allocator, 0) catch return error.OutOfMemory;
+    defer npm_threads.deinit(allocator);
+    // npm worker 的 Arena 与 ctx 需在 join 之后才释放，故不在此块内 defer，改在 join 后统一释放
+    var npm_install_arenas: []std.heap.ArenaAllocator = &.{};
+    var npm_worker_ctxs: []NpmInstallWorkerCtx = &.{};
+    if (have_npm) {
+        const n_workers = @min(npm_tasks.items.len, libs_process.getConcurrencyCap(NPM_INSTALL_MAX_WORKERS));
+        try npm_threads.ensureTotalCapacity(allocator, n_workers);
         var next_atomic = std.atomic.Value(usize).init(0);
-        // 每个 worker 必须使用独立的 ctx 副本与唯一的 worker_id，否则多线程会共享同一栈上 worker_ctx，最终都读到最后一个 worker_id，共用同一临时文件导致覆盖与 TarballExtractFailed。
-        var worker_ctxs = allocator.alloc(NpmInstallWorkerCtx, n_workers) catch return error.OutOfMemory;
-        defer allocator.free(worker_ctxs);
+        npm_install_arenas = allocator.alloc(std.heap.ArenaAllocator, n_workers) catch return error.OutOfMemory;
+        for (npm_install_arenas) |*arena| arena.* = std.heap.ArenaAllocator.init(allocator);
+        npm_worker_ctxs = allocator.alloc(NpmInstallWorkerCtx, n_workers) catch return error.OutOfMemory;
         const base_ctx = NpmInstallWorkerCtx{
             .tasks = npm_tasks.items,
             .results = npm_results.ptr,
@@ -1510,37 +1493,65 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
             .error_detail = error_detail,
             .main_allocator = allocator,
             .worker_id = 0,
+            .allocator = undefined,
+            .io = undefined, // 每 worker 在下面赋 threaded_npm_arr[t].io()
             .install_completed_count = if (want_progress) &install_completed_count else null,
             .last_completed_name = if (want_progress) &last_completed_name else null,
         };
         for (0..n_workers) |t| {
-            worker_ctxs[t] = base_ctx;
-            worker_ctxs[t].worker_id = t;
-            threads.append(allocator, std.Thread.spawn(.{}, npmInstallWorker, .{&worker_ctxs[t]}) catch |e| {
-                for (threads.items) |th| th.join();
+            npm_worker_ctxs[t] = base_ctx;
+            npm_worker_ctxs[t].worker_id = t;
+            npm_worker_ctxs[t].allocator = npm_install_arenas[t].allocator();
+            npm_worker_ctxs[t].io = threaded_npm_arr[t].io();
+            npm_threads.append(allocator, std.Thread.spawn(.{}, npmInstallWorker, .{&npm_worker_ctxs[t]}) catch |e| {
+                for (npm_threads.items) |th| th.join();
+                if (have_jsr) for (jsr_threads.items) |th| th.join();
+                for (threaded_jsr_arr) |*tx| tx.deinit();
+                for (threaded_npm_arr) |*tx| tx.deinit();
+                if (threaded_jsr_arr.len > 0) allocator.free(threaded_jsr_arr);
+                if (threaded_npm_arr.len > 0) allocator.free(threaded_npm_arr);
                 return e;
             }) catch |e| {
-                for (threads.items) |th| th.join();
+                for (npm_threads.items) |th| th.join();
+                if (have_jsr) for (jsr_threads.items) |th| th.join();
+                for (threaded_jsr_arr) |*tx| tx.deinit();
+                for (threaded_npm_arr) |*tx| tx.deinit();
+                if (threaded_jsr_arr.len > 0) allocator.free(threaded_jsr_arr);
+                if (threaded_npm_arr.len > 0) allocator.free(threaded_npm_arr);
                 return e;
             };
         }
-        while (want_progress and install_completed_count.load(.monotonic) < total_work_items) {
-            const cur = install_completed_count.load(.monotonic);
-            var name_buf: [64]u8 = undefined;
-            var name_slice: ?[]const u8 = null;
-            const prog_io = libs_process.getProcessIo() orelse break;
-            last_completed_name.mutex.lock(prog_io) catch break;
-            if (last_completed_name.len > 0) {
-                @memcpy(name_buf[0..last_completed_name.len], last_completed_name.buf[0..last_completed_name.len]);
-                name_slice = name_buf[0..last_completed_name.len];
-            }
-            last_completed_name.mutex.unlock(prog_io);
-            if (reporter.?.onProgress) |onProg| onProg(reporter.?.ctx, cur, total_work_items, name_slice);
-            std.Io.sleep(prog_io, std.Io.Duration.fromNanoseconds(80_000_000), .awake) catch {}; // 80ms
-        }
-        for (threads.items) |th| th.join();
-        if (npm_first_err) |e| first_error = map_install_err(e);
     }
+    // 统一进度轮询：JSR 与 npm 并行进行，主线程只等总完成数
+    while (want_progress and install_completed_count.load(.monotonic) < total_work_items) {
+        const cur = install_completed_count.load(.monotonic);
+        var name_buf: [64]u8 = undefined;
+        var name_slice: ?[]const u8 = null;
+        const prog_io = libs_process.getProcessIo() orelse break;
+        last_completed_name.mutex.lock(prog_io) catch break;
+        if (last_completed_name.len > 0) {
+            @memcpy(name_buf[0..last_completed_name.len], last_completed_name.buf[0..last_completed_name.len]);
+            name_slice = name_buf[0..last_completed_name.len];
+        }
+        last_completed_name.mutex.unlock(prog_io);
+        if (reporter.?.onProgress) |onProg| onProg(reporter.?.ctx, cur, total_work_items, name_slice);
+        std.Io.sleep(prog_io, std.Io.Duration.fromNanoseconds(80_000_000), .awake) catch {}; // 80ms
+    }
+    if (have_jsr) {
+        for (jsr_threads.items) |th| th.join();
+        if (jsr_first_err) |e| first_error = map_install_err(e);
+    }
+    if (have_npm) {
+        for (npm_threads.items) |th| th.join();
+        if (npm_first_err) |e| first_error = map_install_err(e);
+        for (npm_install_arenas) |*arena| arena.deinit();
+        allocator.free(npm_install_arenas);
+        allocator.free(npm_worker_ctxs);
+    }
+    for (threaded_jsr_arr) |*t| t.deinit();
+    for (threaded_npm_arr) |*t| t.deinit();
+    if (threaded_jsr_arr.len > 0) allocator.free(threaded_jsr_arr);
+    if (threaded_npm_arr.len > 0) allocator.free(threaded_npm_arr);
     // 第二遍：按 install_order 报告进度（已安装 / JSR 与 npm 按 results 决定 onPackage 或记错）。
     // add 流程（added_names 非 null）时仅对用户添加的包调用 onPackage 打印，不打印全部传递依赖。
     const shouldReportPackage = struct {
@@ -1695,6 +1706,19 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                 const ns = dur.raw.nanoseconds;
                 break :blk @intCast(@divTrunc(if (ns < 0) 0 else ns, 1_000_000));
             } else 0;
+            if (r.resolving_elapsed_ms) |ptr| {
+                if (resolving_phase_recorded) {
+                    ptr.* = @intCast(@divTrunc(if (resolving_elapsed_ns < 0) 0 else resolving_elapsed_ns, 1_000_000));
+                }
+                // 未解析时保持调用方初始值（如 -1），便于 CLI 不显示分段
+            }
+            if (r.installing_elapsed_ms) |ptr| {
+                if (resolving_phase_recorded) {
+                    const resolving_ms: i64 = @intCast(@divTrunc(if (resolving_elapsed_ns < 0) 0 else resolving_elapsed_ns, 1_000_000));
+                    ptr.* = @as(i64, @intCast(elapsed_ms)) - resolving_ms;
+                    if (ptr.* < 0) ptr.* = 0;
+                }
+            }
             cb(r.ctx, done_total, done_new, @as(i64, @intCast(elapsed_ms)));
         }
     }
