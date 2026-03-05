@@ -20,8 +20,12 @@ pub fn appendJsonEscaped(list: *std.ArrayList(u8), allocator: std.mem.Allocator,
     }
 }
 
-/// 构造传给 handler 的 JS Request 对象：{ url, method, headers }
+/// JSC 回收 NoCopy body TypedArray 时调用的空实现；body 来自 read_buf 或请求 Arena，由请求生命周期统一释放
+fn requestBodyNoOpDeallocator(_: *anyopaque, _: ?*anyopaque) callconv(.c) void {}
+
+/// 构造传给 handler 的 JS Request 对象：{ url, method, headers [, body] }
 /// 精简 JSC 调用：url/method 各 1 次 CreateString+SetProperty；headers 用 JSON.parse 一次生成
+/// body（若有）：零拷贝暴露为 Uint8Array（NoCopy），生命周期约定为「至 handler 返回或本连接下次复用时失效」，不得异步持有
 pub fn makeRequestObject(ctx: jsc.JSContextRef, allocator: std.mem.Allocator, parsed: *const types.ParsedRequest) ?jsc.JSObjectRef {
     const req = jsc.JSObjectMake(ctx, null, null);
     const k_url = jsc.JSStringCreateWithUTF8CString("url");
@@ -88,6 +92,24 @@ pub fn makeRequestObject(ctx: jsc.JSContextRef, allocator: std.mem.Allocator, pa
         _ = jsc.JSObjectSetProperty(ctx, req, k_headers, headers_obj_val, jsc.kJSPropertyAttributeNone, null);
     } else {
         _ = jsc.JSObjectSetProperty(ctx, req, k_headers, jsc.JSObjectMake(ctx, null, null), jsc.kJSPropertyAttributeNone, null);
+    }
+    // 请求 body 零拷贝暴露：NoCopy Uint8Array，生命周期至 handler 返回或连接下次复用（00 §1.6）
+    if (parsed.body) |body_slice| {
+        const k_body = jsc.JSStringCreateWithUTF8CString("body");
+        defer jsc.JSStringRelease(k_body);
+        var exc: jsc.JSValueRef = undefined;
+        const arr = jsc.JSObjectMakeTypedArrayWithBytesNoCopy(
+            ctx,
+            .Uint8Array,
+            @ptrCast(@constCast(body_slice.ptr)),
+            body_slice.len,
+            requestBodyNoOpDeallocator,
+            null,
+            @ptrCast(&exc),
+        );
+        if (arr != null) {
+            _ = jsc.JSObjectSetProperty(ctx, req, k_body, arr.?, jsc.kJSPropertyAttributeNone, null);
+        }
     }
     return req;
 }
