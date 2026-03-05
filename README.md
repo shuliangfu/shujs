@@ -104,7 +104,7 @@ flowchart TB
 | [x]  | **shu run &lt;entry&gt;** | 执行单文件 .js / .ts / .tsx；TS/TSX 自动类型擦除后执行；支持 --allow-net、--allow-read、--allow-env、--allow-write、--allow-exec、--lang                                                  |
 | [x]  | **cli/args.zig**          | 全局参数解析（权限、help 等）                                                                                                                                                             |
 | [x]  | **shu install**           | 安装依赖到 node_modules：npm + JSR 解析、lockfile（shu.lock）、并行解析（A）、并行安装（B）、lockfile 一致时跳过解析（C）、解析阶段存 tarball_url 免重复请求（D）、JSR 16 worker 并行安装 |
-| [ ]  | **其他子命令**            | build、test、check、lint、fmt 已注册，build/test 部分实现，其余为占位                                                                                                                     |
+| [ ]  | **其他子命令**            | build、test、check、lint、fmt 已注册；**test** 已实现发现与执行（shu 模块单元测试为主），待补 node/deno/bun 兼容测试与 --browser；build 部分实现，其余为占位                                                                                     |
 
 ---
 
@@ -129,13 +129,14 @@ flowchart TB
 | [x]  | **bindings**                 | 全局 API 注册（console、定时器、fetch、process、**dirname/**filename、Shu._、Buffer、require、Bun._、node:\* 等）                                                       |
 | [x]  | **run_options / permission** | 工作目录、argv、权限（allow_net/read/env/write/exec）、locale、is_forked                                                                                                |
 | [x]  | **io_core**                  | 高并发 I/O：Darwin（kqueue）、Linux（io_uring）、Windows（IOCP）；ChunkAllocator、ThreadLocalChunkCache；SIMD 头部扫描（indexOfCrLfCrLf）；零拷贝解析与全链路不复制头部 |
+| [x]  | **JSC 边界安全与稳定性**     | 对 GetProperty/arguments 取值先 JSValueToObject 或 undefined/null 检查再 JSObjectIsFunction/Call，避免 tagged 值当指针导致段错误（zlib、dns、net、fs、server、async、perf_hooks 等）；net 模块 host/path 所有权（host_owned/path_owned）仅对 allocator 分配内存 free，避免对字面量 free 导致 Bus error |
 
 ---
 
 ### 📦 四、内置模块（shu:xxx，Zig 实现）
 
 以下模块已实现并可 `require('shu:xxx')` 或
-`import from 'shu:xxx'`（部分为占位或子集）：
+`import from 'shu:xxx'`（部分为占位或子集）。近期：抛错与回调等由内联 JS 改为纯 Zig 实现（assert、url、encoding、crypto、http、stubs 等）；JSC 取值处统一先 ToObject/undefined 检查再作函数调用，避免段错误；net 模块 host/path 所有权明确，仅对分配内存 free。
 
 | 状态 | 项目           | 说明                                                                                                                                                                                                                                                                                                                                                               |
 | :--: | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -156,6 +157,8 @@ flowchart TB
 | [x]  | **skip / skipIf / todo / only**                   | 跳过、条件跳过、占位用例、仅跑该用例                                                                 |
 | [x]  | **run()**                                         | 返回 Promise，纯 Zig 驱动任务队列与 Promise 链；advance、reject 挂到 globalThis                      |
 | [x]  | **runner.zig**                                    | Suite/TestEntry 树、Job 队列、buildJobList（DFS、has_only 过滤）                                     |
+| [x]  | **shu test CLI 与 shu 模块单元测试（部分）**      | CLI 已支持发现并执行测试（`shu test` / `shu test -A`）；`tests/unit/shu/` 下已有约 39 个 shu 模块单元测试（assert、buffer、server、net、fs、crypto、timers 等），部分用例已跑通 |
+| [ ]  | **兼容测试全覆盖（shu / node / deno / bun）**     | 测试需**分配并覆盖**四类命名空间与风格：**shu:** 内置、**node:** 兼容、**Deno** 风格 API（如 Deno.test、Deno.readFile）、**Bun** 风格 API；每类需有独立或共享的兼容用例，保证与 Node/Deno/Bun 行为对齐 |
 | [ ]  | **浏览器测试**                                    | `shu test --browser` 与 CLI 测试发现尚未实现；详见 `src/runtime/modules/shu/test/BROWSER_TESTING.md` |
 
 ---
@@ -284,7 +287,7 @@ T8 cli check/lint/fmt（可选）
 | [x]  | **run**     | 执行单文件或 package.json script；TS/TSX 类型擦除后执行（单文件已实现）             |
 | [x]  | **install** | 安装依赖到 node_modules（npm + JSR、lockfile、并行解析与安装，冷安装约 24s/261 包） |
 | [ ]  | **build**   | 编译/打包入口为单文件或 bundle                                                      |
-| [ ]  | **test**    | 发现并运行测试（含可选 --browser）；shu:test 模块已实现，CLI 需发现测试文件并调 run |
+| [x]  | **test**    | 发现并运行测试（glob `**/*.test.{js,ts,mjs}` 等），启动 VM 执行、复用 shu:test；当前以 shu 模块单元测试为主；待补充：node/deno/bun 兼容测试用例、`--browser` |
 | [ ]  | **check**   | TS 类型检查（对齐 deno check）                                                      |
 | [ ]  | **lint**    | 代码静态检查（对齐 deno lint）                                                      |
 | [ ]  | **fmt**     | 代码格式化（对齐 deno fmt）                                                         |
@@ -294,9 +297,7 @@ T8 cli check/lint/fmt（可选）
 - [ ] **run**：支持 `shu run <script>`，从当前目录 package.json 的 `scripts`
       读取并执行（如 `shu run dev` → 执行 `scripts.dev`）。依赖 package/manifest
       解析 scripts。
-- [ ] **test**：实现测试发现（按约定 glob 如 `**/*.test.{js,ts,mjs}`
-      或配置文件）并启动 VM 执行，内部复用 shu:test 的 describe/it/run；再扩展
-      `--browser`。
+- [x] **test**：已实现测试发现与执行（`shu test` / `shu test -A`），内部复用 shu:test；待做：**补全 shu / node / deno / bun 四类兼容测试**（见上方「五、测试运行器」），以及 `--browser`。
 - [ ] **check**：对指定入口做 TS 类型检查（可对接 tsc 或 swc
       子进程，或自研最小检查），输出类型错误。
 - [ ] **lint**：对指定路径做静态检查（可对接 ESLint/Biome
