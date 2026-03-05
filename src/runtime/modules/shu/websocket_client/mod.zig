@@ -68,9 +68,9 @@ pub const ClientState = struct {
         try self.sendFrame(.close, payload_buf[0..payload_len]);
     }
 
-    /// 同步读一帧：阻塞直到收到完整一帧，返回 payload（指向 read_buf 内，下次 receiveFrame 前有效）
+    /// 同步读一帧：阻塞直到收到完整一帧，返回 opcode + payload（payload 指向 read_buf 内，下次 receiveFrame 前有效）
     /// 返回 null 表示连接已关闭或收到 close 帧
-    pub fn receiveFrame(self: *ClientState) !?[]const u8 {
+    pub fn receiveFrame(self: *ClientState) !?struct { opcode: ws_proto.Opcode, payload: []const u8 } {
         while (true) {
             const active = self.read_buf.items[self.read_off..];
             if (active.len >= 2) {
@@ -82,7 +82,7 @@ pub const ClientState = struct {
                 switch (parsed.opcode) {
                     .text, .binary => {
                         self.read_off += consumed;
-                        return parsed.payload;
+                        return .{ .opcode = parsed.opcode, .payload = parsed.payload };
                     },
                     .close => return null,
                     .ping => {
@@ -127,23 +127,24 @@ pub const ClientState = struct {
     }
 };
 
-/// 全局：id -> *ClientState
-var g_ws_map: std.AutoHashMap(u32, *ClientState) = undefined;
+/// 全局：id -> *ClientState。Unmanaged，put 显式传 allocator（01 §1.2）
+var g_ws_map: std.AutoHashMapUnmanaged(u32, *ClientState) = .{};
 var g_ws_next_id: u32 = 1;
 var g_ws_initialized: bool = false;
 
 fn ensureMap(allocator: std.mem.Allocator) void {
     if (!g_ws_initialized) {
-        g_ws_map = std.AutoHashMap(u32, *ClientState).init(allocator);
+        g_ws_map = .{};
         g_ws_initialized = true;
     }
+    _ = allocator;
 }
 
 /// 解析 ws://host:port/path，仅支持 ws；返回的 host/path 指向栈上 buffer，调用方需立即使用
 fn parseWsUrl(allocator: std.mem.Allocator, url: []const u8) !struct { host: []const u8, port: u16, path: []const u8 } {
     _ = allocator;
     const uri = std.Uri.parse(url) catch return error.InvalidUrl;
-    if (uri.scheme.len > 0 and !std.mem.eql(u8, uri.scheme, "ws")) return error.OnlyWsSupported;
+    if (uri.scheme.len > 0 and (uri.scheme.len != 2 or uri.scheme[0] != 'w' or uri.scheme[1] != 's')) return error.OnlyWsSupported;
     var host_buf: [256]u8 = undefined;
     const host = (uri.host orelse return error.MissingHost).toRaw(&host_buf) catch return error.MissingHost;
     const port: u16 = if (uri.port) |p| @intCast(p) else 80;
@@ -194,7 +195,16 @@ fn connectAndHandshake(allocator: std.mem.Allocator, host: []const u8, port: u16
     if (head.len < 12 or !std.mem.startsWith(u8, head, "HTTP/1.1 101")) return error.BadHandshake;
     const accept_val = parse.getHeader(head, "sec-websocket-accept") orelse return error.BadHandshake;
     const accept_expected = try ws_proto.computeAcceptKey(key_b64);
-    if (!std.mem.eql(u8, accept_val, &accept_expected)) return error.BadHandshake;
+    if (accept_val.len != 28) return error.BadHandshake;
+    var a: [32]u8 align(8) = undefined;
+    var b: [32]u8 align(8) = undefined;
+    @memcpy(a[0..28], accept_val);
+    @memcpy(b[0..28], &accept_expected);
+    a[28..32].* = .{ 0, 0, 0, 0 };
+    b[28..32].* = .{ 0, 0, 0, 0 };
+    const pa = @as(*const [4]u64, @ptrCast(&a));
+    const pb = @as(*const [4]u64, @ptrCast(&b));
+    if (pa[0] != pb[0] or pa[1] != pb[1] or pa[2] != pb[2] or pa[3] != pb[3]) return error.BadHandshake;
     return stream;
 }
 
@@ -283,7 +293,7 @@ fn websocketConstructorCallback(
     };
     const id = g_ws_next_id;
     g_ws_next_id += 1;
-    g_ws_map.put(id, state) catch {
+    g_ws_map.put(allocator, id, state) catch {
         state.deinit();
         allocator.destroy(state);
         return jsc.JSValueMakeUndefined(ctx);
@@ -437,7 +447,11 @@ fn callOnCloseWith(ctx: jsc.JSContextRef, obj: jsc.JSObjectRef, code: u16, reaso
     _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(onclose), obj, 1, &argv, null);
 }
 
-/// receiveSync()：收一条消息；若有 onmessage 则先调用 onmessage({ data }); 若连接关闭则设 readyState=3 并调用 onclose(1006, "", false)
+/// JSC 回收 NoCopy TypedArray 时调用的空实现；payload 来自 read_buf，由下次 receiveFrame 前有效，不释放
+fn wsClientNoOpDeallocator(_: *anyopaque, _: ?*anyopaque) callconv(.c) void {}
+
+/// receiveSync()：收一条消息；若有 onmessage 则先调用 onmessage({ data })；binary 帧零拷贝传 Uint8Array，text 帧传字符串
+/// 若连接关闭则设 readyState=3 并调用 onclose(1006, "", false)
 fn wsReceiveSyncCallback(
     ctx: jsc.JSContextRef,
     this: jsc.JSObjectRef,
@@ -447,8 +461,8 @@ fn wsReceiveSyncCallback(
     _: [*]jsc.JSValueRef,
 ) callconv(.c) jsc.JSValueRef {
     const state = getStateFromThis(ctx, this) orelse return jsc.JSValueMakeUndefined(ctx);
-    const payload = state.receiveFrame() catch return jsc.JSValueMakeUndefined(ctx);
-    if (payload == null) {
+    const result = state.receiveFrame() catch return jsc.JSValueMakeUndefined(ctx);
+    if (result == null) {
         setNumberProperty(ctx, this, "readyState", 3);
         const id = getIdFromThis(ctx, this) orelse return jsc.JSValueMakeUndefined(ctx);
         if (g_ws_map.fetchRemove(id)) |kv| {
@@ -458,9 +472,27 @@ fn wsReceiveSyncCallback(
         callOnCloseWith(ctx, this, 1006, "", false);
         return jsc.JSValueMakeUndefined(ctx);
     }
-    const str = jsc.JSStringCreateWithUTF8CString(if (payload.?.len > 0) payload.?.ptr else "");
-    defer jsc.JSStringRelease(str);
-    const data_val = jsc.JSValueMakeString(ctx, str);
+    const data_val = blk: {
+        if (result.?.opcode == .binary) {
+            const payload = result.?.payload;
+            var exc: jsc.JSValueRef = undefined;
+            const arr = jsc.JSObjectMakeTypedArrayWithBytesNoCopy(
+                ctx,
+                .Uint8Array,
+                @ptrCast(@constCast(payload.ptr)),
+                payload.len,
+                wsClientNoOpDeallocator,
+                null,
+                @ptrCast(&exc),
+            );
+            break :blk if (arr != null) @as(jsc.JSValueRef, @ptrCast(arr.?)) else jsc.JSValueMakeUndefined(ctx);
+        } else {
+            const payload = result.?.payload;
+            const str = jsc.JSStringCreateWithUTF8CString(if (payload.len > 0) payload.ptr else "");
+            defer jsc.JSStringRelease(str);
+            break :blk jsc.JSValueMakeString(ctx, str);
+        }
+    };
     const onmsg_name = jsc.JSStringCreateWithUTF8CString("onmessage");
     defer jsc.JSStringRelease(onmsg_name);
     const onmessage = jsc.JSObjectGetProperty(ctx, this, onmsg_name, null);
