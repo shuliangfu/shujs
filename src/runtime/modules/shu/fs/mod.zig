@@ -43,6 +43,14 @@
 //! - **accessSync(path [, mode])** / **access(path [, mode])**：按 R/W/X 检查可访问性
 //! - **ensureFileSync(path)** / **ensureFile(path)**：不存在则创建空文件（含父目录），存在则不动（Shu 特色）
 //!
+//! ### 监视
+//! - **watch(path [, options] [, listener])**：监视文件/目录变更，返回 FSWatcher（含 close()）；listener(eventType, filename)，eventType 为 'change' 或 'rename'；options.recursive 暂不支持；需 --allow-read；Linux(inotify)/Darwin(kqueue EVFILT_VNODE)/Windows(ReadDirectoryChangesW) 三端已实现。
+//!
+//! ## fs.watch 与 Node / Deno / Bun 兼容性
+//! - **Node.js (node:fs)**：签名与回调 (eventType, filename) 一致；返回值为「仅含 close() 的普通对象」而非 EventEmitter。差异：① 无 listener 时本实现返回 undefined，Node 仍返回 FSWatcher（可后续 .on('change', fn)）；② 无 .on('change'|'close'|'error')，仅支持传入的 listener；③ options 仅解析 recursive（暂不支持），无 encoding/persistent。常见用法 fs.watch(dir, (ev, name) => {}) 与 watcher.close() 可直接复用，无需适配。
+//! - **Bun**：实现与 Node fs.watch 对齐，故与上同；Bun 的 (event, filename) 与 shujs 的 (eventType, filename) 一致。
+//! - **Deno**：Deno 使用 Deno.watchFs()（异步迭代 for await），与 node:fs.watch 非同一 API；若需在 Deno 下跑 node 风格代码，需用 npm 兼容层或自行封装 watchFs→(eventType, filename) 的适配，shujs 侧无需改。
+//!
 //! ## 与 Node.js (node:fs) 兼容情况
 //! - readFileSync/readFile、writeFileSync/writeFile、copyFileSync/copyFile、appendFileSync/appendFile 与 readSync/read、writeSync/write、copySync/copy、appendSync/append 同实现
 //! - ensureDirSync/ensureDir 与 mkdirRecursiveSync/mkdirRecursive 同实现
@@ -124,6 +132,33 @@ const FsAsyncState = struct {
     async_file_io: *libs_io.AsyncFileIO,
 };
 var fs_async_state: ?*FsAsyncState = null;
+
+/// 单条 fs.watch 注册：句柄 + 主线程回调（listener）；drain 时用 ctx 调用 callback(eventType, filename)
+const FsWatcherEntry = struct {
+    handle: *libs_io.WatchHandle,
+    ctx: jsc.JSGlobalContextRef,
+    callback: jsc.JSValueRef,
+};
+/// fs.watch 活跃监视列表；首次 watch() 时按需创建并设置 globals.drain_fs_watch
+/// map: watcher 对象指针 (usize) -> handle，供 close() 查找
+const FsWatchersState = struct {
+    list: std.ArrayListUnmanaged(FsWatcherEntry) = .{},
+    /// key = @intFromPtr(watcher_obj)，value = handle，close 时据此找到 handle 并从 list 移除
+    map: std.AutoHashMapUnmanaged(usize, *libs_io.WatchHandle) = .{},
+    allocator: std.mem.Allocator,
+};
+var g_fs_watchers: ?*FsWatchersState = null;
+
+/// 确保 g_fs_watchers 与 drain_fs_watch 已初始化；首次 watch() 时调用
+fn ensureFsWatchersState() !*FsWatchersState {
+    if (g_fs_watchers) |s| return s;
+    const allocator = globals.current_allocator orelse return error.NoAllocator;
+    const state = allocator.create(FsWatchersState) catch return error.OutOfMemory;
+    state.* = .{ .allocator = allocator };
+    globals.drain_fs_watch = drainFsWatch;
+    g_fs_watchers = state;
+    return state;
+}
 
 /// 供 Promise executor 使用：read 时传入 resolved 路径与 return_buffer，executor 内取走后清空
 var fs_read_promise_args: ?struct { resolved: []const u8, return_buffer: bool } = null;
@@ -1224,6 +1259,36 @@ pub fn drainFileIOCompletions(ctx: jsc.JSContextRef) void {
     }
 }
 
+/// 每轮事件循环调用：收割 fs.watch 事件并回调 JS listener(eventType, filename)；仅主线程、有 watchers 时执行
+pub fn drainFsWatch(ctx: jsc.JSContextRef) void {
+    const state = g_fs_watchers orelse return;
+    const allocator = state.allocator;
+    var i: usize = 0;
+    while (i < state.list.items.len) {
+        const entry = &state.list.items[i];
+        while (libs_io.drainWatchEvents(entry.handle)) |ev| {
+            defer if (ev.filename.len > 0) allocator.free(ev.filename);
+            const event_str = switch (ev.event_type) {
+                .change => "change",
+                .rename => "rename",
+            };
+            const event_ref = jsc.JSStringCreateWithUTF8CString(event_str);
+            defer jsc.JSStringRelease(event_ref);
+            const name_ref = if (ev.filename.len > 0)
+                jsc.JSStringCreateWithUTF8CString(ev.filename.ptr)
+            else
+                jsc.JSStringCreateWithUTF8CString("");
+            defer jsc.JSStringRelease(name_ref);
+            var args: [2]jsc.JSValueRef = .{
+                jsc.JSValueMakeString(ctx, event_ref),
+                jsc.JSValueMakeString(ctx, name_ref),
+            };
+            _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(jsc.JSValueToObject(ctx, entry.callback, null)), null, 2, &args, null);
+        }
+        i += 1;
+    }
+}
+
 /// 核心逻辑：用已解析路径提交一次异步读，resolve/reject 由 drain 或本函数内同步 resolve（空文件等）时调用；不检查权限（由调用方在构造 Promise 前完成）
 fn doSubmitRead(
     ctx: jsc.JSContextRef,
@@ -1390,6 +1455,100 @@ fn fsWriteExecutorCallback(
     return jsc.JSValueMakeUndefined(ctx);
 }
 
+/// C 回调：fs.watch(path [, options] [, listener])。path 必填；listener 为 (eventType, filename) => {}；options.recursive 暂不支持。
+/// 返回带 close() 的 FSWatcher 对象；需 --allow-read。
+fn watchCallback(
+    ctx: jsc.JSContextRef,
+    _: jsc.JSObjectRef,
+    _: jsc.JSObjectRef,
+    argumentCount: usize,
+    arguments: [*]const jsc.JSValueRef,
+    _: [*]jsc.JSValueRef,
+) callconv(.c) jsc.JSValueRef {
+    const allocator = globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
+    const opts = globals.current_run_options orelse return jsc.JSValueMakeUndefined(ctx);
+    if (argumentCount < 1) return jsc.JSValueMakeUndefined(ctx);
+    if (!opts.permissions.allow_read) {
+        errors.reportToStderr(.{ .code = .permission_denied, .message = "Shu.fs.watch requires --allow-read" }) catch {};
+        return jsc.JSValueMakeUndefined(ctx);
+    }
+    const resolved = getResolvedPath(allocator, opts.cwd, ctx, arguments, argumentCount, 0) orelse return jsc.JSValueMakeUndefined(ctx);
+    defer allocator.free(resolved);
+
+    var recursive = false;
+    var listener: ?jsc.JSValueRef = null;
+    if (argumentCount >= 2 and jsc.JSObjectIsFunction(ctx, @ptrCast(arguments[1]))) {
+        listener = arguments[1];
+    } else if (argumentCount >= 2 and jsc.JSValueToObject(ctx, arguments[1], null) != null) {
+        if (argumentCount >= 3 and jsc.JSObjectIsFunction(ctx, @ptrCast(arguments[2])))
+            listener = arguments[2];
+        const rec_str = jsc.JSStringCreateWithUTF8CString("recursive");
+        defer jsc.JSStringRelease(rec_str);
+        const rec_val = jsc.JSObjectGetProperty(ctx, @ptrCast(jsc.JSValueToObject(ctx, arguments[1], null)), rec_str, null);
+        if (jsc.JSValueToBoolean(ctx, rec_val)) recursive = true;
+    }
+
+    const state = ensureFsWatchersState() catch return jsc.JSValueMakeUndefined(ctx);
+    const handle = libs_io.startWatch(allocator, resolved, recursive) catch |e| {
+        const msg = std.fmt.allocPrint(allocator, "Shu.fs.watch failed: {s}", .{@errorName(e)}) catch return jsc.JSValueMakeUndefined(ctx);
+        defer allocator.free(msg);
+        errors.reportToStderr(.{ .code = .unknown, .message = msg }) catch {};
+        return jsc.JSValueMakeUndefined(ctx);
+    };
+    const callback = listener orelse {
+        handle.deinit();
+        allocator.destroy(handle);
+        return jsc.JSValueMakeUndefined(ctx);
+    };
+    jsc.JSValueProtect(ctx, callback);
+    state.list.append(state.allocator, .{ .handle = handle, .ctx = @ptrCast(ctx), .callback = callback }) catch {
+        jsc.JSValueUnprotect(ctx, callback);
+        handle.deinit();
+        allocator.destroy(handle);
+        return jsc.JSValueMakeUndefined(ctx);
+    };
+    const watcher_obj = jsc.JSObjectMake(ctx, null, null);
+    state.map.put(state.allocator, @intFromPtr(watcher_obj), handle) catch {
+        _ = state.list.pop();
+        jsc.JSValueUnprotect(ctx, callback);
+        handle.deinit();
+        allocator.destroy(handle);
+        return jsc.JSValueMakeUndefined(ctx);
+    };
+
+    const close_str = jsc.JSStringCreateWithUTF8CString("close");
+    defer jsc.JSStringRelease(close_str);
+    const close_fn = jsc.JSObjectMakeFunctionWithCallback(ctx, close_str, watchCloseCallback);
+    _ = jsc.JSObjectSetProperty(ctx, watcher_obj, close_str, close_fn, jsc.kJSPropertyAttributeNone, null);
+    return watcher_obj;
+}
+
+/// C 回调：FSWatcher.close()；从 map/list 移除、Unprotect、deinit handle
+fn watchCloseCallback(
+    ctx: jsc.JSContextRef,
+    this: jsc.JSObjectRef,
+    _: jsc.JSObjectRef,
+    argumentCount: usize,
+    _: [*]const jsc.JSValueRef,
+    _: [*]jsc.JSValueRef,
+) callconv(.c) jsc.JSValueRef {
+    _ = argumentCount;
+    const state = g_fs_watchers orelse return jsc.JSValueMakeUndefined(ctx);
+    const key = @intFromPtr(this);
+    const handle = state.map.fetchRemove(key) orelse return jsc.JSValueMakeUndefined(ctx);
+    var i: usize = 0;
+    while (i < state.list.items.len) : (i += 1) {
+        if (state.list.items[i].handle == handle.value) {
+            const entry = state.list.swapRemove(i);
+            jsc.JSValueUnprotect(ctx, entry.callback);
+            break;
+        }
+    }
+    handle.value.deinit();
+    state.allocator.destroy(handle.value);
+    return jsc.JSValueMakeUndefined(ctx);
+}
+
 /// 内部 C 回调：供 JS 侧 Shu.__fsSubmitRead(path, returnBuffer, resolve, reject) 调用；解析路径、检查权限后调用 doSubmitRead
 fn fsSubmitReadCallback(
     ctx: jsc.JSContextRef,
@@ -1494,6 +1653,8 @@ fn attachMethods(ctx: jsc.JSGlobalContextRef, file_obj: jsc.JSObjectRef) void {
     common.setMethod(ctx, file_obj, "rmdirRecursiveSync", rmdirRecursiveSyncCallback);
     // 检查目录是否存在，不存在则创建（含父目录），存在则不做任何操作；与 mkdirRecursiveSync 同实现
     common.setMethod(ctx, file_obj, "ensureDirSync", mkdirRecursiveSyncCallback);
+    // 文件/目录监视：返回 FSWatcher（含 close()）；与 node:fs watch 对齐，需 --allow-read
+    common.setMethod(ctx, file_obj, "watch", watchCallback);
     // node:fs 兼容命名：与上同实现，便于 Node 迁移
     common.setMethod(ctx, file_obj, "readFileSync", readFileSyncCallback);
     common.setMethod(ctx, file_obj, "writeFileSync", writeFileSyncCallback);
