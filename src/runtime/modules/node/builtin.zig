@@ -8,6 +8,7 @@
 // |--------------------|----------------|----------|
 // | node:path          | shu:path       | ✅ 已实现，与 node:path API 对齐 |
 // | node:fs            | shu:fs         | ✅ 已实现 |
+// | node:fs/promises   | shu:fs         | ✅ 已实现（Promise 形态 API，util.promisify 包装） |
 // | node:zlib          | shu:zlib       | ✅ 已实现 |
 // | node:assert        | shu:assert     | ✅ 已实现 |
 // | node:events        | shu:events     | ✅ 已实现 |
@@ -47,12 +48,15 @@
 // | node:webstreams    | shu:webstreams | ✅ 已实现（透传 globalThis 流类） |
 // | node:cluster       | shu:cluster    | ✅ 已实现（单进程，fork 占位） |
 // | node:repl          | shu:repl       | ⚠ 占位（start/ReplServer 抛 not implemented） |
-// | node:test          | shu:test       | ⚠ 占位（describe/it/run 等抛 not implemented） |
+// | node:test          | shu:test       | ✅ 已实现（describe/it/run 等与 node:test 语义接近） |
 // | node:wasi          | shu:wasi       | ⚠ 占位（WASI 类抛 not implemented） |
 // | node:debugger      | shu:debugger   | ✅ 已实现（port/host） |
 // | node:v8            | shu_stub       | ⚠ 占位（JSC 无 V8，直接走 shu_stub） |
 // | node:punycode      | shu_stub       | ⚠ 占位（Node 已弃用，直接走 shu_stub） |
 // | node:domain        | shu_stub       | ⚠ 占位（Node 已弃用，直接走 shu_stub） |
+// | node:errors        | shu:errors     | ✅ 已实现（SystemError、codes 与 node:errors 对齐） |
+// | node:corepack      | shu_stub       | ⚠ 占位（实验性包管理，可占位） |
+// | node:sqlite        | shu_stub       | ⚠ 占位（Node 22+ SQLite，可占位） |
 //
 // shu: 侧完整 API 兼容情况见 modules/shu/builtin.zig 顶部。注：node:server 在 Node 中为内部模块，不暴露，故不映射。
 
@@ -65,6 +69,7 @@ const shu_stub = @import("../shu/stub/mod.zig");
 pub const NODE_BUILTIN_NAMES: []const []const u8 = &.{
     "node:path",
     "node:fs",
+    "node:fs/promises",
     "node:zlib",
     "node:assert",
     "node:events",
@@ -110,10 +115,47 @@ pub const NODE_BUILTIN_NAMES: []const []const u8 = &.{
     "node:v8",
     "node:punycode",
     "node:domain",
+    "node:errors",
+    "node:corepack",
+    "node:sqlite",
+    // 裸说明符 require("fs/promises") 与 node:fs/promises 同源
+    "fs/promises",
 };
+
+/// 返回 node:fs/promises 与 fs/promises 的 exports：基于 shu:fs + shu:util.promisify 生成 Promise 形态 API 对象。[Borrows] 返回值由 JSC 管理，调用方勿 free。
+fn getFsPromisesExports(ctx: jsc.JSContextRef, allocator: std.mem.Allocator) jsc.JSValueRef {
+    const fs_exports = shu_builtin.getShuBuiltin(ctx, allocator, "shu:fs");
+    if (jsc.JSValueIsUndefined(ctx, fs_exports) or jsc.JSValueIsNull(ctx, fs_exports)) return jsc.JSValueMakeUndefined(ctx);
+    const util_exports = shu_builtin.getShuBuiltin(ctx, allocator, "shu:util");
+    if (jsc.JSValueIsUndefined(ctx, util_exports) or jsc.JSValueIsNull(ctx, util_exports)) return jsc.JSValueMakeUndefined(ctx);
+    const k_promisify = jsc.JSStringCreateWithUTF8CString("promisify");
+    defer jsc.JSStringRelease(k_promisify);
+    const promisify_fn = jsc.JSObjectGetProperty(ctx, util_exports, k_promisify, null);
+    if (jsc.JSValueIsUndefined(ctx, promisify_fn) or !jsc.JSObjectIsFunction(ctx, promisify_fn)) return jsc.JSValueMakeUndefined(ctx);
+    const promises_obj = jsc.JSObjectMake(ctx, null, null);
+    // node:fs/promises 与 Node 对齐的异步方法名（与 shu:fs 上命名一致）
+    const method_names = [_][]const u8{
+        "readFile", "writeFile", "appendFile", "copyFile", "readdir", "stat", "lstat", "realpath",
+        "mkdir", "access", "unlink", "rmdir", "rename", "copy", "truncate", "symlink", "readlink",
+        "exists", "mkdirRecursive", "rmdirRecursive", "ensureDir", "read", "write",
+        "isEmptyDir", "size", "isFile", "isDirectory", "readdirWithStats", "ensureFile",
+    };
+    for (method_names) |name| {
+        const name_ref = jsc.JSStringCreateWithUTF8CString(name.ptr);
+        defer jsc.JSStringRelease(name_ref);
+        const fs_fn = jsc.JSObjectGetProperty(ctx, fs_exports, name_ref, null);
+        if (jsc.JSValueIsUndefined(ctx, fs_fn) or !jsc.JSObjectIsFunction(ctx, fs_fn)) continue;
+        var args = [_]jsc.JSValueRef{fs_fn};
+        const wrapped = jsc.JSObjectCallAsFunction(ctx, promisify_fn, null, 1, &args, null);
+        if (jsc.JSValueIsUndefined(ctx, wrapped)) continue;
+        _ = jsc.JSObjectSetProperty(ctx, promises_obj, name_ref, wrapped, jsc.kJSPropertyAttributeNone, null);
+    }
+    return promises_obj;
+}
 
 /// 返回 node:xxx 的 exports；统一走 getShuBuiltin(ctx, allocator, "shu:yyy")，与 NODE_BUILTIN_NAMES 一一对应
 pub fn getNodeBuiltin(ctx: jsc.JSContextRef, allocator: std.mem.Allocator, specifier: []const u8) jsc.JSValueRef {
+    if (std.mem.eql(u8, specifier, "node:fs/promises") or std.mem.eql(u8, specifier, "fs/promises")) return getFsPromisesExports(ctx, allocator);
     if (std.mem.eql(u8, specifier, "node:path")) return shu_builtin.getShuBuiltin(ctx, allocator, "shu:path");
     if (std.mem.eql(u8, specifier, "node:fs")) return shu_builtin.getShuBuiltin(ctx, allocator, "shu:fs");
     if (std.mem.eql(u8, specifier, "node:zlib")) return shu_builtin.getShuBuiltin(ctx, allocator, "shu:zlib");
@@ -161,6 +203,9 @@ pub fn getNodeBuiltin(ctx: jsc.JSContextRef, allocator: std.mem.Allocator, speci
     if (std.mem.eql(u8, specifier, "node:v8")) return shu_stub.getExports(ctx, allocator, "v8");
     if (std.mem.eql(u8, specifier, "node:punycode")) return shu_stub.getExports(ctx, allocator, "punycode");
     if (std.mem.eql(u8, specifier, "node:domain")) return shu_stub.getExports(ctx, allocator, "domain");
+    if (std.mem.eql(u8, specifier, "node:errors")) return shu_builtin.getShuBuiltin(ctx, allocator, "shu:errors");
+    if (std.mem.eql(u8, specifier, "node:corepack")) return shu_builtin.getShuBuiltin(ctx, allocator, "shu:corepack");
+    if (std.mem.eql(u8, specifier, "node:sqlite")) return shu_builtin.getShuBuiltin(ctx, allocator, "shu:sqlite");
     return jsc.JSValueMakeUndefined(ctx);
 }
 
