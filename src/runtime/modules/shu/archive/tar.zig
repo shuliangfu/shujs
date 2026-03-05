@@ -1,9 +1,10 @@
 //! Tar 打包与解包：使用 std.tar（Writer / pipeToFileSystem）
 //! 供 package、cli pack 等复用；路径须为绝对路径或通过 io_core 解析后再传入。
+//! TODO: migrate to libs_io (rule §3.0) when libs_io exposes dir iteration + tar writer; current I/O via std.fs.
 
 const std = @import("std");
 
-/// 将指定目录递归打包为 tar 格式字节。
+/// [Allocates] 将指定目录递归打包为 tar 格式字节；调用方须用同一 allocator free 返回值。
 /// dir_path 须为绝对路径；返回的切片由调用方 free。
 pub fn packTarFromDir(allocator: std.mem.Allocator, dir_path: []const u8) ![]const u8 {
     var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return error.TarOpenDirFailed;
