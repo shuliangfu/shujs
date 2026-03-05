@@ -1,6 +1,7 @@
 // 全局 process（cwd、argv、env）、__dirname、__filename 注册；is_forked 时挂载 send/receiveSync
 // shu:process 协议：getExports 返回与全局 process 同一对象（Node node:process 兼容）
 // 由 bindings 在具备 RunOptions 时调用 register；本模块不依赖 engine。
+// 所有权：process 对象及属性为 JSC 持有；__dirname/__filename 等由 RunOptions 或调用方保证生命周期，无 Zig 侧返回 [Allocates] 切片。
 
 const std = @import("std");
 const jsc = @import("jsc");
