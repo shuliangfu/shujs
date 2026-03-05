@@ -44,11 +44,11 @@
 | **重试失败** | 无 | 无 | **--retry N** | ✅ **--retry=N**（SHU_TEST_RETRY，失败用例重试 N 次） |
 | **随机顺序** | 有 | 无 | **--randomize** + **--seed** | ✅ **--randomize**、**--seed=N**（打乱测试文件顺序，SHU_TEST_RANDOMIZE/SEED） |
 | **只跑 todo** | 无 | 无 | **--todo** | ✅ **--todo**（只跑 it.todo/test.todo，SHU_TEST_TODO_ONLY） |
-| **更新 snapshot** | 无 | 无 | **--update-snapshots / -u** | ✅ **--update-snapshots** / **-u**（SHU_TEST_UPDATE_SNAPSHOTS；snapshot 持久化到 __snapshots__/*.snap） |
+| **更新 snapshot** | 无 | 无 | **--update-snapshots / -u** | ✅ **--update-snapshots** / **-u**（SHU_TEST_UPDATE_SNAPSHOTS；snapshot 持久化到项目根 **snapshots/** 目录） |
 | **Preload** | 无 | 无 | **--preload** | ✅ **--preload=path**（跑测试前先 require 该脚本，SHU_TEST_PRELOAD） |
 | **Coverage** | 实验性 --test-coverage-* | **--coverage** | **--coverage** 等 | ✅ **--coverage**、**--coverage-dir=path**（SHU_TEST_COVERAGE/COVERAGE_DIR；当前写占位 lcov.info，行/分支采集待后续） |
 
-**说明**：snapshot 与 coverage 已完整实现（CLI 传 env + runtime 读/写文件）。若本地未生成 `__snapshots__/*.snap` 或 `coverage/lcov.info`，请在**项目根**执行、并尝试 `--jobs=1`；子进程依赖 `SHU_TEST_CWD` 解析路径，确保从根目录启动。
+**说明**：snapshot 与 coverage 已完整实现（CLI 传 env + runtime 读/写文件）。若本地未生成 `snapshots/**/*.snap` 或 `coverage/lcov.info`，请在**项目根**执行、并尝试 `--jobs=1`；子进程依赖 `SHU_TEST_CWD` 解析路径，确保从根目录启动。
 
 ---
 
@@ -68,7 +68,7 @@
 | **只跑 todo** | `shu test --todo` | 仅运行标记为 it.todo / test.todo 的用例（SHU_TEST_TODO_ONLY）。 |
 | **随机顺序** | `shu test --randomize`、`shu test --randomize --seed=N` | 打乱测试文件执行顺序；未指定 --seed 时种子为 0（可复现）。 |
 | **Preload** | `shu test --preload=path` | 每个测试文件执行前先 require(preload)，便于加载环境或 polyfill。 |
-| **更新 snapshot** | `shu test --update-snapshots` 或 `shu test -u` | 将 snapshot(name, value) 的当前值写回 tests/__snapshots__/<file>.snap；需 --allow-write。 |
+| **更新 snapshot** | `shu test --update-snapshots` 或 `shu test -u` | 将 snapshot(name, value) 的当前值写回项目根 **snapshots/** 下对应路径（如 snapshots/tests/unit/shu/xxx.test.snap）；需 --allow-write。 |
 | **Coverage** | `shu test --coverage`、`shu test --coverage --coverage-dir=dir` | 启用覆盖率；输出目录默认 coverage，会生成占位 lcov.info（行/分支采集待后续）；需 --allow-write。 |
 
 ---
@@ -90,7 +90,7 @@
 | **P3** | **--preload=path** | Bun --preload | ✅ **已实现**：SHU_TEST_PRELOAD，run 前 require 该脚本。 |
 | **P3** | **--watch** | Bun --watch | ❌ 未实现：需文件监听与增量调度。 |
 | **P3** | **--retry=N** | Bun --retry | ✅ **已实现**：SHU_TEST_RETRY，runner 层失败用例重试 N 次。 |
-| **P3** | **--update-snapshots / -u** | Bun --update-snapshots | ✅ **已实现**：snapshot 持久化到 tests/__snapshots__/<testfile>.snap，加载/比较/写回由 runtime 完成。 |
+| **P3** | **--update-snapshots / -u** | Bun --update-snapshots | ✅ **已实现**：snapshot 持久化到项目根 **snapshots/** 目录（与常见运行时约定一致），加载/比较/写回由 runtime 完成。 |
 | **P3** | **--coverage**、**--coverage-dir** | Deno/Bun --coverage | ✅ **已实现**：CLI 传 SHU_TEST_COVERAGE/COVERAGE_DIR；runtime 写占位 lcov.info，完整行/分支采集待 JSC 或插桩方案。 |
 
 **说明**：**--filter** 在 shu 中为「路径子串」，与 Deno/Bun 的「按测试名」不同；若加 **--test-name-pattern**，则「路径过滤」与「名称过滤」可同时使用（先筛文件，再筛用例）。
