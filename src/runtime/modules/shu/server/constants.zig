@@ -54,6 +54,16 @@ pub const DEFAULT_CHUNKED_RESPONSE_THRESHOLD = 64 * 1024;
 pub const DEFAULT_KEEP_ALIVE_TIMEOUT_SEC = 5;
 /// listen() 默认 kernel backlog
 pub const DEFAULT_LISTEN_BACKLOG = 128;
+/// cluster workers 不得超过「CPU 核数 × 此倍数」；避免进程数远大于核数导致调度与资源浪费
+pub const WORKERS_MAX_MULTIPLIER: u32 = 4;
+/// workers 绝对上限：getCpuCount() 异常或核数极大时的兜底，防止进程数爆炸（fd/内存/调度）
+pub const WORKERS_ABSOLUTE_MAX: u32 = 1024;
+/// Thread-per-Core：单进程内 I/O 线程数上限（每线程一环 + 亲和性）；0=沿用单线程
+pub const MAX_IO_THREADS: u32 = 64;
+/// 每 I/O 线程投递至 JS 的完成项槽位数（RingBuffer 容量）；须 ≥ max_completions
+pub const IO_THREAD_COMPLETION_SLOTS: usize = 2048;
+/// 每 I/O 线程从 JS 接收的 work 槽位数（submitRecv/submitSend）
+pub const IO_THREAD_WORK_SLOTS: usize = 2048;
 /// 单次 poll 最多返回的完成项数量（默认，可被 options.maxCompletions 覆盖）
 pub const DEFAULT_MAX_COMPLETIONS: usize = 256;
 
