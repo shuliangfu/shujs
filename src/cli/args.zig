@@ -52,14 +52,23 @@ fn isGlobalOption(arg: []const u8) bool {
     return (arg.len == 2 and (arg[1] == 'A' or arg[1] == 'h'));
 }
 
+/// 判断是否为已识别的全局选项（仅此类会被消费，未知 --xxx 留给子命令）。
+fn isKnownGlobalOption(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "--allow-all") or std.mem.eql(u8, arg, "--all") or std.mem.eql(u8, arg, "-A") or
+        std.mem.eql(u8, arg, "--allow-net") or std.mem.eql(u8, arg, "--allow-read") or std.mem.eql(u8, arg, "--allow-env") or
+        std.mem.eql(u8, arg, "--allow-write") or std.mem.eql(u8, arg, "--allow-run") or std.mem.eql(u8, arg, "--allow-hrtime") or
+        std.mem.eql(u8, arg, "--allow-ffi") or std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h");
+}
+
 /// 从命令行参数中解析全局选项，并分离出位置参数。
-/// 从第一个不以 "--" 或 "-A/-h" 开头的参数起视为位置参数。
-/// --allow-all / --all / -A 表示允许所有权限（与 Deno 一致：net、read、env、write、run、hrtime、ffi）。
+/// 仅消费已识别的全局选项（allow_*、help）；未知的 --xxx 保留在 positional 中供子命令使用。
+/// --allow-all / --all / -A 表示允许所有权限（与 Deno 一致）。
 /// 典型用法：main 里取 args[2..] 传入（即去掉程序名与子命令）。
 pub fn parse(args: []const []const u8) ParseResult {
     var result = ParsedArgs{};
     var i: usize = 0;
     while (i < args.len and isGlobalOption(args[i])) : (i += 1) {
+        if (!isKnownGlobalOption(args[i])) break;
         if (std.mem.eql(u8, args[i], "--allow-all") or std.mem.eql(u8, args[i], "--all") or std.mem.eql(u8, args[i], "-A")) {
             result.allow_net = true;
             result.allow_read = true;
