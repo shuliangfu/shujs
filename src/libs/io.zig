@@ -88,6 +88,14 @@ pub const AsyncFileIO = file.AsyncFileIO;
 /// 统一 HTTP 客户端：request(任意方法)/get(GET 便捷)，供 package/registry、shu:fetch 使用；仅 Zig 路径（std.http.Client）
 pub const http = @import("http.zig");
 
+/// 文件/目录监视：startWatch、drainWatchEvents、WatchHandle、WatchEvent；Linux inotify，其他平台占位
+const watch_mod = @import("watch.zig");
+pub const WatchEvent = watch_mod.WatchEvent;
+pub const WatchHandle = watch_mod.WatchHandle;
+pub const WatchError = watch_mod.WatchError;
+pub const startWatch = watch_mod.startWatch;
+pub const drainWatchEvents = watch_mod.drainWatchEvents;
+
 // 按 OS 选择实现，编译时只包含当前平台
 const backend = switch (builtin.os.tag) {
     .linux => @import("linux.zig"),
