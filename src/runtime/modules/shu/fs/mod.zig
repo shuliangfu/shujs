@@ -114,10 +114,10 @@ const PendingEntry = struct {
     write_data: ?[]const u8 = null,
 };
 
-/// 每线程异步 fs 状态：AsyncFileIO 实例与 pending 表；首次 Shu.fs.read/Shu.fs.write（异步）时按需创建
+/// 每线程异步 fs 状态：AsyncFileIO 实例与 pending 表；首次 Shu.fs.read/Shu.fs.write（异步）时按需创建。pending 为 Unmanaged，put 显式传 allocator（01 §1.2）
 const FsAsyncState = struct {
     allocator: std.mem.Allocator,
-    pending: std.AutoHashMap(usize, PendingEntry),
+    pending: std.AutoHashMapUnmanaged(usize, PendingEntry),
     next_id: usize,
     async_file_io: *libs_io.AsyncFileIO,
 };
@@ -147,7 +147,7 @@ fn ensureAsyncFileIO() !*FsAsyncState {
         return error.OutOfMemory;
     };
     state.allocator = allocator;
-    state.pending = std.AutoHashMap(usize, PendingEntry).init(allocator);
+    state.pending = .{};
     state.next_id = 1;
     state.async_file_io = fio;
     fs_async_state = state;
@@ -203,14 +203,14 @@ const DeferredFsOp = struct {
 var deferred_fs_current_op: DeferredFsOp = undefined;
 /// 当前待挂载 resolve/reject 的 op（executor 被 JSC 调用时写入并入队）
 var current_deferred_fs_op: ?*DeferredFsOp = null;
-/// 延迟队列；首次使用时用 current_allocator 初始化
-var deferred_fs_queue: ?std.ArrayList(DeferredFsOp) = null;
+/// 延迟队列；Unmanaged 不存 allocator，append/orderedRemove 显式传 allocator（01 §1.2、00 §1.5）
+var deferred_fs_queue: ?std.ArrayListUnmanaged(DeferredFsOp) = null;
 
 /// 确保延迟队列已初始化；调用方须持有 current_allocator
 fn ensureDeferredFsQueue() !void {
     if (deferred_fs_queue != null) return;
     const allocator = globals.current_allocator orelse return error.NoAllocator;
-    deferred_fs_queue = std.ArrayList(DeferredFsOp).initCapacity(allocator, 0) catch return error.NoAllocator;
+    deferred_fs_queue = std.ArrayListUnmanaged(DeferredFsOp).initCapacity(allocator, 0) catch return error.NoAllocator;
 }
 
 /// Promise executor 的 C 回调：JSC 调用时传入 (resolve, reject)，将当前 op 的 resolve/reject 写入，path/path2/content 复制后入队并释放原指针，返回 undefined
@@ -1163,7 +1163,7 @@ fn doSubmitRead(
     };
     jsc.JSValueProtect(ctx, resolve_fn);
     jsc.JSValueProtect(ctx, reject_fn);
-    state.pending.put(user_data, .{
+    state.pending.put(state.allocator, user_data, .{
         .resolve = resolve_fn,
         .reject = reject_fn,
         .file = file,
@@ -1211,7 +1211,7 @@ fn doSubmitWrite(
     };
     jsc.JSValueProtect(ctx, resolve_fn);
     jsc.JSValueProtect(ctx, reject_fn);
-    state.pending.put(user_data, .{
+    state.pending.put(state.allocator, user_data, .{
         .resolve = resolve_fn,
         .reject = reject_fn,
         .file = file,
@@ -1573,7 +1573,7 @@ fn createDeferredFsPromise(
 
 // ---------- 同步回调 ----------
 
-/// 从 options 对象读取 encoding：'utf8' 或未传则返回 string，null/'buffer' 则返回 Buffer（零拷贝）；大文件且 encoding 为 null 时用 libs_io.mapFileReadOnly
+/// [Allocates] 从 options 对象读取 encoding：'utf8' 或未传则返回 string（Zig 分配后交 JSC）；null/'buffer' 则返回 Buffer（零拷贝或 mmap，生命周期见 NoCopy/映射约定）。大文件且 encoding 为 null 时用 libs_io.mapFileReadOnly。
 fn readFileSyncCallback(
     ctx: jsc.JSContextRef,
     _: jsc.JSObjectRef,
@@ -1617,7 +1617,13 @@ fn readFileSyncCallback(
         var buf: [32]u8 = undefined;
         const n = jsc.JSStringGetUTF8CString(enc_str, &buf, max_sz);
         const enc = buf[0..if (n > 0) n - 1 else 0];
-        if (std.mem.eql(u8, enc, "buffer") or std.mem.eql(u8, enc, "binary") or enc.len == 0) break :blk true;
+        if (enc.len == 0) break :blk true;
+        if (enc.len == 6) {
+            var pad: [8]u8 = [_]u8{0} ** 8;
+            @memcpy(pad[0..6], enc[0..6]);
+            const q = @as(u64, @bitCast(pad));
+            if (q == @as(u64, @bitCast([8]u8{ 'b', 'u', 'f', 'f', 'e', 'r', 0, 0 })) or q == @as(u64, @bitCast([8]u8{ 'b', 'i', 'n', 'a', 'r', 'y', 0, 0 }))) break :blk true;
+        }
         break :blk false;
     };
     // 大文件且返回 Buffer 时走 libs_io.mapFileReadOnly，减少整文件读入与 OOM
@@ -1844,7 +1850,7 @@ fn statSyncCallback(
     return makeStatObject(ctx, true, s.size, mtime_ns);
 }
 
-/// 解析符号链接与 . / .. 得到规范绝对路径；realpathSync(path)，需要 --allow-read
+/// [Allocates] 解析符号链接与 . / .. 得到规范绝对路径；返回的 JS 字符串对应 Zig 侧 dupe 的路径，由本函数 defer 释放后交 JSC。realpathSync(path)，需要 --allow-read。
 fn realpathSyncCallback(
     ctx: jsc.JSContextRef,
     _: jsc.JSObjectRef,
@@ -2475,7 +2481,13 @@ fn readFileAsyncCallback(
         var buf: [32]u8 = undefined;
         const n = jsc.JSStringGetUTF8CString(enc_str, &buf, max_sz);
         const enc = buf[0..if (n > 0) n - 1 else 0];
-        if (std.mem.eql(u8, enc, "buffer") or std.mem.eql(u8, enc, "binary") or enc.len == 0) break :blk true;
+        if (enc.len == 0) break :blk true;
+        if (enc.len == 6) {
+            var pad: [8]u8 = [_]u8{0} ** 8;
+            @memcpy(pad[0..6], enc[0..6]);
+            const q = @as(u64, @bitCast(pad));
+            if (q == @as(u64, @bitCast([8]u8{ 'b', 'u', 'f', 'f', 'e', 'r', 0, 0 })) or q == @as(u64, @bitCast([8]u8{ 'b', 'i', 'n', 'a', 'r', 'y', 0, 0 }))) break :blk true;
+        }
         break :blk false;
     };
     const resolved_owned = allocator.dupe(u8, resolved) catch {
