@@ -6,20 +6,48 @@ const jsc = @import("jsc");
 const common = @import("../../../common.zig");
 const globals = @import("../../../globals.zig");
 
-/// 在 JS 侧抛错：将 msg_js 设为 globalThis.__assert_msg 后执行 throw new Error(globalThis.__assert_msg)
+/// 在 JS 侧抛错：用 Zig 创建 new Error(msg_js)，再 setThrowAndThrow（无内联 throw new Error 脚本）
 fn throwAssertErrorWithJS(ctx: jsc.JSContextRef, msg_js: jsc.JSValueRef) jsc.JSValueRef {
     const global = jsc.JSContextGetGlobalObject(ctx);
-    const k = jsc.JSStringCreateWithUTF8CString("__assert_msg");
-    defer jsc.JSStringRelease(k);
-    _ = jsc.JSObjectSetProperty(ctx, global, k, msg_js, jsc.kJSPropertyAttributeNone, null);
-    const script = "throw new Error(globalThis.__assert_msg);";
-    const script_ref = jsc.JSStringCreateWithUTF8CString(script);
-    defer jsc.JSStringRelease(script_ref);
-    _ = jsc.JSEvaluateScript(ctx, script_ref, null, null, 1, null);
-    return jsc.JSValueMakeUndefined(ctx);
+    const k_Error = jsc.JSStringCreateWithUTF8CString("Error");
+    defer jsc.JSStringRelease(k_Error);
+    const Error_ctor = jsc.JSObjectGetProperty(ctx, global, k_Error, null);
+    const err_obj = jsc.JSValueToObject(ctx, Error_ctor, null) orelse return jsc.JSValueMakeUndefined(ctx);
+    var args: [1]jsc.JSValueRef = .{msg_js};
+    var exception: ?jsc.JSValueRef = null;
+    const err_instance = jsc.JSObjectCallAsConstructor(ctx, err_obj, 1, &args, @ptrCast(&exception));
+    if (exception != null) return jsc.JSValueMakeUndefined(ctx);
+    return common.setThrowAndThrow(ctx, err_instance);
 }
 
-/// assert.strictEqual(actual, expected [, message])
+/// 纯 Zig 严格相等：===（同类型且同值；NaN !== NaN）
+fn jsValueStrictEqual(ctx: jsc.JSContextRef, a: jsc.JSValueRef, b: jsc.JSValueRef) bool {
+    if (a == b) return true;
+    if (jsc.JSValueIsUndefined(ctx, a)) return jsc.JSValueIsUndefined(ctx, b);
+    if (jsc.JSValueIsNull(ctx, a)) return jsc.JSValueIsNull(ctx, b);
+    const na = jsc.JSValueToNumber(ctx, a, null);
+    const nb = jsc.JSValueToNumber(ctx, b, null);
+    if (na == na and nb == nb) return na == nb;
+    const obj_a = jsc.JSValueToObject(ctx, a, null);
+    const obj_b = jsc.JSValueToObject(ctx, b, null);
+    if (obj_a != null and obj_b != null) return obj_a == obj_b;
+    const sa = jsc.JSValueToStringCopy(ctx, a, null);
+    defer jsc.JSStringRelease(sa);
+    const sb = jsc.JSValueToStringCopy(ctx, b, null);
+    defer jsc.JSStringRelease(sb);
+    const len_a = jsc.JSStringGetMaximumUTF8CStringSize(sa);
+    const len_b = jsc.JSStringGetMaximumUTF8CStringSize(sb);
+    if (len_a != len_b or len_a == 0) return false;
+    var buf_a: [256]u8 = undefined;
+    var buf_b: [256]u8 = undefined;
+    const slice_a = if (len_a <= buf_a.len) buf_a[0..] else buf_a[0..buf_a.len];
+    const slice_b = if (len_b <= buf_b.len) buf_b[0..] else buf_b[0..buf_b.len];
+    const n_a = jsc.JSStringGetUTF8CString(sa, slice_a.ptr, slice_a.len);
+    const n_b = jsc.JSStringGetUTF8CString(sb, slice_b.ptr, slice_b.len);
+    return n_a == n_b and std.mem.eql(u8, slice_a[0 .. n_a - 1], slice_b[0 .. n_b - 1]);
+}
+
+/// assert.strictEqual(actual, expected [, message])：纯 Zig 比较，不相等则 new Error(message) 并 throw
 fn strictEqualCallback(
     ctx: jsc.JSContextRef,
     _: jsc.JSObjectRef,
@@ -29,43 +57,54 @@ fn strictEqualCallback(
     _: [*]jsc.JSValueRef,
 ) callconv(.c) jsc.JSValueRef {
     if (argumentCount < 2) return jsc.JSValueMakeUndefined(ctx);
-    const allocator = globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
-    const global = jsc.JSContextGetGlobalObject(ctx);
-    const k_a = jsc.JSStringCreateWithUTF8CString("__assert_a");
-    defer jsc.JSStringRelease(k_a);
-    const k_b = jsc.JSStringCreateWithUTF8CString("__assert_b");
-    defer jsc.JSStringRelease(k_b);
-    _ = jsc.JSObjectSetProperty(ctx, global, k_a, arguments[0], jsc.kJSPropertyAttributeNone, null);
-    _ = jsc.JSObjectSetProperty(ctx, global, k_b, arguments[1], jsc.kJSPropertyAttributeNone, null);
-    const msg = if (argumentCount >= 3) blk: {
-        const str_ref = jsc.JSValueToStringCopy(ctx, arguments[2], null);
-        defer jsc.JSStringRelease(str_ref);
-        const max_sz = jsc.JSStringGetMaximumUTF8CStringSize(str_ref);
-        if (max_sz == 0 or max_sz > 200) break :blk "strictEqual";
-        const buf = allocator.alloc(u8, max_sz) catch break :blk "strictEqual";
-        defer allocator.free(buf);
-        const n = jsc.JSStringGetUTF8CString(str_ref, buf.ptr, max_sz);
-        if (n == 0) break :blk "strictEqual";
-        break :blk allocator.dupe(u8, buf[0 .. n - 1]) catch "strictEqual";
-    } else "strictEqual";
-    defer if (argumentCount >= 3 and msg.len > 0 and msg.ptr != "strictEqual".ptr) globals.current_allocator.?.free(msg);
-    const script = "if(globalThis.__assert_a!==globalThis.__assert_b) throw new Error(globalThis.__assert_msg||'strictEqual');";
-    const script_z = allocator.dupeZ(u8, script) catch return jsc.JSValueMakeUndefined(ctx);
-    defer allocator.free(script_z);
-    if (argumentCount >= 3) {
-        const k_msg = jsc.JSStringCreateWithUTF8CString("__assert_msg");
-        defer jsc.JSStringRelease(k_msg);
-        const msg_ref = jsc.JSStringCreateWithUTF8CString(if (msg.ptr != "strictEqual".ptr) msg.ptr else "strictEqual");
-        defer jsc.JSStringRelease(msg_ref);
-        _ = jsc.JSObjectSetProperty(ctx, global, k_msg, jsc.JSValueMakeString(ctx, msg_ref), jsc.kJSPropertyAttributeNone, null);
-    }
-    const script_ref = jsc.JSStringCreateWithUTF8CString(script_z.ptr);
-    defer jsc.JSStringRelease(script_ref);
-    _ = jsc.JSEvaluateScript(ctx, script_ref, null, null, 1, null);
+    if (jsValueStrictEqual(ctx, arguments[0], arguments[1])) return jsc.JSValueMakeUndefined(ctx);
+    const msg_js = if (argumentCount >= 3) arguments[2] else blk: {
+        const ref = jsc.JSStringCreateWithUTF8CString("strictEqual");
+        defer jsc.JSStringRelease(ref);
+        break :blk jsc.JSValueMakeString(ctx, ref);
+    };
+    _ = throwAssertErrorWithJS(ctx, msg_js);
     return jsc.JSValueMakeUndefined(ctx);
 }
 
-/// assert.deepStrictEqual(actual, expected [, message])：递归深度比较，不相等则抛错
+/// 递归深度比较（纯 Zig）：a === b 直接 true；非对象或 null 用严格相等；对象则比较 key 数量与每 key 的 hasOwnProperty + 递归
+fn jsValueDeepStrictEqual(ctx: jsc.JSContextRef, a: jsc.JSValueRef, b: jsc.JSValueRef) bool {
+    if (jsValueStrictEqual(ctx, a, b)) return true;
+    const obj_a = jsc.JSValueToObject(ctx, a, null);
+    const obj_b = jsc.JSValueToObject(ctx, b, null);
+    if (obj_a == null or obj_b == null) return false;
+    const names_a = jsc.JSObjectCopyPropertyNames(ctx, obj_a.?);
+    defer jsc.JSPropertyNameArrayRelease(names_a);
+    const names_b = jsc.JSObjectCopyPropertyNames(ctx, obj_b.?);
+    defer jsc.JSPropertyNameArrayRelease(names_b);
+    const count_a = jsc.JSPropertyNameArrayGetCount(names_a);
+    const count_b = jsc.JSPropertyNameArrayGetCount(names_b);
+    if (count_a != count_b) return false;
+    const global = jsc.JSContextGetGlobalObject(ctx);
+    const k_Object = jsc.JSStringCreateWithUTF8CString("Object");
+    defer jsc.JSStringRelease(k_Object);
+    const k_prototype = jsc.JSStringCreateWithUTF8CString("prototype");
+    defer jsc.JSStringRelease(k_prototype);
+    const k_hasOwnProperty = jsc.JSStringCreateWithUTF8CString("hasOwnProperty");
+    defer jsc.JSStringRelease(k_hasOwnProperty);
+    const Object_ctor = jsc.JSObjectGetProperty(ctx, global, k_Object, null);
+    const proto = jsc.JSObjectGetProperty(ctx, @ptrCast(Object_ctor), k_prototype, null);
+    const hasOwn_fn = jsc.JSObjectGetProperty(ctx, @ptrCast(proto), k_hasOwnProperty, null);
+    var i: usize = 0;
+    while (i < count_a) : (i += 1) {
+        const key = jsc.JSPropertyNameArrayGetNameAtIndex(names_a, i);
+        var key_arg: [1]jsc.JSValueRef = .{jsc.JSValueMakeString(ctx, key)};
+        var exc: ?jsc.JSValueRef = null;
+        const has = jsc.JSObjectCallAsFunction(ctx, @ptrCast(hasOwn_fn), @ptrCast(obj_b.?), 1, &key_arg, @ptrCast(&exc));
+        if (!jsc.JSValueToBoolean(ctx, has)) return false;
+        const val_a = jsc.JSObjectGetProperty(ctx, obj_a.?, key, null);
+        const val_b = jsc.JSObjectGetProperty(ctx, obj_b.?, key, null);
+        if (!jsValueDeepStrictEqual(ctx, val_a, val_b)) return false;
+    }
+    return true;
+}
+
+/// assert.deepStrictEqual(actual, expected [, message])：纯 Zig 深度比较，不相等则 new Error 并 throw
 fn deepStrictEqualCallback(
     ctx: jsc.JSContextRef,
     _: jsc.JSObjectRef,
@@ -75,20 +114,10 @@ fn deepStrictEqualCallback(
     _: [*]jsc.JSValueRef,
 ) callconv(.c) jsc.JSValueRef {
     if (argumentCount < 2) return jsc.JSValueMakeUndefined(ctx);
-    const allocator = globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
-    const global = jsc.JSContextGetGlobalObject(ctx);
-    const k_a = jsc.JSStringCreateWithUTF8CString("__assert_a");
-    defer jsc.JSStringRelease(k_a);
-    const k_b = jsc.JSStringCreateWithUTF8CString("__assert_b");
-    defer jsc.JSStringRelease(k_b);
-    _ = jsc.JSObjectSetProperty(ctx, global, k_a, arguments[0], jsc.kJSPropertyAttributeNone, null);
-    _ = jsc.JSObjectSetProperty(ctx, global, k_b, arguments[1], jsc.kJSPropertyAttributeNone, null);
-    const script = "(function(a,b){ if(a===b) return; if(typeof a!=='object'||a===null||typeof b!=='object'||b===null) throw new Error('deepStrictEqual'); var ka=Object.keys(a),kb=Object.keys(b); if(ka.length!==kb.length) throw new Error('deepStrictEqual'); for(var i=0;i<ka.length;i++){ var k=ka[i]; if(!Object.prototype.hasOwnProperty.call(b,k)) throw new Error('deepStrictEqual'); arguments.callee(a[k],b[k]); } })(globalThis.__assert_a,globalThis.__assert_b);";
-    const script_z = allocator.dupeZ(u8, script) catch return jsc.JSValueMakeUndefined(ctx);
-    defer allocator.free(script_z);
-    const script_ref = jsc.JSStringCreateWithUTF8CString(script_z.ptr);
-    defer jsc.JSStringRelease(script_ref);
-    _ = jsc.JSEvaluateScript(ctx, script_ref, null, null, 1, null);
+    if (jsValueDeepStrictEqual(ctx, arguments[0], arguments[1])) return jsc.JSValueMakeUndefined(ctx);
+    const ref = jsc.JSStringCreateWithUTF8CString("deepStrictEqual");
+    defer jsc.JSStringRelease(ref);
+    _ = throwAssertErrorWithJS(ctx, jsc.JSValueMakeString(ctx, ref));
     return jsc.JSValueMakeUndefined(ctx);
 }
 

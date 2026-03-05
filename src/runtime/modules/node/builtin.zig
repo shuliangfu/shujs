@@ -128,7 +128,7 @@ pub fn getNodeBuiltin(ctx: jsc.JSContextRef, allocator: std.mem.Allocator, speci
     if (std.mem.eql(u8, specifier, "node:process")) return shu_builtin.getShuBuiltin(ctx, allocator, "shu:process");
     if (std.mem.eql(u8, specifier, "node:timers")) return shu_builtin.getShuBuiltin(ctx, allocator, "shu:timers");
     if (std.mem.eql(u8, specifier, "node:console")) return shu_builtin.getShuBuiltin(ctx, allocator, "shu:console");
-    if (std.mem.eql(u8, specifier, "node:child_process")) return shu_builtin.getShuBuiltin(ctx, allocator, "shu:system");
+    if (std.mem.eql(u8, specifier, "node:child_process")) return shu_builtin.getShuBuiltin(ctx, allocator, "shu:cmd");
     if (std.mem.eql(u8, specifier, "node:worker_threads")) return shu_builtin.getShuBuiltin(ctx, allocator, "shu:threads");
     if (std.mem.eql(u8, specifier, "node:buffer")) return shu_builtin.getShuBuiltin(ctx, allocator, "shu:buffer");
     if (std.mem.eql(u8, specifier, "node:stream")) return shu_builtin.getShuBuiltin(ctx, allocator, "shu:stream");
