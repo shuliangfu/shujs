@@ -90,6 +90,7 @@ pub const Engine = struct {
         defer jsc.JSStringRelease(script_ref);
         _ = jsc.JSEvaluateScript(@ptrCast(self.ctx), script_ref, null, null, 1, null);
         if (engine_globals.drain_async_file_io) |drain| drain(@ptrCast(self.ctx.?));
+        if (engine_globals.drain_fs_watch) |drain| drain(@ptrCast(self.ctx.?));
         self.timer_state.runMicrotasks(@ptrCast(self.ctx.?));
         self.timer_state.runLoop(@ptrCast(self.ctx.?));
     }
@@ -123,6 +124,7 @@ pub const Engine = struct {
         }
         esm_loader.runAsEsmModule(@ptrCast(self.ctx.?), self.allocator, entry_path, source);
         if (engine_globals.drain_async_file_io) |drain| drain(@ptrCast(self.ctx.?));
+        if (engine_globals.drain_fs_watch) |drain| drain(@ptrCast(self.ctx.?));
         self.timer_state.runMicrotasks(@ptrCast(self.ctx.?));
         self.timer_state.runLoop(@ptrCast(self.ctx.?));
     }
