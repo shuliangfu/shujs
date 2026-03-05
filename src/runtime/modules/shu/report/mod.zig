@@ -1,4 +1,5 @@
 // shu:report — 与 node:report API 兼容，纯 Zig 实现
+// 所有权：getReport/writeReport 为 JS API，返回值 JSC 持有；buildReportString [Allocates] 返回切片由调用方 free。
 //
 // ========== API 兼容情况 ==========
 //
@@ -19,7 +20,7 @@ const globals = @import("../../../globals.zig");
 /// 超过此长度写文件时用 libs_io.mapFileReadWrite，减少大报告时的多次 write 与拷贝
 const REPORT_MAP_THRESHOLD = 64 * 1024;
 
-/// 生成简单诊断报告字符串（不含真实堆栈；与 Node report 格式近似）；返回的切片由调用方 free。Zig 0.16：用 bufPrint + appendSlice 替代 writer.print。
+/// [Allocates] 生成简单诊断报告字符串（不含真实堆栈；与 Node report 格式近似）；返回的切片由调用方 free。Zig 0.16：用 bufPrint + appendSlice 替代 writer.print。
 fn buildReportString(allocator: std.mem.Allocator) []const u8 {
     var list = std.ArrayList(u8).initCapacity(allocator, 2048) catch return "";
     var buf: [512]u8 = undefined;
