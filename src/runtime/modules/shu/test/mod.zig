@@ -48,6 +48,7 @@
 
 const std = @import("std");
 const jsc = @import("jsc");
+const promise_mod = @import("../promise.zig");
 const common = @import("../../../common.zig");
 const globals = @import("../../../globals.zig");
 const runner = @import("runner.zig");
@@ -55,6 +56,13 @@ const mock = @import("mock.zig");
 const c = std.c;
 const libs_process = @import("libs_process");
 const libs_io = @import("libs_io");
+
+/// ANSI 颜色：用例结果 ok/fail/skipped 与耗时 (Nms) 在 TTY 下着色；与 CLI test.zig 语义一致。
+const c_green = "\x1b[32m";
+const c_red = "\x1b[31m";
+const c_yellow = "\x1b[33m";
+const c_cyan = "\x1b[36m";
+const c_reset = "\x1b[0m";
 
 /// 判断是否为保留消息 "true"(4) 或 "false"(5)，用于 skip/todo 的 message 是否需复制（00 §2.1 len+整型比较）
 fn isReservedMessage(m: []const u8) bool {
@@ -109,12 +117,44 @@ const RunState = struct {
     coverage_dir: ?[]const u8 = null,
     /// SHU_TEST_CWD：测试运行的项目根目录（绝对路径），用于解析 snapshot_file/coverage_dir；[Allocates]，state 持有，runNext 结束时 free。
     test_cwd: ?[]const u8 = null,
+    /// 用例级计数：供 shu test CLI 汇总用；run 结束时写入 stderr 一行 __SHU_TEST_CASES__ 供解析。
+    case_passed: u32 = 0,
+    case_failed: u32 = 0,
+    case_skipped: u32 = 0,
+    /// run 开始时间（毫秒），用于每条用例耗时及 writeCaseSummaryToStderr；不在此处打印 per-file 汇总，由 CLI 最后统一打印 Test cases。
+    run_start_ms: i64 = 0,
+    /// 当前用例开始时间（毫秒），用于每条 "name ... ok (Nms)" 的 N。
+    current_test_start_ms: i64 = 0,
+    /// SHU_TEST_BAIL / --fail-fast：true 时首个失败即 reject 并停止；false（默认）时跑完全部用例再 resolve，仅设 exitCode=1。
+    fail_fast: bool = false,
+    /// 同步抛错时 rejectWrapper 已对 job_index +1，外层 runNext 返回时不要再 +1，避免覆盖 setImmediate 后的正确索引。
+    reject_wrapper_did_advance: bool = false,
+    /// !fail_fast 时记录刚失败的 run_test 的 job 下标，advanceCallback 中对该下标不打印 ok、不增加 case_passed。
+    last_failed_job_index: ?usize = null,
+    /// 仅在 runTestJob 同步抛错并调用 reject wrapper 前设为 true，rejectWrapperCallback 内据此区分同步/异步以正确计算 failed_job_idx，用后清 false。
+    reject_is_sync: bool = false,
+    /// 已打印过 "(test failed, job_index=N)" 的 N，同一 job_index 只打印一次，避免 reject 被多次调用时刷屏。
+    last_printed_generic_fail_job_index: ?usize = null,
+    /// 上一轮实际执行过的 job 下标；同一 job 绝不执行第二次，用于破除任何路径导致的死循环。
+    last_run_job_index: ?usize = null,
 
     fn runNext(state: *RunState) void {
+        state.reject_wrapper_did_advance = false;
+        state.last_printed_generic_fail_job_index = null;
+        // 防止重复运行已失败用例：若索引仍停在失败用例或之前，强制推进到失败用例之后
+        if (state.last_failed_job_index) |idx| {
+            if (state.job_index <= idx) state.job_index = idx + 1;
+            state.last_failed_job_index = null;
+        }
+        // 硬性防护：同一 job 只执行一次，避免成功/失败路径下索引错乱导致的死循环
+        while (state.job_index < state.jobs.items.len and state.last_run_job_index != null and state.job_index == state.last_run_job_index.?) {
+            state.job_index += 1;
+        }
         if (state.job_index >= state.jobs.items.len) {
             saveSnapshotToFileIfRequested(state);
             writeCoveragePlaceholderIfRequested(state);
             writeJUnitIfRequested(state);
+            writeCaseSummaryToStderr(state);
             var no_args: [0]jsc.JSValueRef = undefined;
             _ = jsc.JSObjectCallAsFunction(state.ctx, @ptrCast(state.resolve_ref), null, 0, &no_args, null);
             state.jobs.deinit(state.allocator);
@@ -129,8 +169,19 @@ const RunState = struct {
         }
         if (!state.retry_pending) state.retry_count = 0;
         state.retry_pending = false;
+        // 首次进入时打印 "running N tests from path"（Deno 风格）并记录 run_start_ms
+        if (state.job_index == 0) {
+            var run_test_count: usize = 0;
+            for (state.jobs.items) |j| {
+                if (j == .run_test) run_test_count += 1;
+            }
+            const path = if (c.getenv("SHU_TEST_FILE_PATH")) |p| std.mem.span(p) else "unknown";
+            printTestLineStdout("\nrunning {d} tests from {s}\n", .{ run_test_count, path });
+            state.run_start_ms = nowMs();
+        }
+        state.last_run_job_index = state.job_index;
         const result = runCurrentJob(state);
-        state.job_index += 1;
+        if (!state.reject_wrapper_did_advance) state.job_index += 1;
         if (result.defer_advance) {
             // 回调风格测试 (t.done)：不调度，等用户调 t.done() 时触发 advance
         } else if (isThenable(state.ctx, result.value)) {
@@ -164,13 +215,20 @@ const RunState = struct {
                 return .{ .value = jsc.JSValueMakeUndefined(state.ctx), .defer_advance = false };
             defer state.allocator.free(full_name);
             if (state.name_pattern) |pat| {
-                if (std.mem.indexOf(u8, full_name, pat) == null)
+                if (std.mem.indexOf(u8, full_name, pat) == null) {
+                    state.case_skipped += 1;
+                    printTestResultLine(full_name, .skipped, null);
                     return .{ .value = jsc.JSValueMakeUndefined(state.ctx), .defer_advance = false };
+                }
             }
             if (state.skip_pattern) |pat| {
-                if (std.mem.indexOf(u8, full_name, pat) != null)
+                if (std.mem.indexOf(u8, full_name, pat) != null) {
+                    state.case_skipped += 1;
+                    printTestResultLine(full_name, .skipped, null);
                     return .{ .value = jsc.JSValueMakeUndefined(state.ctx), .defer_advance = false };
+                }
             }
+            state.current_test_start_ms = nowMs();
             if (state.junit_outfile != null) {
                 const name_owned = state.allocator.dupe(u8, full_name) catch return .{ .value = jsc.JSValueMakeUndefined(state.ctx), .defer_advance = false };
                 state.junit_results.append(state.allocator, .{ .name = name_owned, .passed = true, .message = null }) catch {
@@ -178,7 +236,7 @@ const RunState = struct {
                     return .{ .value = jsc.JSValueMakeUndefined(state.ctx), .defer_advance = false };
                 };
             }
-            return runTestJob(state.ctx, p.suite, p.test_idx, state.has_only);
+            return runTestJob(state.ctx, state, p.suite, p.test_idx, state.has_only);
         }
     }
 };
@@ -188,18 +246,37 @@ fn callHook(ctx: jsc.JSContextRef, fn_ref: jsc.JSValueRef) jsc.JSValueRef {
     return jsc.JSObjectCallAsFunction(ctx, @ptrCast(fn_ref), null, 0, &no_args, null);
 }
 
-fn runTestJob(ctx: jsc.JSContextRef, suite: *runner.Suite, test_idx: usize, has_only: bool) JobResult {
+fn runTestJob(ctx: jsc.JSContextRef, state: *RunState, suite: *runner.Suite, test_idx: usize, has_only: bool) JobResult {
     const t_entry = &suite.tests.items[test_idx];
-    if (t_entry.skip) return .{ .value = jsc.JSValueMakeUndefined(ctx), .defer_advance = false };
-    if (t_entry.skip_if_ref) |skip_if| {
-        const cond = if (jsc.JSObjectIsFunction(ctx, @ptrCast(skip_if))) blk: {
-            var no_args: [0]jsc.JSValueRef = undefined;
-            break :blk jsc.JSObjectCallAsFunction(ctx, @ptrCast(skip_if), null, 0, &no_args, null);
-        } else skip_if;
-        if (!jsc.JSValueIsUndefined(ctx, cond) and !jsc.JSValueIsNull(ctx, cond) and jsc.JSValueToBoolean(ctx, cond))
-            return .{ .value = jsc.JSValueMakeUndefined(ctx), .defer_advance = false };
+    if (t_entry.skip) {
+        state.case_skipped += 1;
+        const full_name = runner.getFullTestName(state.allocator, suite, test_idx) catch return .{ .value = jsc.JSValueMakeUndefined(ctx), .defer_advance = false };
+        defer state.allocator.free(full_name);
+        printTestResultLine(full_name, .skipped, null);
+        return .{ .value = jsc.JSValueMakeUndefined(ctx), .defer_advance = false };
     }
-    if (has_only and !t_entry.only) return .{ .value = jsc.JSValueMakeUndefined(ctx), .defer_advance = false };
+    if (t_entry.skip_if_ref) |skip_if| {
+        // skipIf 可能是布尔/原始值或函数；仅当能转为对象且为函数时才调用，否则当原始值用
+        const as_obj = jsc.JSValueToObject(ctx, skip_if, null);
+        const cond = if (as_obj != null and jsc.JSObjectIsFunction(ctx, as_obj.?)) blk: {
+            var no_args: [0]jsc.JSValueRef = undefined;
+            break :blk jsc.JSObjectCallAsFunction(ctx, as_obj.?, null, 0, &no_args, null);
+        } else skip_if;
+        if (!jsc.JSValueIsUndefined(ctx, cond) and !jsc.JSValueIsNull(ctx, cond) and jsc.JSValueToBoolean(ctx, cond)) {
+            state.case_skipped += 1;
+            const full_name = runner.getFullTestName(state.allocator, suite, test_idx) catch return .{ .value = jsc.JSValueMakeUndefined(ctx), .defer_advance = false };
+            defer state.allocator.free(full_name);
+            printTestResultLine(full_name, .skipped, null);
+            return .{ .value = jsc.JSValueMakeUndefined(ctx), .defer_advance = false };
+        }
+    }
+    if (has_only and !t_entry.only) {
+        state.case_skipped += 1;
+        const full_name = runner.getFullTestName(state.allocator, suite, test_idx) catch return .{ .value = jsc.JSValueMakeUndefined(ctx), .defer_advance = false };
+        defer state.allocator.free(full_name);
+        printTestResultLine(full_name, .skipped, null);
+        return .{ .value = jsc.JSValueMakeUndefined(ctx), .defer_advance = false };
+    }
     const t_ctx = jsc.JSObjectMake(ctx, null, null);
     // t.name：当前用例名（与 node:test 对齐），只读
     const name_z = suite.allocator.dupeZ(u8, t_entry.name) catch return .{ .value = jsc.JSValueMakeUndefined(ctx), .defer_advance = false };
@@ -222,16 +299,37 @@ fn runTestJob(ctx: jsc.JSContextRef, suite: *runner.Suite, test_idx: usize, has_
     _ = jsc.JSObjectSetProperty(ctx, t_ctx, k_skip, advance, jsc.kJSPropertyAttributeNone, null);
     _ = jsc.JSObjectSetProperty(ctx, t_ctx, k_todo, advance, jsc.kJSPropertyAttributeNone, null);
     _ = jsc.JSObjectSetProperty(ctx, t_ctx, k_step, jsc.JSObjectMakeFunctionWithCallback(ctx, k_step, stepCallback), jsc.kJSPropertyAttributeNone, null);
-    var args = [_]jsc.JSValueRef{t_ctx};
-    const ret = jsc.JSObjectCallAsFunction(ctx, @ptrCast(t_entry.fn_ref), null, 1, &args, null);
+    // 通过 __shu_test_run_test_fn 包装：内部执行 testFn(t)，同步异常时存 exc 并返回 Promise.reject(exc)，保证 reject 收到正确 Error（避免 JSC 嵌套 exception 不填回 &exc）
+    const run_test_fn = getRunTestWrapperFn(ctx);
+    if (!jsc.JSObjectIsFunction(ctx, @ptrCast(run_test_fn))) {
+        if (t_entry.todo) return .{ .value = jsc.JSValueMakeUndefined(ctx), .defer_advance = false };
+        var args_direct = [_]jsc.JSValueRef{t_ctx};
+        var exc_direct: jsc.JSValueRef = undefined;
+        const ret_direct = jsc.JSObjectCallAsFunction(ctx, @ptrCast(t_entry.fn_ref), null, 1, &args_direct, @ptrCast(&exc_direct));
+        const defer_advance = jsc.JSValueIsUndefined(ctx, ret_direct) and !isThenable(ctx, ret_direct);
+        return .{ .value = ret_direct, .defer_advance = defer_advance };
+    }
+    var wrap_args = [_]jsc.JSValueRef{ t_entry.fn_ref, t_ctx };
+    const promise = jsc.JSObjectCallAsFunction(ctx, @ptrCast(run_test_fn), null, 2, &wrap_args, null);
+    if (!jsc.JSValueIsUndefined(ctx, promise) and isThenable(ctx, promise)) {
+        thenChain(ctx, promise, state);
+        return .{ .value = jsc.JSValueMakeUndefined(ctx), .defer_advance = false };
+    }
     if (t_entry.todo) return .{ .value = jsc.JSValueMakeUndefined(ctx), .defer_advance = false };
-    const defer_advance = jsc.JSValueIsUndefined(ctx, ret) and !isThenable(ctx, ret);
-    return .{ .value = ret, .defer_advance = defer_advance };
+    const defer_advance = jsc.JSValueIsUndefined(ctx, promise) or !isThenable(ctx, promise);
+    return .{ .value = promise, .defer_advance = defer_advance };
 }
 
 fn getAdvanceFn(ctx: jsc.JSContextRef) jsc.JSValueRef {
     const global = jsc.JSContextGetGlobalObject(ctx);
     const k = jsc.JSStringCreateWithUTF8CString("__shu_test_advance");
+    defer jsc.JSStringRelease(k);
+    return jsc.JSObjectGetProperty(ctx, global, k, null);
+}
+
+fn getRunTestWrapperFn(ctx: jsc.JSContextRef) jsc.JSValueRef {
+    const global = jsc.JSContextGetGlobalObject(ctx);
+    const k = jsc.JSStringCreateWithUTF8CString("__shu_test_run_test_fn");
     defer jsc.JSStringRelease(k);
     return jsc.JSObjectGetProperty(ctx, global, k, null);
 }
@@ -254,10 +352,8 @@ fn stepCallback(
     defer jsc.JSStringRelease(k_exec);
     const exec = jsc.JSObjectMakeFunctionWithCallback(ctx, k_exec, stepExecutorCallback);
     var args = [_]jsc.JSValueRef{exec};
-    const k_promise = jsc.JSStringCreateWithUTF8CString("Promise");
-    defer jsc.JSStringRelease(k_promise);
-    const Promise_ctor = jsc.JSObjectGetProperty(ctx, global, k_promise, null);
-    return jsc.JSObjectCallAsConstructor(ctx, @ptrCast(Promise_ctor), 1, &args, null);
+    const Promise_ctor = promise_mod.getPromiseConstructor(ctx) orelse return jsc.JSValueMakeUndefined(ctx);
+    return jsc.JSObjectCallAsConstructor(ctx, Promise_ctor, 1, &args, null);
 }
 
 /// t.step 的 Promise executor：调用 __shu_step_fn()，thenable 则链 then(resolve, reject)，否则 resolve(undefined)；抛错则 reject
@@ -329,6 +425,91 @@ fn isThenable(ctx: jsc.JSContextRef, val: jsc.JSValueRef) bool {
     return jsc.JSObjectIsFunction(ctx, @ptrCast(then_val));
 }
 
+// 全局槽名：包装测试调用时把同步异常/返回值存到这里，供 Promise executor 读取
+const k_shu_test_last_exc = "__shu_test_last_exc";
+const k_shu_test_ret = "__shu_test_ret";
+
+/// Promise executor：从 global 读取 __shu_test_last_exc 并调用 reject(exc)，保证 reject 收到 C 层捕获的 Error
+fn promiseRejectExecutorCallback(
+    ctx: jsc.JSContextRef,
+    _: jsc.JSObjectRef,
+    _: jsc.JSObjectRef,
+    argumentCount: usize,
+    arguments: [*]const jsc.JSValueRef,
+    _: [*]jsc.JSValueRef,
+) callconv(.c) jsc.JSValueRef {
+    if (argumentCount < 2) return jsc.JSValueMakeUndefined(ctx);
+    const global = jsc.JSContextGetGlobalObject(ctx);
+    const k = jsc.JSStringCreateWithUTF8CString(k_shu_test_last_exc);
+    defer jsc.JSStringRelease(k);
+    const exc = jsc.JSObjectGetProperty(ctx, global, k, null);
+    const reject_fn = arguments[1];
+    var one = [_]jsc.JSValueRef{exc};
+    _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(reject_fn), null, 1, &one, null);
+    return jsc.JSValueMakeUndefined(ctx);
+}
+
+/// Promise executor：从 global 读取 __shu_test_ret 并调用 resolve(ret)
+fn promiseResolveExecutorCallback(
+    ctx: jsc.JSContextRef,
+    _: jsc.JSObjectRef,
+    _: jsc.JSObjectRef,
+    argumentCount: usize,
+    arguments: [*]const jsc.JSValueRef,
+    _: [*]jsc.JSValueRef,
+) callconv(.c) jsc.JSValueRef {
+    if (argumentCount < 1) return jsc.JSValueMakeUndefined(ctx);
+    const global = jsc.JSContextGetGlobalObject(ctx);
+    const k = jsc.JSStringCreateWithUTF8CString(k_shu_test_ret);
+    defer jsc.JSStringRelease(k);
+    const ret = jsc.JSObjectGetProperty(ctx, global, k, null);
+    const resolve_fn = arguments[0];
+    var one = [_]jsc.JSValueRef{ret};
+    _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(resolve_fn), null, 1, &one, null);
+    return jsc.JSValueMakeUndefined(ctx);
+}
+
+/// 包装单次测试调用：执行 testFn(t)，若同步抛错则把 exc 存到 global 并返回 Promise.reject(exc)，否则返回 thenable 或 Promise.resolve(ret)。
+/// 这样无论 JSC 是否把嵌套 C 回调的 exception 填回 &exc，reject 都能收到正确的 Error。
+fn runTestWrapperCallback(
+    ctx: jsc.JSContextRef,
+    _: jsc.JSObjectRef,
+    _: jsc.JSObjectRef,
+    argumentCount: usize,
+    arguments: [*]const jsc.JSValueRef,
+    _: [*]jsc.JSValueRef,
+) callconv(.c) jsc.JSValueRef {
+    if (argumentCount < 2) return jsc.JSValueMakeUndefined(ctx);
+    const test_fn = arguments[0];
+    const t_ctx = arguments[1];
+    if (!jsc.JSObjectIsFunction(ctx, @ptrCast(test_fn))) return jsc.JSValueMakeUndefined(ctx);
+    var args = [_]jsc.JSValueRef{t_ctx};
+    var exc: jsc.JSValueRef = undefined;
+    const ret = jsc.JSObjectCallAsFunction(ctx, @ptrCast(test_fn), null, 1, &args, @ptrCast(&exc));
+    const global = jsc.JSContextGetGlobalObject(ctx);
+    if (!jsc.JSValueIsUndefined(ctx, exc) and !jsc.JSValueIsNull(ctx, exc)) {
+        const k_exc = jsc.JSStringCreateWithUTF8CString(k_shu_test_last_exc);
+        defer jsc.JSStringRelease(k_exc);
+        _ = jsc.JSObjectSetProperty(ctx, global, k_exc, exc, jsc.kJSPropertyAttributeNone, null);
+        const k_exec = jsc.JSStringCreateWithUTF8CString("");
+        defer jsc.JSStringRelease(k_exec);
+        const executor = jsc.JSObjectMakeFunctionWithCallback(ctx, k_exec, promiseRejectExecutorCallback);
+        const Promise_ctor = promise_mod.getPromiseConstructor(ctx) orelse return jsc.JSValueMakeUndefined(ctx);
+        var exec_arg = [_]jsc.JSValueRef{executor};
+        return jsc.JSObjectCallAsConstructor(ctx, Promise_ctor, 1, &exec_arg, null);
+    }
+    if (isThenable(ctx, ret)) return ret;
+    const k_ret = jsc.JSStringCreateWithUTF8CString(k_shu_test_ret);
+    defer jsc.JSStringRelease(k_ret);
+    _ = jsc.JSObjectSetProperty(ctx, global, k_ret, ret, jsc.kJSPropertyAttributeNone, null);
+    const k_exec2 = jsc.JSStringCreateWithUTF8CString("");
+    defer jsc.JSStringRelease(k_exec2);
+    const executor2 = jsc.JSObjectMakeFunctionWithCallback(ctx, k_exec2, promiseResolveExecutorCallback);
+    const Promise_ctor2 = promise_mod.getPromiseConstructor(ctx) orelse return jsc.JSValueMakeUndefined(ctx);
+    var exec_arg2 = [_]jsc.JSValueRef{executor2};
+    return jsc.JSObjectCallAsConstructor(ctx, Promise_ctor2, 1, &exec_arg2, null);
+}
+
 /// Promise.then(advance, rejectWrapper)：成功时 advance 继续下一 job，失败时 wrapper 设 process.exitCode 并调 reject
 fn thenChain(ctx: jsc.JSContextRef, promise: jsc.JSValueRef, state: *RunState) void {
     _ = state;
@@ -352,6 +533,24 @@ fn advanceCallback(
     _: [*]jsc.JSValueRef,
 ) callconv(.c) jsc.JSValueRef {
     const state = g_run_state orelse return jsc.JSValueMakeUndefined(ctx);
+    // runNext 在 runCurrentJob 返回后已执行 job_index += 1，故刚完成的 job 为 job_index - 1
+    if (state.job_index > 0 and state.jobs.items[state.job_index - 1] == .run_test) {
+        const just_completed_idx = state.job_index - 1;
+        // !fail_fast 时该用例可能已失败并打印过 fail，不再打印 ok、不增加 case_passed
+        const skip_ok = state.last_failed_job_index != null and state.last_failed_job_index.? == just_completed_idx;
+        if (skip_ok) state.last_failed_job_index = null else {
+            state.case_passed += 1;
+            const p = state.jobs.items[just_completed_idx].run_test;
+            const elapsed = nowMs() - state.current_test_start_ms;
+            if (runner.getFullTestName(state.allocator, p.suite, p.test_idx)) |full_name| {
+                defer state.allocator.free(full_name);
+                printTestResultLine(full_name, .ok, elapsed);
+            } else |_| {
+                const t_name = p.suite.tests.items[p.test_idx].name;
+                printTestResultLine(t_name, .ok, elapsed);
+            }
+        }
+    }
     RunState.runNext(state);
     return jsc.JSValueMakeUndefined(ctx);
 }
@@ -381,7 +580,7 @@ fn jsValueToUtf8Alloc(ctx: jsc.JSContextRef, allocator: std.mem.Allocator, val: 
     };
 }
 
-/// describe(name, fn [, options])：注册一个 suite，执行 fn(suiteCtx)；options 为可选且必须在末尾，当前未使用
+/// describe(name, fn [, options])：注册一个 suite，执行 fn(suiteCtx)；options 支持 timeout/skipIf，子 suite 与 it 继承（子级覆盖）
 fn describeCallback(
     ctx: jsc.JSContextRef,
     _: jsc.JSObjectRef,
@@ -397,12 +596,27 @@ fn describeCallback(
     defer allocator.free(name_slice);
     const fn_val = arguments[1];
     if (!jsc.JSObjectIsFunction(ctx, @ptrCast(fn_val))) return jsc.JSValueMakeUndefined(ctx);
-    // argumentCount >= 3 时 arguments[2] 为 options，当前未解析，仅保持 API 一致
-
-    return describeCallbackCore(ctx, allocator, r, name_slice, fn_val, false, false);
+    var suite_timeout_ms: ?u32 = null;
+    var suite_skip_if_ref: ?jsc.JSValueRef = null;
+    if (argumentCount >= 3) {
+        if (jsc.JSValueToObject(ctx, arguments[2], null)) |opts_obj| {
+            const k_timeout = jsc.JSStringCreateWithUTF8CString("timeout");
+            defer jsc.JSStringRelease(k_timeout);
+            const k_skipIf = jsc.JSStringCreateWithUTF8CString("skipIf");
+            defer jsc.JSStringRelease(k_skipIf);
+            const v_timeout = jsc.JSObjectGetProperty(ctx, opts_obj, k_timeout, null);
+            const v_skip_if = jsc.JSObjectGetProperty(ctx, opts_obj, k_skipIf, null);
+            if (!jsc.JSValueIsUndefined(ctx, v_timeout)) {
+                const n = jsc.JSValueToNumber(ctx, v_timeout, null);
+                if (n >= 0 and n <= 0xFFFF_FFFF and std.math.isFinite(n)) suite_timeout_ms = @intFromFloat(n);
+            }
+            if (!jsc.JSValueIsUndefined(ctx, v_skip_if)) suite_skip_if_ref = v_skip_if;
+        }
+    }
+    return describeCallbackCore(ctx, allocator, r, name_slice, fn_val, false, false, suite_timeout_ms, suite_skip_if_ref);
 }
 
-/// describe.skip(name, fn) / describe.ignore(name, fn)：整 suite 跳过，不加入 job 列表
+/// describe.skip(name, fn) / describe.ignore(name, fn)：整 suite 跳过，不加入 job 列表；无 options 继承
 fn describeSkipCallback(
     ctx: jsc.JSContextRef,
     _: jsc.JSObjectRef,
@@ -418,10 +632,10 @@ fn describeSkipCallback(
     defer allocator.free(name_slice);
     const fn_val = arguments[1];
     if (!jsc.JSObjectIsFunction(ctx, @ptrCast(fn_val))) return jsc.JSValueMakeUndefined(ctx);
-    return describeCallbackCore(ctx, allocator, r, name_slice, fn_val, true, false);
+    return describeCallbackCore(ctx, allocator, r, name_slice, fn_val, true, false, null, null);
 }
 
-/// describe.only(name, fn)：仅运行该 suite（及其子树内 only 的测试）
+/// describe.only(name, fn)：仅运行该 suite（及其子树内 only 的测试）；无 options
 fn describeOnlyCallback(
     ctx: jsc.JSContextRef,
     _: jsc.JSObjectRef,
@@ -437,10 +651,10 @@ fn describeOnlyCallback(
     defer allocator.free(name_slice);
     const fn_val = arguments[1];
     if (!jsc.JSObjectIsFunction(ctx, @ptrCast(fn_val))) return jsc.JSValueMakeUndefined(ctx);
-    return describeCallbackCore(ctx, allocator, r, name_slice, fn_val, false, true);
+    return describeCallbackCore(ctx, allocator, r, name_slice, fn_val, false, true, null, null);
 }
 
-/// 公共 describe 逻辑：创建子 suite、push、调 fn、pop；skip/only 控制 suite.skip 与 suite.only
+/// 公共 describe 逻辑：创建子 suite、push、调 fn、pop；skip/only 控制 suite.skip 与 suite.only；suite_timeout_ms/suite_skip_if 为本层 options，未指定则继承 parent
 fn describeCallbackCore(
     ctx: jsc.JSContextRef,
     allocator: std.mem.Allocator,
@@ -449,6 +663,8 @@ fn describeCallbackCore(
     fn_val: jsc.JSValueRef,
     suite_skip: bool,
     suite_only: bool,
+    suite_timeout_ms: ?u32,
+    suite_skip_if_ref: ?jsc.JSValueRef,
 ) jsc.JSValueRef {
     const parent = r.currentSuite() orelse &r.root;
     const child = allocator.create(runner.Suite) catch return jsc.JSValueMakeUndefined(ctx);
@@ -466,6 +682,8 @@ fn describeCallbackCore(
         .after_each = .{},
         .skip = suite_skip,
         .only = suite_only,
+        .timeout_ms = suite_timeout_ms orelse parent.timeout_ms,
+        .skip_if_ref = suite_skip_if_ref orelse parent.skip_if_ref,
         .allocator = allocator,
     };
     parent.children.append(allocator, child) catch {
@@ -579,6 +797,14 @@ fn itCallback(
         }
     }
     if (only) r.has_only = true;
+
+    // 继承：从当前 suite 沿 parent 到 root 取首个非 null 的 timeout_ms / skip_if_ref，用例级 options 覆盖
+    var cur: ?*runner.Suite = suite;
+    while (cur) |n| : (cur = n.parent) {
+        if (timeout_ms == null and n.timeout_ms != null) timeout_ms = n.timeout_ms;
+        if (skip_if_ref == null and n.skip_if_ref != null) skip_if_ref = n.skip_if_ref;
+        if (timeout_ms != null and skip_if_ref != null) break;
+    }
 
     defer if (skip_message) |s| allocator.free(s);
     defer if (todo_message) |s| allocator.free(s);
@@ -710,6 +936,7 @@ fn runExecutorCallback(
         .retry_count = 0,
         .junit_outfile = null,
         .junit_results = .{},
+        .fail_fast = (c.getenv("SHU_TEST_BAIL") != null),
     };
     if (c.getenv("SHU_TEST_REPORTER")) |p| {
         if (std.mem.eql(u8, std.mem.span(p), "junit")) {
@@ -775,6 +1002,40 @@ fn rejectWrapperCallback(
         }
         writeJUnitIfRequested(state);
     }
+    state.case_failed += 1;
+    // 同步抛错时 job_index 尚未在 runNext 中 +1，失败用例在 job_index；异步 reject 时已在 +1 后，失败用例在 job_index - 1。用 reject_is_sync 区分，避免连续两个 run_test 时误把下一用例当成本次失败。
+    const failed_job_idx: usize = blk: {
+        if (state.reject_is_sync) {
+            state.reject_is_sync = false;
+            if (state.job_index < state.jobs.items.len and state.jobs.items[state.job_index] == .run_test)
+                break :blk state.job_index;
+        } else if (state.job_index > 0 and state.jobs.items[state.job_index - 1] == .run_test) {
+            break :blk state.job_index - 1;
+        } else if (state.job_index < state.jobs.items.len and state.jobs.items[state.job_index] == .run_test) {
+            break :blk state.job_index;
+        }
+        break :blk state.jobs.items.len;
+    };
+    state.last_failed_job_index = failed_job_idx;
+    if (failed_job_idx < state.jobs.items.len) {
+        const p = state.jobs.items[failed_job_idx].run_test;
+        const elapsed = nowMs() - state.current_test_start_ms;
+        if (runner.getFullTestName(state.allocator, p.suite, p.test_idx)) |full_name| {
+            defer state.allocator.free(full_name);
+            printTestResultLine(full_name, .fail, elapsed);
+        } else |_| {
+            const t_name = p.suite.tests.items[p.test_idx].name;
+            printTestResultLine(t_name, .fail, elapsed);
+        }
+        // 失败时打印断言/异常信息，便于排查
+        if (argumentCount >= 1) printAssertionErrorMessage(ctx, state.allocator, arguments[0]);
+    } else {
+        // 同一 job_index 只打印一次，避免 Promise 链多次 reject 导致刷屏与死循环感
+        if (state.last_printed_generic_fail_job_index != state.job_index) {
+            state.last_printed_generic_fail_job_index = state.job_index;
+            printTestLineStdout("(test failed, job_index={d})\n", .{state.job_index});
+        }
+    }
     const global = jsc.JSContextGetGlobalObject(ctx);
     const k_process = jsc.JSStringCreateWithUTF8CString("process");
     defer jsc.JSStringRelease(k_process);
@@ -786,9 +1047,39 @@ fn rejectWrapperCallback(
             _ = jsc.JSObjectSetProperty(ctx, process_obj, k_exit, jsc.JSValueMakeNumber(ctx, 1), jsc.kJSPropertyAttributeNone, null);
         }
     }
-    const err = if (argumentCount >= 1) arguments[0] else jsc.JSValueMakeUndefined(ctx);
-    var args = [_]jsc.JSValueRef{err};
-    _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(state.reject_ref), null, 1, &args, null);
+    if (state.fail_fast) {
+        // --fail-fast / SHU_TEST_BAIL：立即写 cases 并 reject，停止后续用例
+        writeCaseSummaryToStderr(state);
+        const err = if (argumentCount >= 1) arguments[0] else jsc.JSValueMakeUndefined(ctx);
+        var args = [_]jsc.JSValueRef{err};
+        _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(state.reject_ref), null, 1, &args, null);
+    } else {
+        // 默认：跑完全部用例；不 reject。仅同步抛错时 job_index 尚未 +1；标记已推进并 +1，外层 runNext 返回时不再 +1
+        if (failed_job_idx == state.job_index) {
+            state.reject_wrapper_did_advance = true;
+        }
+        // 强制推进到失败用例之后，保证 setImmediate 回调绝不会再次运行同一用例，消除死循环
+        if (failed_job_idx < state.jobs.items.len) {
+            state.job_index = failed_job_idx + 1;
+        } else {
+            // 无法解析出 run_test 时（如钩子失败），直接推进到末尾，下一轮 runNext 会结束
+            state.job_index = state.jobs.items.len;
+        }
+        const k_set_imm = jsc.JSStringCreateWithUTF8CString("setImmediate");
+        defer jsc.JSStringRelease(k_set_imm);
+        const k_run_next = jsc.JSStringCreateWithUTF8CString("__shu_test_run_next");
+        defer jsc.JSStringRelease(k_run_next);
+        const set_imm = jsc.JSObjectGetProperty(ctx, global, k_set_imm, null);
+        const run_next_fn = jsc.JSObjectGetProperty(ctx, global, k_run_next, null);
+        if (!jsc.JSValueIsUndefined(ctx, set_imm) and jsc.JSObjectIsFunction(ctx, @ptrCast(set_imm)) and
+            !jsc.JSValueIsUndefined(ctx, run_next_fn) and jsc.JSObjectIsFunction(ctx, @ptrCast(run_next_fn)))
+        {
+            var one_arg = [_]jsc.JSValueRef{run_next_fn};
+            _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(set_imm), null, 1, &one_arg, null);
+        } else {
+            RunState.runNext(state);
+        }
+    }
     return jsc.JSValueMakeUndefined(ctx);
 }
 
@@ -797,6 +1088,20 @@ fn getRejectWrapper(ctx: jsc.JSContextRef) jsc.JSValueRef {
     const k = jsc.JSStringCreateWithUTF8CString("__shu_test_reject_wrapper");
     defer jsc.JSStringRelease(k);
     return jsc.JSObjectGetProperty(ctx, global, k, null);
+}
+
+/// 仅执行 runNext、不经过 advance；供 !fail_fast 时 setImmediate 调度，避免嵌套导致 job_index 被覆盖。
+fn runNextOnlyCallback(
+    ctx: jsc.JSContextRef,
+    _: jsc.JSObjectRef,
+    _: jsc.JSObjectRef,
+    _: usize,
+    _: [*]const jsc.JSValueRef,
+    _: [*]jsc.JSValueRef,
+) callconv(.c) jsc.JSValueRef {
+    const state = g_run_state orelse return jsc.JSValueMakeUndefined(ctx);
+    RunState.runNext(state);
+    return jsc.JSValueMakeUndefined(ctx);
 }
 
 /// 将字符串中 XML 特殊字符转义为实体，用于 JUnit name/message。调用方负责 free 返回值。
@@ -816,7 +1121,7 @@ fn escapeXml(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
     return list.toOwnedSlice(allocator);
 }
 
-/// 当 state.snapshot_file 与 snapshot_update 均设置时，将全局 __shu_snapshot_store 序列化为 JSON 写入该文件；会创建 __snapshots__ 目录。
+/// 当 state.snapshot_file 与 snapshot_update 均设置时，将全局 __shu_snapshot_store 序列化为 JSON 写入该文件；会创建项目根下 snapshots 目录及父级路径。
 fn saveSnapshotToFileIfRequested(state: *RunState) void {
     if (state.snapshot_file == null or !state.snapshot_update) return;
     saveSnapshotToFile(state);
@@ -960,6 +1265,128 @@ fn saveSnapshotToFile(state: *RunState) void {
     file.writeStreamingAll(io, out.items) catch return;
 }
 
+/// 返回当前时间（毫秒）；无 process io 时返回 0。
+fn nowMs() i64 {
+    const io = libs_process.getProcessIo() orelse return 0;
+    return @as(i64, @intCast(@divTrunc(std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds, 1_000_000)));
+}
+
+/// 是否由 shu test 子进程运行（有 SHU_TEST_FILE_PATH 时）：测试行写 stderr（父进程 .stderr = .inherit 时直接到终端），用例数写 SHU_TEST_CASES_FILE 文件。
+fn isRunningUnderShuTest() bool {
+    return c.getenv("SHU_TEST_FILE_PATH") != null;
+}
+
+/// 向 stderr 或 stdout 打印一行测试输出（Deno 风格：用例名 ... ok/fail/skipped (Nms)）。
+/// 当 isRunningUnderShuTest() 时写 process io 的 stderr，父进程 .stderr = .inherit 时直接显示在终端；否则写 stdout 或 std.debug.print。
+fn printTestLineStdout(comptime fmt: []const u8, args: anytype) void {
+    if (isRunningUnderShuTest()) {
+        if (libs_process.getProcessIo()) |io| {
+            var buf: [1024]u8 = undefined;
+            var w = std.Io.File.Writer.init(std.Io.File.stderr(), io, &buf);
+            w.interface.print(fmt, args) catch return;
+            w.interface.flush() catch {};
+        } else {
+            std.debug.print(fmt, args);
+        }
+        return;
+    }
+    if (libs_process.getProcessIo()) |io| {
+        var buf: [1024]u8 = undefined;
+        var w = std.Io.File.Writer.init(std.Io.File.stdout(), io, &buf);
+        w.interface.print(fmt, args) catch return;
+        w.interface.flush() catch {};
+    } else {
+        std.debug.print(fmt, args);
+    }
+}
+
+/// 失败时从 JS Error 或字符串取内容并打印到与用例结果同一流（shu test 下为 stderr），便于排查。
+/// 仅当能解析出可读的 message 或字符串时才打印；若得到的是数字转成的字符串（如 -3.44e-103）则跳过，避免垃圾输出。
+fn printAssertionErrorMessage(ctx: jsc.JSContextRef, allocator: std.mem.Allocator, err_value: jsc.JSValueRef) void {
+    if (jsc.JSValueIsUndefined(ctx, err_value) or jsc.JSValueIsNull(ctx, err_value)) return;
+    var msg_slice: ?[]const u8 = null;
+    defer if (msg_slice) |s| allocator.free(s);
+    if (jsc.JSValueToObject(ctx, err_value, null)) |obj| {
+        const k_message = jsc.JSStringCreateWithUTF8CString("message");
+        defer jsc.JSStringRelease(k_message);
+        const msg_val = jsc.JSObjectGetProperty(ctx, obj, k_message, null);
+        msg_slice = jsValueToUtf8Alloc(ctx, allocator, msg_val);
+    }
+    if (msg_slice == null) msg_slice = jsValueToUtf8Alloc(ctx, allocator, err_value);
+    // 仅打印可读消息：长度合理且不以数字/科学计数开头（避免引擎传入数字转成字符串如 -3.44e-103）
+    if (msg_slice) |s| {
+        if (s.len >= 2 and s.len <= 512) {
+            const first = s[0];
+            const looks_like_number = (first == '-' or first == '+') or std.ascii.isDigit(first);
+            if (!looks_like_number) printTestLineStdout("  {s}\n", .{s});
+        }
+    }
+}
+
+/// 用例结果类型，用于 printTestResultLine 着色。
+const TestResultKind = enum { ok, fail, skipped };
+
+/// 打印单条用例结果行并着色：ok 绿、fail 红、skipped 黄、耗时 (Nms) 青；非 TTY 不插 ANSI。输出为英文。
+fn printTestResultLine(name: []const u8, kind: TestResultKind, elapsed_ms: ?i64) void {
+    const use_color = if (isRunningUnderShuTest()) c.isatty(2) != 0 else c.isatty(1) != 0;
+    if (use_color) {
+        switch (kind) {
+            .ok => {
+                const ms = elapsed_ms orelse 0;
+                printTestLineStdout("{s} ... {s}ok{s} ({s}{d}ms{s})\n", .{ name, c_green, c_reset, c_cyan, ms, c_reset });
+            },
+            .fail => {
+                const ms = elapsed_ms orelse 0;
+                printTestLineStdout("{s} ... {s}fail{s} ({s}{d}ms{s})\n", .{ name, c_red, c_reset, c_cyan, ms, c_reset });
+            },
+            .skipped => printTestLineStdout("{s} ... {s}skipped{s}\n", .{ name, c_yellow, c_reset }),
+        }
+    } else {
+        switch (kind) {
+            .ok => printTestLineStdout("{s} ... ok ({d}ms)\n", .{ name, elapsed_ms orelse 0 }),
+            .fail => printTestLineStdout("{s} ... fail ({d}ms)\n", .{ name, elapsed_ms orelse 0 }),
+            .skipped => printTestLineStdout("{s} ... skipped\n", .{name}),
+        }
+    }
+}
+
+/// 写入用例汇总：shu test 时写 SHU_TEST_CASES_FILE 指定路径（CLI 读该文件汇总）；否则写 stderr。
+fn writeCaseSummaryToStderr(state: *RunState) void {
+    if (isRunningUnderShuTest()) {
+        const path_z = c.getenv("SHU_TEST_CASES_FILE") orelse return;
+        const path = std.mem.span(path_z);
+        var f = libs_io.createFileAbsolute(path, .{}) catch return;
+        const io = libs_process.getProcessIo() orelse return;
+        defer f.close(io);
+        var line_buf: [128]u8 = undefined;
+        const line = std.fmt.bufPrint(&line_buf, "__SHU_TEST_CASES__{{\"passed\":{d},\"failed\":{d},\"skipped\":{d}}}\n", .{
+            state.case_passed,
+            state.case_failed,
+            state.case_skipped,
+        }) catch return;
+        var w_buf: [64]u8 = undefined;
+        var w = f.writer(io, &w_buf);
+        _ = w.interface.writeAll(line) catch return;
+        _ = w.interface.flush() catch return;
+        return;
+    }
+    if (libs_process.getProcessIo()) |io| {
+        var buf: [128]u8 = undefined;
+        var w = std.Io.File.Writer.init(std.Io.File.stderr(), io, &buf);
+        w.interface.print("__SHU_TEST_CASES__{{\"passed\":{d},\"failed\":{d},\"skipped\":{d}}}\n", .{
+            state.case_passed,
+            state.case_failed,
+            state.case_skipped,
+        }) catch {};
+        w.interface.flush() catch {};
+    }
+    std.debug.print("__SHU_TEST_CASES__{{\"passed\":{d},\"failed\":{d},\"skipped\":{d}}}\n", .{
+        state.case_passed,
+        state.case_failed,
+        state.case_skipped,
+    });
+}
+
 /// 当 SHU_TEST_REPORTER=junit 且 SHU_TEST_REPORTER_OUTFILE 已设置时，将收集的用例结果写入 JUnit XML 文件；写完后释放各 result 的 name/message 并清空列表。
 fn writeJUnitIfRequested(state: *RunState) void {
     const outfile = state.junit_outfile orelse return;
@@ -1039,16 +1466,12 @@ fn runCallback(
             }
         }
     }
-    const global = jsc.JSContextGetGlobalObject(ctx);
-    const k_promise = jsc.JSStringCreateWithUTF8CString("Promise");
-    defer jsc.JSStringRelease(k_promise);
-    const promise_ctor = jsc.JSObjectGetProperty(ctx, global, k_promise, null);
-    if (jsc.JSValueIsUndefined(ctx, promise_ctor)) return jsc.JSValueMakeUndefined(ctx);
+    const Promise_ctor = promise_mod.getPromiseConstructor(ctx) orelse return jsc.JSValueMakeUndefined(ctx);
     const k_executor = jsc.JSStringCreateWithUTF8CString("");
     defer jsc.JSStringRelease(k_executor);
     const executor_fn = jsc.JSObjectMakeFunctionWithCallback(ctx, k_executor, runExecutorCallback);
     var args = [_]jsc.JSValueRef{executor_fn};
-    return jsc.JSObjectCallAsConstructor(ctx, @ptrCast(promise_ctor), 1, &args, null);
+    return jsc.JSObjectCallAsConstructor(ctx, Promise_ctor, 1, &args, null);
 }
 
 /// 将用户 options 对象与单键值合并后返回新对象；用于 it.skip/todo/only(name, fn, options) 时保留 options 并加上 skip/todo/only 标志。纯 Zig：遍历 base 属性复制到新对象再设 key。
@@ -1421,7 +1844,22 @@ fn snapshotCallback(
 
 const node_compat = @import("../node_compat/mod.zig");
 
+/// 创建 Error("Assertion failed") 并返回，用于同步失败时 exc 非对象时 fallback，保证 reject 收到有效 Error。
+fn makeFallbackAssertError(ctx: jsc.JSContextRef) jsc.JSValueRef {
+    const k = jsc.JSStringCreateWithUTF8CString("Assertion failed");
+    defer jsc.JSStringRelease(k);
+    const msg_js = jsc.JSValueMakeString(ctx, k);
+    const global = jsc.JSContextGetGlobalObject(ctx);
+    const k_error = jsc.JSStringCreateWithUTF8CString("Error");
+    defer jsc.JSStringRelease(k_error);
+    const Error_ctor = jsc.JSObjectGetProperty(ctx, global, k_error, null);
+    if (jsc.JSValueIsUndefined(ctx, Error_ctor)) return jsc.JSValueMakeUndefined(ctx);
+    var args = [_]jsc.JSValueRef{msg_js};
+    return jsc.JSObjectCallAsConstructor(ctx, @ptrCast(Error_ctor), 1, &args, null);
+}
+
 /// 在 ctx 中创建 Error(message_js) 并写入 exception_out[0]，供 assert 回调抛错；纯 Zig，无内联脚本。
+/// 仅当 Error 构造成功（err_instance 非 undefined/null）时才写入 exception_out，避免填入无效值。
 fn setAssertException(ctx: jsc.JSContextRef, message_js: jsc.JSValueRef, exception_out: [*]jsc.JSValueRef) void {
     const global = jsc.JSContextGetGlobalObject(ctx);
     const k_error = jsc.JSStringCreateWithUTF8CString("Error");
@@ -1430,7 +1868,8 @@ fn setAssertException(ctx: jsc.JSContextRef, message_js: jsc.JSValueRef, excepti
     if (jsc.JSValueIsUndefined(ctx, Error_ctor)) return;
     var args = [_]jsc.JSValueRef{message_js};
     const err_instance = jsc.JSObjectCallAsConstructor(ctx, @ptrCast(Error_ctor), 1, &args, null);
-    exception_out[0] = err_instance;
+    if (!jsc.JSValueIsUndefined(ctx, err_instance) and !jsc.JSValueIsNull(ctx, err_instance))
+        exception_out[0] = err_instance;
 }
 
 /// assert.ok(value [, message])：value 为 falsy 时通过 exception 出参抛 Error，与 node:assert 一致；纯 Zig 实现。
@@ -1473,7 +1912,8 @@ fn assertStrictEqualCallback(
     const is_fn = jsc.JSObjectGetProperty(ctx, Object_obj, k_is, null);
     if (jsc.JSValueIsUndefined(ctx, is_fn) or !jsc.JSObjectIsFunction(ctx, @ptrCast(is_fn))) return jsc.JSValueMakeUndefined(ctx);
     var is_args = [_]jsc.JSValueRef{ arguments[0], arguments[1] };
-    const is_result = jsc.JSObjectCallAsFunction(ctx, @ptrCast(is_fn), null, 2, &is_args, null);
+    const is_result = jsc.JSObjectCallAsFunction(ctx, @ptrCast(is_fn), null, 2, &is_args, @ptrCast(exception_out));
+    if (!jsc.JSValueIsUndefined(ctx, exception_out[0]) and !jsc.JSValueIsNull(ctx, exception_out[0])) return jsc.JSValueMakeUndefined(ctx);
     if (jsc.JSValueToBoolean(ctx, is_result)) return jsc.JSValueMakeUndefined(ctx);
     const msg_js = if (argumentCount >= 3) arguments[2] else blk: {
         const k_msg = jsc.JSStringCreateWithUTF8CString("Expected strict equality");
@@ -1503,13 +1943,12 @@ fn assertDeepStrictEqualCallback(
     const json_obj = jsc.JSValueToObject(ctx, json_val, null) orelse return jsc.JSValueMakeUndefined(ctx);
     const stringify_fn = jsc.JSObjectGetProperty(ctx, json_obj, k_stringify, null);
     if (jsc.JSValueIsUndefined(ctx, stringify_fn) or !jsc.JSObjectIsFunction(ctx, @ptrCast(stringify_fn))) return jsc.JSValueMakeUndefined(ctx);
-    var exc: jsc.JSValueRef = undefined;
     var one_arg = [_]jsc.JSValueRef{arguments[0]};
-    const s_actual = jsc.JSObjectCallAsFunction(ctx, @ptrCast(stringify_fn), @ptrCast(json_obj), 1, &one_arg, @ptrCast(&exc));
-    if (!jsc.JSValueIsUndefined(ctx, exc)) return jsc.JSValueMakeUndefined(ctx);
+    const s_actual = jsc.JSObjectCallAsFunction(ctx, @ptrCast(stringify_fn), @ptrCast(json_obj), 1, &one_arg, @ptrCast(exception_out));
+    if (!jsc.JSValueIsUndefined(ctx, exception_out[0]) and !jsc.JSValueIsNull(ctx, exception_out[0])) return jsc.JSValueMakeUndefined(ctx);
     one_arg[0] = arguments[1];
-    const s_expected = jsc.JSObjectCallAsFunction(ctx, @ptrCast(stringify_fn), @ptrCast(json_obj), 1, &one_arg, @ptrCast(&exc));
-    if (!jsc.JSValueIsUndefined(ctx, exc)) return jsc.JSValueMakeUndefined(ctx);
+    const s_expected = jsc.JSObjectCallAsFunction(ctx, @ptrCast(stringify_fn), @ptrCast(json_obj), 1, &one_arg, @ptrCast(exception_out));
+    if (!jsc.JSValueIsUndefined(ctx, exception_out[0]) and !jsc.JSValueIsNull(ctx, exception_out[0])) return jsc.JSValueMakeUndefined(ctx);
     const k_object = jsc.JSStringCreateWithUTF8CString("Object");
     defer jsc.JSStringRelease(k_object);
     const Object_val = jsc.JSObjectGetProperty(ctx, global, k_object, null);
@@ -1519,7 +1958,8 @@ fn assertDeepStrictEqualCallback(
     const is_fn = jsc.JSObjectGetProperty(ctx, Object_obj, k_is, null);
     if (jsc.JSValueIsUndefined(ctx, is_fn) or !jsc.JSObjectIsFunction(ctx, @ptrCast(is_fn))) return jsc.JSValueMakeUndefined(ctx);
     var is_args = [_]jsc.JSValueRef{ s_actual, s_expected };
-    const is_result = jsc.JSObjectCallAsFunction(ctx, @ptrCast(is_fn), null, 2, &is_args, null);
+    const is_result = jsc.JSObjectCallAsFunction(ctx, @ptrCast(is_fn), null, 2, &is_args, @ptrCast(exception_out));
+    if (!jsc.JSValueIsUndefined(ctx, exception_out[0]) and !jsc.JSValueIsNull(ctx, exception_out[0])) return jsc.JSValueMakeUndefined(ctx);
     if (jsc.JSValueToBoolean(ctx, is_result)) return jsc.JSValueMakeUndefined(ctx);
     const msg_js = if (argumentCount >= 3) arguments[2] else blk: {
         const k_msg = jsc.JSStringCreateWithUTF8CString("Expected deep strict equality");
@@ -1710,13 +2150,11 @@ fn assertRejectsCallback(
     _ = jsc.JSObjectSetProperty(ctx, global, k_inner, inner, jsc.kJSPropertyAttributeNone, null);
     _ = jsc.JSObjectSetProperty(ctx, global, k_msg, if (argumentCount >= 2) arguments[1] else jsc.JSValueMakeUndefined(ctx), jsc.kJSPropertyAttributeNone, null);
     _ = jsc.JSObjectSetProperty(ctx, global, k_mode, jsc.JSValueMakeBoolean(ctx, true), jsc.kJSPropertyAttributeNone, null);
-    const k_promise = jsc.JSStringCreateWithUTF8CString("Promise");
-    defer jsc.JSStringRelease(k_promise);
-    const Promise_ctor = jsc.JSObjectGetProperty(ctx, global, k_promise, null);
+    const Promise_ctor = promise_mod.getPromiseConstructor(ctx) orelse return jsc.JSValueMakeUndefined(ctx);
     const k_exec = jsc.JSStringCreateWithUTF8CString("");
     defer jsc.JSStringRelease(k_exec);
     var args = [_]jsc.JSValueRef{jsc.JSObjectMakeFunctionWithCallback(ctx, k_exec, rejectsExecutorCallback)};
-    return jsc.JSObjectCallAsConstructor(ctx, @ptrCast(Promise_ctor), 1, &args, null);
+    return jsc.JSObjectCallAsConstructor(ctx, Promise_ctor, 1, &args, null);
 }
 
 /// assert.doesNotReject(promiseOrFn [, message])：返回 Promise，inner 被 fulfill 则 resolve(value)，被 reject 则 reject(msg 或 err)；与 node:test 对齐。
@@ -1745,13 +2183,11 @@ fn assertDoesNotRejectCallback(
     _ = jsc.JSObjectSetProperty(ctx, global, k_inner, inner, jsc.kJSPropertyAttributeNone, null);
     _ = jsc.JSObjectSetProperty(ctx, global, k_msg, if (argumentCount >= 2) arguments[1] else jsc.JSValueMakeUndefined(ctx), jsc.kJSPropertyAttributeNone, null);
     _ = jsc.JSObjectSetProperty(ctx, global, k_mode, jsc.JSValueMakeBoolean(ctx, false), jsc.kJSPropertyAttributeNone, null);
-    const k_promise = jsc.JSStringCreateWithUTF8CString("Promise");
-    defer jsc.JSStringRelease(k_promise);
-    const Promise_ctor = jsc.JSObjectGetProperty(ctx, global, k_promise, null);
+    const Promise_ctor = promise_mod.getPromiseConstructor(ctx) orelse return jsc.JSValueMakeUndefined(ctx);
     const k_exec = jsc.JSStringCreateWithUTF8CString("");
     defer jsc.JSStringRelease(k_exec);
     var args = [_]jsc.JSValueRef{jsc.JSObjectMakeFunctionWithCallback(ctx, k_exec, rejectsExecutorCallback)};
-    return jsc.JSObjectCallAsConstructor(ctx, @ptrCast(Promise_ctor), 1, &args, null);
+    return jsc.JSObjectCallAsConstructor(ctx, Promise_ctor, 1, &args, null);
 }
 
 /// assert.doesNotThrow(fn [, message])：调用 fn()，若抛错则用该错误或 message 通过 exception 出参抛错。
@@ -1953,7 +2389,10 @@ pub fn getExports(ctx: jsc.JSContextRef, allocator: std.mem.Allocator) jsc.JSVal
     common.setMethod(ctx, obj, "afterAll", afterAllCallback);
     common.setMethod(ctx, obj, "beforeEach", beforeEachCallback);
     common.setMethod(ctx, obj, "afterEach", afterEachCallback);
-    common.setMethod(ctx, obj, "mock", mockCallback);
+    // mock 导出为对象 { fn, method }，供 mock.fn() / mock.method() 使用
+    const k_mock = jsc.JSStringCreateWithUTF8CString("mock");
+    defer jsc.JSStringRelease(k_mock);
+    _ = jsc.JSObjectSetProperty(ctx, obj, k_mock, mock.getExports(ctx, allocator), jsc.kJSPropertyAttributeNone, null);
     common.setMethod(ctx, obj, "snapshot", snapshotCallback);
 
     const k_it = jsc.JSStringCreateWithUTF8CString("it");
@@ -2026,5 +2465,11 @@ pub fn getExports(ctx: jsc.JSContextRef, allocator: std.mem.Allocator) jsc.JSVal
     const k_reject_wrapper = jsc.JSStringCreateWithUTF8CString("__shu_test_reject_wrapper");
     defer jsc.JSStringRelease(k_reject_wrapper);
     _ = jsc.JSObjectSetProperty(ctx, global, k_reject_wrapper, jsc.JSObjectMakeFunctionWithCallback(ctx, k_reject_wrapper, rejectWrapperCallback), jsc.kJSPropertyAttributeNone, null);
+    const k_run_test_fn = jsc.JSStringCreateWithUTF8CString("__shu_test_run_test_fn");
+    defer jsc.JSStringRelease(k_run_test_fn);
+    _ = jsc.JSObjectSetProperty(ctx, global, k_run_test_fn, jsc.JSObjectMakeFunctionWithCallback(ctx, k_run_test_fn, runTestWrapperCallback), jsc.kJSPropertyAttributeNone, null);
+    const k_run_next = jsc.JSStringCreateWithUTF8CString("__shu_test_run_next");
+    defer jsc.JSStringRelease(k_run_next);
+    _ = jsc.JSObjectSetProperty(ctx, global, k_run_next, jsc.JSObjectMakeFunctionWithCallback(ctx, k_run_next, runNextOnlyCallback), jsc.kJSPropertyAttributeNone, null);
     return obj;
 }
