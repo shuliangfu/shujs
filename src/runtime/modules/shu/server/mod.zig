@@ -601,9 +601,10 @@ fn serverCallback(
     const k_set_immediate = jsc.JSStringCreateWithUTF8CString("setImmediate");
     defer jsc.JSStringRelease(k_set_immediate);
     const set_immediate_fn = jsc.JSObjectGetProperty(ctx, global, k_set_immediate, null);
-    if (jsc.JSObjectIsFunction(ctx, @ptrCast(set_immediate_fn))) {
+    const set_immediate_obj = jsc.JSValueToObject(ctx, set_immediate_fn, null);
+    if (set_immediate_obj != null and jsc.JSObjectIsFunction(ctx, set_immediate_obj.?)) {
         const args: [1]jsc.JSValueRef = .{tick_fn};
-        _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(set_immediate_fn), null, 1, &args, null);
+        _ = jsc.JSObjectCallAsFunction(ctx, set_immediate_obj.?, null, 1, &args, null);
     }
     return server_obj;
 }
