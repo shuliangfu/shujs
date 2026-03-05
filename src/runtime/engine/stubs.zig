@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const jsc = @import("jsc");
+const common = @import("../common.zig");
 
 /// 占位：向全局注册 Buffer、require、WebSocket、Bun（Bun.serve / Bun.file / Bun.write）；allocator 统一传入（§1.1），本模块暂不使用
 pub fn register(ctx: jsc.JSGlobalContextRef, allocator: ?std.mem.Allocator) void {
@@ -21,12 +22,24 @@ fn setGlobalFunction(ctx: jsc.JSGlobalContextRef, global: jsc.JSObjectRef, name:
     _ = jsc.JSObjectSetProperty(ctx, global, name_ref, fn_ref, jsc.kJSPropertyAttributeNone, null);
 }
 
+/// 纯 Zig：new Error(msg) 后 setThrowAndThrow，无内联 throw new Error 脚本
 fn throwNotImplemented(ctx: jsc.JSContextRef, msg: []const u8) void {
-    var script_buf: [256]u8 = undefined;
-    const script = std.fmt.bufPrintZ(&script_buf, "throw new Error(\"{s}\");", .{msg}) catch return;
-    const script_ref = jsc.JSStringCreateWithUTF8CString(script.ptr);
-    defer jsc.JSStringRelease(script_ref);
-    _ = jsc.JSEvaluateScript(ctx, script_ref, null, null, 1, null);
+    var buf: [256]u8 = undefined;
+    if (msg.len >= buf.len) return;
+    @memcpy(buf[0..msg.len], msg);
+    buf[msg.len] = 0;
+    const global = jsc.JSContextGetGlobalObject(ctx);
+    const k_Error = jsc.JSStringCreateWithUTF8CString("Error");
+    defer jsc.JSStringRelease(k_Error);
+    const Error_ctor = jsc.JSObjectGetProperty(ctx, global, k_Error, null);
+    const err_obj = jsc.JSValueToObject(ctx, Error_ctor, null) orelse return;
+    const msg_js = jsc.JSStringCreateWithUTF8CString(buf[0..].ptr);
+    defer jsc.JSStringRelease(msg_js);
+    var args: [1]jsc.JSValueRef = .{jsc.JSValueMakeString(ctx, msg_js)};
+    var exception: ?jsc.JSValueRef = null;
+    const err_instance = jsc.JSObjectCallAsConstructor(ctx, err_obj, 1, &args, @ptrCast(&exception));
+    if (exception != null) return;
+    _ = common.setThrowAndThrow(ctx, err_instance);
 }
 
 fn bufferNotImplementedCallback(
