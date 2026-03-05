@@ -3,7 +3,7 @@
 //
 // 本目录为 Shu.fs、Shu.path、Shu.system 的唯一实现；engine 不再保留重复代码。
 // engine/shu/mod.zig 通过 @import("../modules/shu/fs/mod.zig") 等直接调用；
-// process、system/fork_child 等在本目录内互相引用（如 ipc.zig、run.zig、fork_child.zig）。
+// process、cmd/fork_child 等在本目录内互相引用（如 ipc.zig、run.zig、fork_child.zig）。
 //
 // JS/TS 端预期用法（待 loader 接入后）：
 //   静态：import * as fs from "shu:fs";  // fs.readSync(path) 等
