@@ -35,7 +35,7 @@ const std = @import("std");
 const jsc = @import("jsc");
 const shu_fs = @import("fs/mod.zig");
 const shu_path = @import("path/mod.zig");
-const shu_system = @import("system/mod.zig");
+const shu_cmd = @import("cmd/mod.zig");
 const shu_zlib = @import("zlib/mod.zig");
 const shu_archive = @import("archive/mod.zig");
 const shu_crypto = @import("crypto/mod.zig");
@@ -99,7 +99,7 @@ fn prefix8(comptime s: []const u8) u64 {
 const ShuBuiltinTag = enum {
     fs,
     path,
-    system,
+    cmd,
     zlib,
     archive,
     crypto,
@@ -152,7 +152,7 @@ const SPEC_TABLE = blk: {
     const specs = .{
         .{ "shu:fs", .fs },
         .{ "shu:path", .path },
-        .{ "shu:system", .system },
+        .{ "shu:cmd", .cmd },
         .{ "shu:zlib", .zlib },
         .{ "shu:archive", .archive },
         .{ "shu:crypto", .crypto },
@@ -208,7 +208,7 @@ fn getExportsByTag(tag: ShuBuiltinTag, ctx: jsc.JSContextRef, allocator: std.mem
     return switch (tag) {
         .fs => shu_fs.getExports(ctx, allocator),
         .path => shu_path.getExports(ctx, allocator),
-        .system => shu_system.getExports(ctx, allocator),
+        .cmd => shu_cmd.getExports(ctx, allocator),
         .zlib => shu_zlib.getExports(ctx, allocator),
         .archive => shu_archive.getExports(ctx, allocator),
         .crypto => shu_crypto.getExports(ctx, allocator),
@@ -262,7 +262,7 @@ pub const SUPPORTED: []const []const u8 = &.{
     "shu:process",
     "shu:timers",
     "shu:console",
-    "shu:system",
+    "shu:cmd",
     "shu:zlib",
     "shu:archive",
     "shu:crypto",
