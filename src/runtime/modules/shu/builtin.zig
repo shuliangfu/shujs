@@ -23,11 +23,11 @@
 // | shu:debugger    | port、host | ✅ 已实现 | port=0，host='' |
 // | shu:tracing     | createTracing、trace | ✅ 已实现 | no-op；trace(fn) 会执行 fn |
 // | shu:webcrypto   | getRandomValues、randomUUID | ✅ 已实现 | 透传 globalThis.crypto |
-// | shu:webcrypto   | subtle | ⚠ 占位   | 未实现 |
+// | shu:webcrypto   | subtle | ✅ 由 shu:crypto 挂载 | digest 已实现，其余占位 |
 // | shu:webstreams  | ReadableStream、WritableStream、TransformStream、*Controller、*QueuingStrategy | ✅ 透传 | 来自 globalThis，缺则 undefined |
-// | shu:repl        | start、ReplServer | ⚠ 占位   | 抛 not implemented |
-// | shu:test        | describe、it、test、before/after、mock、run、snapshot、skip、todo、only | ⚠ 占位 | 抛 not implemented |
-// | shu:wasi        | WASI   | ⚠ 占位   | 抛 not implemented |
+// | shu:repl        | start、ReplServer、REPL_MODE_* | ✅ 已实现 | readline + vm.runInContext |
+// | shu:test        | describe、it、test、before/after、mock、run、snapshot、skip、todo、only | ✅ 已实现 | 与 node:test 语义接近 |
+// | shu:wasi        | WASI、getImportObject、start | ✅ 已实现 | start() 暂抛 not implemented（待 WASM 运行时） |
 //
 // v8、punycode、domain 不在此列表；node 兼容侧 node:v8 / node:punycode / node:domain 直接走 shu_stub（见 modules/node/builtin.zig）。
 
@@ -79,6 +79,11 @@ const shu_webcrypto = @import("webcrypto/mod.zig");
 const shu_webstreams = @import("webstreams/mod.zig");
 const shu_cluster = @import("cluster/mod.zig");
 const shu_debugger = @import("debugger/mod.zig");
+const shu_errors = @import("errors/mod.zig");
+const shu_corepack = @import("corepack/mod.zig");
+const shu_sql = @import("sql/mod.zig");
+const shu_mongo = @import("mongo/mod.zig");
+const shu_kv = @import("kv/mod.zig");
 
 /// 取 specifier 前 8 字节转 u64（不足零填充），用于与 comptime 常量整型比较（00 §2.1）
 fn specPrefix(specifier: []const u8) u64 {
@@ -143,12 +148,18 @@ const ShuBuiltinTag = enum {
     webstreams,
     cluster,
     debugger,
+    errors,
+    corepack,
+    sqlite,
+    sql,
+    mongo,
+    kv,
 };
 
 /// (len, u64 前缀) -> tag 表，comptime 生成；运行时一次整型比较匹配（00 §2.1）
 const SPEC_TABLE = blk: {
     const Entry = struct { len: usize, prefix: u64, tag: ShuBuiltinTag };
-    var list: [46]Entry = undefined;
+    var list: [52]Entry = undefined;
     const specs = .{
         .{ "shu:fs", .fs },
         .{ "shu:path", .path },
@@ -196,6 +207,12 @@ const SPEC_TABLE = blk: {
         .{ "shu:webstreams", .webstreams },
         .{ "shu:cluster", .cluster },
         .{ "shu:debugger", .debugger },
+        .{ "shu:errors", .errors },
+        .{ "shu:corepack", .corepack },
+        .{ "shu:sqlite", .sqlite },
+        .{ "shu:sql", .sql },
+        .{ "shu:mongo", .mongo },
+        .{ "shu:kv", .kv },
     };
     for (specs, 0..) |s, i| {
         list[i] = .{ .len = s.@"0".len, .prefix = prefix8(s.@"0"), .tag = s.@"1" };
@@ -252,6 +269,12 @@ fn getExportsByTag(tag: ShuBuiltinTag, ctx: jsc.JSContextRef, allocator: std.mem
         .webstreams => shu_webstreams.getExports(ctx, allocator),
         .cluster => shu_cluster.getExports(ctx, allocator),
         .debugger => shu_debugger.getExports(ctx, allocator),
+        .errors => shu_errors.getExports(ctx, allocator),
+        .corepack => shu_corepack.getExports(ctx, allocator),
+        .sqlite => shu_sql.getSqliteExports(ctx, allocator),
+        .sql => shu_sql.getExports(ctx, allocator),
+        .mongo => shu_mongo.getExports(ctx, allocator),
+        .kv => shu_kv.getExports(ctx, allocator),
     };
 }
 
@@ -302,6 +325,12 @@ pub const SUPPORTED: []const []const u8 = &.{
     "shu:webstreams",
     "shu:cluster",
     "shu:debugger",
+    "shu:errors",
+    "shu:corepack",
+    "shu:sqlite",
+    "shu:sql",
+    "shu:mongo",
+    "shu:kv",
 };
 
 /// 判断是否为已支持的 shu: 内置说明符（用于 require/import 分支）；(len, u64) 表匹配（00 §2.1）
