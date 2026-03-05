@@ -138,10 +138,11 @@ const DgramEntry = struct {
     broadcast: bool = false,
     multicast_ttl: u32 = 1,
 };
-var g_dgram_sockets: ?std.AutoHashMap(u32, DgramEntry) = null;
+/// Unmanaged，put/fetchRemove 显式传 allocator（01 §1.2）
+var g_dgram_sockets: ?std.AutoHashMapUnmanaged(u32, DgramEntry) = null;
 var g_dgram_next_id: u32 = 1;
-/// socket id -> JS 对象（供 on('message') 等）
-var g_dgram_socket_objs: ?std.AutoHashMap(u32, jsc.JSObjectRef) = null;
+/// socket id -> JS 对象（供 on('message') 等）。Unmanaged
+var g_dgram_socket_objs: ?std.AutoHashMapUnmanaged(u32, jsc.JSObjectRef) = null;
 
 /// 首次有 bound socket 时初始化 recv 池；失败则保持 null，tick 内走栈缓冲
 fn ensureDgramRecvPool() void {
@@ -469,17 +470,17 @@ fn createSocketCallback(
         _ = std.c.close(fd);
         return jsc.JSValueMakeUndefined(ctx);
     };
-    if (g_dgram_sockets == null) g_dgram_sockets = std.AutoHashMap(u32, DgramEntry).init(allocator);
-    if (g_dgram_socket_objs == null) g_dgram_socket_objs = std.AutoHashMap(u32, jsc.JSObjectRef).init(allocator);
+    if (g_dgram_sockets == null) g_dgram_sockets = .{};
+    if (g_dgram_socket_objs == null) g_dgram_socket_objs = .{};
     const id = g_dgram_next_id;
     g_dgram_next_id +%= 1;
     setNonBlocking(fd);
-    g_dgram_sockets.?.put(id, .{ .fd = fd, .family = family, .bound = false, .ctx = ctx, .ref_count = 1, .broadcast = false, .multicast_ttl = 1 }) catch {
+    g_dgram_sockets.?.put(allocator, id, .{ .fd = fd, .family = family, .bound = false, .ctx = ctx, .ref_count = 1, .broadcast = false, .multicast_ttl = 1 }) catch {
         _ = std.c.close(fd);
         return jsc.JSValueMakeUndefined(ctx);
     };
     const socket = makeDgramSocketObject(ctx, id);
-    g_dgram_socket_objs.?.put(id, socket) catch {};
+    g_dgram_socket_objs.?.put(allocator, id, socket) catch {};
     if (argumentCount >= 2 and jsc.JSObjectIsFunction(ctx, @ptrCast(arguments[1]))) {
         var args = [_]jsc.JSValueRef{socket};
         _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(arguments[1]), null, 1, &args, null);
