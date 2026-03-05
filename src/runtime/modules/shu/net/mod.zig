@@ -214,36 +214,45 @@ fn socketConnectCallback(
     if (argumentCount < 1) return jsc.JSValueMakeUndefined(ctx);
     const port_val = arguments[0];
     const host_val = if (argumentCount > 1) arguments[1] else jsc.JSValueMakeUndefined(ctx);
-    const user_cb = if (argumentCount > 2) arguments[2] else if (argumentCount > 1 and jsc.JSObjectIsFunction(ctx, @ptrCast(arguments[1]))) arguments[1] else jsc.JSValueMakeUndefined(ctx);
+    const host_val_obj = jsc.JSValueToObject(ctx, host_val, null);
+    const arg1_is_fn = host_val_obj != null and jsc.JSObjectIsFunction(ctx, host_val_obj.?);
+    const user_cb = if (argumentCount > 2) arguments[2] else if (argumentCount > 1 and arg1_is_fn) arguments[1] else jsc.JSValueMakeUndefined(ctx);
     const allocator = globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
     const port_n = jsc.JSValueToNumber(ctx, port_val, null);
     if (port_n != port_n or port_n < 1 or port_n > 65535) return jsc.JSValueMakeUndefined(ctx);
     const port = @as(u16, @intFromFloat(port_n));
     var host: []const u8 = "localhost";
-    if (!jsc.JSValueIsUndefined(ctx, host_val) and !jsc.JSObjectIsFunction(ctx, @ptrCast(host_val))) {
+    var host_owned: bool = false;
+    if (!jsc.JSValueIsUndefined(ctx, host_val) and !arg1_is_fn) {
         const js_str = jsc.JSValueToStringCopy(ctx, host_val, null);
         defer jsc.JSStringRelease(js_str);
         var host_buf: [256]u8 = undefined;
         const n = jsc.JSStringGetUTF8CString(js_str, host_buf[0..].ptr, host_buf.len);
-        if (n > 0) host = allocator.dupe(u8, host_buf[0 .. n - 1]) catch "localhost";
+        if (n > 0) {
+            host = allocator.dupe(u8, host_buf[0 .. n - 1]) catch "localhost";
+            host_owned = true;
+        }
     } else {
         host = allocator.dupe(u8, "localhost") catch return jsc.JSValueMakeUndefined(ctx);
+        host_owned = true;
     }
-    const connect_listener = if (jsc.JSObjectIsFunction(ctx, @ptrCast(user_cb))) user_cb else return jsc.JSValueMakeUndefined(ctx);
+    const user_cb_obj = jsc.JSValueToObject(ctx, user_cb, null);
+    if (user_cb_obj == null or !jsc.JSObjectIsFunction(ctx, user_cb_obj.?)) return jsc.JSValueMakeUndefined(ctx);
+    const connect_listener = user_cb;
     jsc.JSValueProtect(ctx, connect_listener);
     _ = g_net_pending_count.fetchAdd(1, .monotonic);
     if (g_net_pending_connects == null) {
         g_net_pending_connects = std.ArrayListUnmanaged(PendingConnect).initCapacity(allocator, 4) catch {
             jsc.JSValueUnprotect(ctx, connect_listener);
             _ = g_net_pending_count.fetchSub(1, .monotonic);
-            if (host.len > 0) allocator.free(host);
+            if (host_owned) allocator.free(host);
             return jsc.JSValueMakeUndefined(ctx);
         };
     }
     const args = allocator.create(ConnectArgs) catch {
         jsc.JSValueUnprotect(ctx, connect_listener);
         _ = g_net_pending_count.fetchSub(1, .monotonic);
-        if (host.len > 0) allocator.free(host);
+        if (host_owned) allocator.free(host);
         return jsc.JSValueMakeUndefined(ctx);
     };
     args.* = .{
@@ -252,13 +261,15 @@ fn socketConnectCallback(
         .host = host,
         .path = "",
         .is_unix = false,
+        .host_owned = host_owned,
+        .path_owned = false,
         .ctx = ctx,
         .callback = connect_listener,
         .user_callback = connect_listener,
     };
     var thread = std.Thread.spawn(.{}, connectThreadMain, .{args}) catch {
         allocator.destroy(args);
-        if (host.len > 0) allocator.free(host);
+        if (host_owned) allocator.free(host);
         jsc.JSValueUnprotect(ctx, connect_listener);
         _ = g_net_pending_count.fetchSub(1, .monotonic);
         return jsc.JSValueMakeUndefined(ctx);
@@ -316,7 +327,9 @@ fn listenCallback(
     const k_listener = jsc.JSStringCreateWithUTF8CString("_connectionListener");
     defer jsc.JSStringRelease(k_listener);
     const listener_val = jsc.JSObjectGetProperty(ctx, this, k_listener, null);
-    if (!jsc.JSObjectIsFunction(ctx, @ptrCast(listener_val))) return jsc.JSValueMakeUndefined(ctx);
+    if (jsc.JSValueIsUndefined(ctx, listener_val) or jsc.JSValueIsNull(ctx, listener_val)) return jsc.JSValueMakeUndefined(ctx);
+    const listener_obj = jsc.JSValueToObject(ctx, listener_val, null);
+    if (listener_obj == null or !jsc.JSObjectIsFunction(ctx, listener_obj.?)) return jsc.JSValueMakeUndefined(ctx);
     const allocator = globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
     var server: std.Io.net.Server = undefined;
     var port: u16 = 0;
@@ -1340,6 +1353,9 @@ const ConnectArgs = struct {
     host: []const u8,
     path: []const u8,
     is_unix: bool,
+    /// 是否由本结构持有 host/path 的分配，线程结束时仅在此为 true 时 free
+    host_owned: bool = false,
+    path_owned: bool = false,
     ctx: jsc.JSContextRef,
     callback: jsc.JSValueRef,
     user_callback: ?jsc.JSValueRef = null,
@@ -1352,7 +1368,11 @@ const ConnectArgs = struct {
 fn connectThreadMain(args: *ConnectArgs) void {
     const io = libs_process.getProcessIo() orelse return;
     defer {
-        if (args.is_unix) args.allocator.free(args.path) else args.allocator.free(args.host);
+        if (args.is_unix) {
+            if (args.path_owned) args.allocator.free(args.path);
+        } else {
+            if (args.host_owned) args.allocator.free(args.host);
+        }
         if (args.local_address) |la| args.allocator.free(la);
         args.allocator.destroy(args);
     }
@@ -1418,11 +1438,13 @@ fn createConnectionCallback(
     const allocator = globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
     const first = arguments[0];
     const opts_obj = jsc.JSValueToObject(ctx, first, null);
-    const use_options = opts_obj != null and !jsc.JSObjectIsFunction(ctx, @ptrCast(first));
+    const use_options = opts_obj != null and !jsc.JSObjectIsFunction(ctx, opts_obj.?);
     var connect_listener: jsc.JSValueRef = undefined;
     var port: u16 = 0;
     var host: []const u8 = "localhost";
     var path: []const u8 = "";
+    var host_owned: bool = false;
+    var path_owned: bool = false;
     var is_unix: bool = false;
     var options_timeout_ms: ?u32 = null;
     var options_local_address: ?[]const u8 = null;
@@ -1453,6 +1475,7 @@ fn createConnectionCallback(
         if (path_slice) |p| {
             is_unix = true;
             path = allocator.dupe(u8, p) catch return jsc.JSValueMakeUndefined(ctx);
+            path_owned = true;
             host = "";
         } else if (port_slice) |ps| {
             const port_n = std.fmt.parseUnsigned(u16, ps, 10) catch 0;
@@ -1460,11 +1483,12 @@ fn createConnectionCallback(
                 port = port_n;
                 const host_slice = getOptStrFromObj(ctx, opts_obj.?, "host", &host_buf);
                 host = if (host_slice) |h| allocator.dupe(u8, h) catch "localhost" else allocator.dupe(u8, "localhost") catch return jsc.JSValueMakeUndefined(ctx);
+                host_owned = true;
             }
         }
         connect_listener = if (argumentCount > 1) arguments[1] else jsc.JSValueMakeUndefined(ctx);
         if (!is_unix and port == 0) {
-            allocator.free(host);
+            if (host_owned) allocator.free(host);
             if (options_local_address) |la| allocator.free(la);
             return jsc.JSValueMakeUndefined(ctx);
         }
@@ -1485,25 +1509,33 @@ fn createConnectionCallback(
             const n = jsc.JSStringGetUTF8CString(js_str, path_buf[0..].ptr, path_buf.len);
             if (n == 0) return jsc.JSValueMakeUndefined(ctx);
             path = allocator.dupe(u8, path_buf[0 .. n - 1]) catch return jsc.JSValueMakeUndefined(ctx);
+            path_owned = true;
             host = "";
             connect_listener = if (argumentCount > 1) arguments[1] else jsc.JSValueMakeUndefined(ctx);
         } else {
             port = @intFromFloat(port_n);
-            if (argumentCount > 1 and !jsc.JSObjectIsFunction(ctx, @ptrCast(arguments[1]))) {
+            const arg1_obj = if (argumentCount > 1) jsc.JSValueToObject(ctx, arguments[1], null) else null;
+            const arg1_is_fn = arg1_obj != null and jsc.JSObjectIsFunction(ctx, arg1_obj.?);
+            if (argumentCount > 1 and !arg1_is_fn) {
                 const js_str = jsc.JSValueToStringCopy(ctx, arguments[1], null);
                 defer jsc.JSStringRelease(js_str);
                 var host_buf: [256]u8 = undefined;
                 const n = jsc.JSStringGetUTF8CString(js_str, host_buf[0..].ptr, host_buf.len);
-                if (n > 0) host = allocator.dupe(u8, host_buf[0 .. n - 1]) catch "localhost";
+                if (n > 0) {
+                    host = allocator.dupe(u8, host_buf[0 .. n - 1]) catch "localhost";
+                    host_owned = true;
+                }
             } else {
                 host = allocator.dupe(u8, "localhost") catch return jsc.JSValueMakeUndefined(ctx);
+                host_owned = true;
             }
-            connect_listener = if (argumentCount > 2) arguments[2] else if (argumentCount > 1 and jsc.JSObjectIsFunction(ctx, @ptrCast(arguments[1]))) arguments[1] else jsc.JSValueMakeUndefined(ctx);
+            connect_listener = if (argumentCount > 2) arguments[2] else if (argumentCount > 1 and arg1_is_fn) arguments[1] else jsc.JSValueMakeUndefined(ctx);
         }
     }
-    if (!jsc.JSObjectIsFunction(ctx, @ptrCast(connect_listener))) {
-        if (!is_unix) allocator.free(host);
-        if (is_unix) allocator.free(path);
+    const connect_listener_obj = jsc.JSValueToObject(ctx, connect_listener, null);
+    if (connect_listener_obj == null or !jsc.JSObjectIsFunction(ctx, connect_listener_obj.?)) {
+        if (host_owned) allocator.free(host);
+        if (path_owned) allocator.free(path);
         return jsc.JSValueMakeUndefined(ctx);
     }
     jsc.JSValueProtect(ctx, connect_listener);
@@ -1512,16 +1544,16 @@ fn createConnectionCallback(
         g_net_pending_connects = std.ArrayListUnmanaged(PendingConnect).initCapacity(allocator, 4) catch {
             jsc.JSValueUnprotect(ctx, connect_listener);
             _ = g_net_pending_count.fetchSub(1, .monotonic);
-            if (!is_unix) allocator.free(host);
-            if (is_unix) allocator.free(path);
+            if (host_owned) allocator.free(host);
+            if (path_owned) allocator.free(path);
             return jsc.JSValueMakeUndefined(ctx);
         };
     }
     const args = allocator.create(ConnectArgs) catch {
         jsc.JSValueUnprotect(ctx, connect_listener);
         _ = g_net_pending_count.fetchSub(1, .monotonic);
-        if (!is_unix) allocator.free(host);
-        if (is_unix) allocator.free(path);
+        if (host_owned) allocator.free(host);
+        if (path_owned) allocator.free(path);
         return jsc.JSValueMakeUndefined(ctx);
     };
     args.* = .{
@@ -1530,6 +1562,8 @@ fn createConnectionCallback(
         .host = host,
         .path = path,
         .is_unix = is_unix,
+        .host_owned = host_owned,
+        .path_owned = path_owned,
         .ctx = ctx,
         .callback = connect_listener,
         .timeout_ms = options_timeout_ms,
@@ -1538,8 +1572,8 @@ fn createConnectionCallback(
     };
     var thread = std.Thread.spawn(.{}, connectThreadMain, .{args}) catch {
         allocator.destroy(args);
-        if (!is_unix) allocator.free(host);
-        if (is_unix) allocator.free(path);
+        if (host_owned) allocator.free(host);
+        if (path_owned) allocator.free(path);
         if (options_local_address) |la| allocator.free(la);
         jsc.JSValueUnprotect(ctx, connect_listener);
         _ = g_net_pending_count.fetchSub(1, .monotonic);
