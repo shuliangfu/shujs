@@ -67,6 +67,8 @@ const errors = @import("errors");
 const libs_process = @import("libs_process");
 const globals = @import("../../../globals.zig");
 const common = @import("../../../common.zig");
+const promise = @import("../promise.zig");
+const timer_state = @import("../timers/state.zig");
 
 /// 超过此大小的文件在 readSync(encoding:null) 时用 libs_io.mapFileReadOnly；copySync 源文件超过此值时用 mmap 读+整块写
 const FS_MAP_THRESHOLD = 256 * 1024;
@@ -206,6 +208,145 @@ var current_deferred_fs_op: ?*DeferredFsOp = null;
 /// 延迟队列；Unmanaged 不存 allocator，append/orderedRemove 显式传 allocator（01 §1.2、00 §1.5）
 var deferred_fs_queue: ?std.ArrayListUnmanaged(DeferredFsOp) = null;
 
+// ---------- read/write 回退到「微任务 + Shu.fs.xxxSync」的纯 Zig 路径（无内联 JS） ----------
+
+/// 单参/双参 Sync 回退的 payload：微任务执行时从 global 取 Shu.fs[method_name]、JSON.parse 后调用并 resolve/reject；path_json/path2_json 为 dupeZ 所有权
+const FsSyncFallbackPayload = struct {
+    allocator: std.mem.Allocator,
+    ctx: jsc.JSContextRef,
+    resolve: jsc.JSValueRef,
+    reject: jsc.JSValueRef,
+    method_name: []const u8,
+    path_json: []const u8,
+    path2_json: ?[]const u8,
+};
+/// 待执行的 Sync 回退微任务队列；微任务回调每次弹出队首执行并释放 payload
+var pending_fs_sync_fallback_list: ?std.ArrayListUnmanaged(*FsSyncFallbackPayload) = null;
+
+/// 确保 pending_fs_sync_fallback_list 已初始化，便于首次 append
+fn ensurePendingFsSyncFallbackList(allocator: std.mem.Allocator) void {
+    if (pending_fs_sync_fallback_list == null) {
+        pending_fs_sync_fallback_list = std.ArrayListUnmanaged(*FsSyncFallbackPayload).initCapacity(allocator, 8) catch return;
+    }
+}
+
+/// 微任务被 runMicrotasks 调用时执行：弹出队首 payload，取 Shu.fs[method]、JSON.parse(path_json[, path2_json])，调用同步方法后 resolve(result) 或 reject(exception)
+fn fsSyncFallbackMicrotaskCallback(
+    ctx: jsc.JSContextRef,
+    _: jsc.JSObjectRef,
+    _: jsc.JSObjectRef,
+    _: usize,
+    _: [*]const jsc.JSValueRef,
+    _: [*]jsc.JSValueRef,
+) callconv(.c) jsc.JSValueRef {
+    const allocator = globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
+    var list_opt = pending_fs_sync_fallback_list orelse return jsc.JSValueMakeUndefined(ctx);
+    if (list_opt.items.len == 0) return jsc.JSValueMakeUndefined(ctx);
+    const payload = list_opt.orderedRemove(0);
+    pending_fs_sync_fallback_list = list_opt;
+    defer {
+        jsc.JSValueUnprotect(ctx, payload.resolve);
+        jsc.JSValueUnprotect(ctx, payload.reject);
+        allocator.free(payload.path_json);
+        if (payload.path2_json) |p2| allocator.free(p2);
+        allocator.destroy(payload);
+    }
+    const global = jsc.JSContextGetGlobalObject(ctx);
+    const k_Shu = jsc.JSStringCreateWithUTF8CString("Shu");
+    defer jsc.JSStringRelease(k_Shu);
+    const k_fs = jsc.JSStringCreateWithUTF8CString("fs");
+    defer jsc.JSStringRelease(k_fs);
+    const Shu = jsc.JSObjectGetProperty(ctx, global, k_Shu, null);
+    const fs_obj = jsc.JSObjectGetProperty(ctx, @ptrCast(Shu), k_fs, null);
+    const method_name_str = jsc.JSStringCreateWithUTF8CString(payload.method_name.ptr);
+    defer jsc.JSStringRelease(method_name_str);
+    const method_val = jsc.JSObjectGetProperty(ctx, @ptrCast(fs_obj), method_name_str, null);
+    if (!jsc.JSObjectIsFunction(ctx, @ptrCast(method_val))) {
+        const rej_fn = jsc.JSValueToObject(ctx, payload.reject, null);
+        var rej_args: [1]jsc.JSValueRef = .{jsc.JSValueMakeUndefined(ctx)};
+        _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(rej_fn), null, 1, &rej_args, null);
+        return jsc.JSValueMakeUndefined(ctx);
+    }
+    const k_JSON = jsc.JSStringCreateWithUTF8CString("JSON");
+    defer jsc.JSStringRelease(k_JSON);
+    const k_parse = jsc.JSStringCreateWithUTF8CString("parse");
+    defer jsc.JSStringRelease(k_parse);
+    const JSON_obj = jsc.JSObjectGetProperty(ctx, global, k_JSON, null);
+    const parse_fn = jsc.JSObjectGetProperty(ctx, @ptrCast(JSON_obj), k_parse, null);
+    const path_str_ref = jsc.JSStringCreateWithUTF8CString(payload.path_json.ptr);
+    defer jsc.JSStringRelease(path_str_ref);
+    const path_js = jsc.JSValueMakeString(ctx, path_str_ref);
+    var parse_args: [1]jsc.JSValueRef = .{path_js};
+    var exception: ?jsc.JSValueRef = null;
+    const parsed_a = jsc.JSObjectCallAsFunction(ctx, @ptrCast(parse_fn), @ptrCast(JSON_obj), 1, &parse_args, @ptrCast(&exception));
+    if (exception != null) {
+        const rej_fn = jsc.JSValueToObject(ctx, payload.reject, null);
+        var rej_args: [1]jsc.JSValueRef = .{exception.?};
+        _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(rej_fn), null, 1, &rej_args, null);
+        return jsc.JSValueMakeUndefined(ctx);
+    }
+    if (payload.path2_json) |b_json| {
+        const b_str_ref = jsc.JSStringCreateWithUTF8CString(b_json.ptr);
+        defer jsc.JSStringRelease(b_str_ref);
+        const b_js = jsc.JSValueMakeString(ctx, b_str_ref);
+        var parse_b_args: [1]jsc.JSValueRef = .{b_js};
+        const parsed_b = jsc.JSObjectCallAsFunction(ctx, @ptrCast(parse_fn), @ptrCast(JSON_obj), 1, &parse_b_args, @ptrCast(&exception));
+        if (exception != null) {
+            const rej_fn = jsc.JSValueToObject(ctx, payload.reject, null);
+            var rej_args: [1]jsc.JSValueRef = .{exception.?};
+            _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(rej_fn), null, 1, &rej_args, null);
+            return jsc.JSValueMakeUndefined(ctx);
+        }
+        var call_args: [2]jsc.JSValueRef = .{ parsed_a, parsed_b };
+        _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(method_val), @ptrCast(fs_obj), 2, &call_args, @ptrCast(&exception));
+        if (exception != null) {
+            const resolve_fn = jsc.JSValueToObject(ctx, payload.reject, null);
+            var rej_args: [1]jsc.JSValueRef = .{exception.?};
+            _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(resolve_fn), null, 1, &rej_args, null);
+            return jsc.JSValueMakeUndefined(ctx);
+        }
+        const resolve_fn = jsc.JSValueToObject(ctx, payload.resolve, null);
+        var empty_args: [0]jsc.JSValueRef = .{};
+        _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(resolve_fn), null, 0, &empty_args, null);
+        return jsc.JSValueMakeUndefined(ctx);
+    }
+    var one_arg: [1]jsc.JSValueRef = .{parsed_a};
+    const result = jsc.JSObjectCallAsFunction(ctx, @ptrCast(method_val), @ptrCast(fs_obj), 1, &one_arg, @ptrCast(&exception));
+    if (exception != null) {
+        const rej_fn = jsc.JSValueToObject(ctx, payload.reject, null);
+        var rej_args: [1]jsc.JSValueRef = .{exception.?};
+        _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(rej_fn), null, 1, &rej_args, null);
+        return jsc.JSValueMakeUndefined(ctx);
+    }
+    const resolve_fn = jsc.JSValueToObject(ctx, payload.resolve, null);
+    var res_args: [1]jsc.JSValueRef = .{result};
+    _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(resolve_fn), null, 1, &res_args, null);
+    return jsc.JSValueMakeUndefined(ctx);
+}
+
+/// promise.createWithExecutor 的 Zig 回调：把 resolve/reject 写入 payload，Protect 后入队并 enqueueMicrotask(__fsSyncFallbackMicrotask)
+fn fsSyncFallbackOnExecutor(ctx: jsc.JSContextRef, resolve_val: jsc.JSValueRef, reject_val: jsc.JSValueRef, user_data: ?*anyopaque) void {
+    const payload = @as(*FsSyncFallbackPayload, @ptrCast(@alignCast(user_data orelse return)));
+    payload.resolve = resolve_val;
+    payload.reject = reject_val;
+    jsc.JSValueProtect(ctx, resolve_val);
+    jsc.JSValueProtect(ctx, reject_val);
+    const allocator = globals.current_allocator orelse return;
+    ensurePendingFsSyncFallbackList(allocator);
+    var list = &pending_fs_sync_fallback_list.?;
+    list.append(allocator, payload) catch return;
+    const state = globals.current_timer_state orelse return;
+    const global = jsc.JSContextGetGlobalObject(ctx);
+    const k = jsc.JSStringCreateWithUTF8CString("__fsSyncFallbackMicrotask");
+    defer jsc.JSStringRelease(k);
+    const fn_val = jsc.JSObjectGetProperty(ctx, global, k, null);
+    if (jsc.JSValueIsUndefined(ctx, fn_val) or jsc.JSValueIsNull(ctx, fn_val)) return;
+    const fn_obj = jsc.JSValueToObject(ctx, fn_val, null) orelse return;
+    if (!jsc.JSObjectIsFunction(ctx, fn_obj)) return;
+    jsc.JSValueProtect(ctx, fn_val);
+    state.enqueueMicrotask(@ptrCast(ctx), fn_val);
+}
+
 /// 确保延迟队列已初始化；调用方须持有 current_allocator
 fn ensureDeferredFsQueue() !void {
     if (deferred_fs_queue != null) return;
@@ -213,20 +354,12 @@ fn ensureDeferredFsQueue() !void {
     deferred_fs_queue = std.ArrayListUnmanaged(DeferredFsOp).initCapacity(allocator, 0) catch return error.NoAllocator;
 }
 
-/// Promise executor 的 C 回调：JSC 调用时传入 (resolve, reject)，将当前 op 的 resolve/reject 写入，path/path2/content 复制后入队并释放原指针，返回 undefined
-fn deferredFsExecutor(
-    ctx: jsc.JSContextRef,
-    _: jsc.JSObjectRef,
-    _: jsc.JSObjectRef,
-    argumentCount: usize,
-    arguments: [*]const jsc.JSValueRef,
-    _: [*]jsc.JSValueRef,
-) callconv(.c) jsc.JSValueRef {
-    const op = current_deferred_fs_op orelse return jsc.JSValueMakeUndefined(ctx);
+/// promise.createWithExecutor 的 Zig 回调：将 resolve/reject 写入 op，path/path2/content 复制后入队并释放原指针
+fn fsDeferredOnExecutor(ctx: jsc.JSContextRef, resolve_val: jsc.JSValueRef, reject_val: jsc.JSValueRef, user_data: ?*anyopaque) void {
+    const op = @as(*DeferredFsOp, @alignCast(@ptrCast(user_data orelse return)));
     current_deferred_fs_op = null;
-    if (argumentCount < 2) return jsc.JSValueMakeUndefined(ctx);
     const allocator = op.allocator;
-    const path_dup = allocator.dupe(u8, op.path) catch return jsc.JSValueMakeUndefined(ctx);
+    const path_dup = allocator.dupe(u8, op.path) catch return;
     allocator.free(op.path);
     const path2_dup = if (op.path2) |p| allocator.dupe(u8, p) catch null else null;
     if (op.path2) |p| allocator.free(p);
@@ -241,8 +374,8 @@ fn deferredFsExecutor(
         .len = op.len,
         .mode = op.mode,
         .return_buffer = op.return_buffer,
-        .resolve = arguments[0],
-        .reject = arguments[1],
+        .resolve = resolve_val,
+        .reject = reject_val,
     };
     jsc.JSValueProtect(ctx, entry.resolve);
     jsc.JSValueProtect(ctx, entry.reject);
@@ -251,12 +384,8 @@ fn deferredFsExecutor(
             allocator.free(path_dup);
             if (path2_dup) |p| allocator.free(p);
             if (content_dup) |c| allocator.free(c);
-            return jsc.JSValueMakeUndefined(ctx);
         };
-    } else {
-        return jsc.JSValueMakeUndefined(ctx);
     }
-    return jsc.JSValueMakeUndefined(ctx);
 }
 
 /// 在 drain 中执行单条延迟任务：按 tag 跑同步逻辑，resolve(result) 或 reject(err)，释放 path/path2/content 并 Unprotect
@@ -1323,7 +1452,7 @@ pub fn getExports(ctx: jsc.JSContextRef, _: std.mem.Allocator) jsc.JSValueRef {
     return file_obj;
 }
 
-/// 向 shu_obj 上注册 Shu.fs 子对象（委托 getExports），与 node:fs/deno:fs 命名统一；并注册内部 __fsSubmitRead/__fsSubmitWrite 供异步 read/write 使用
+/// 向 shu_obj 上注册 Shu.fs 子对象（委托 getExports），与 node:fs/deno:fs 命名统一；并注册内部 __fsSubmitRead/__fsSubmitWrite 与全局 __fsSyncFallbackMicrotask 供异步 read/write 回退微任务使用
 pub fn register(ctx: jsc.JSGlobalContextRef, shu_obj: jsc.JSObjectRef) void {
     const allocator = globals.current_allocator orelse return;
     const name_fs = jsc.JSStringCreateWithUTF8CString("fs");
@@ -1331,6 +1460,8 @@ pub fn register(ctx: jsc.JSGlobalContextRef, shu_obj: jsc.JSObjectRef) void {
     _ = jsc.JSObjectSetProperty(ctx, shu_obj, name_fs, getExports(ctx, allocator), jsc.kJSPropertyAttributeNone, null);
     common.setMethod(ctx, shu_obj, "__fsSubmitRead", fsSubmitReadCallback);
     common.setMethod(ctx, shu_obj, "__fsSubmitWrite", fsSubmitWriteCallback);
+    const global = jsc.JSContextGetGlobalObject(ctx);
+    common.setMethod(ctx, @ptrCast(global), "__fsSyncFallbackMicrotask", fsSyncFallbackMicrotaskCallback);
 }
 
 /// 在 file_obj 上挂载所有方法（getExports / register 共用）；含 node:fs 兼容命名（readFileSync/writeFileSync/readFile/writeFile/copyFileSync/appendFileSync）
@@ -1519,18 +1650,46 @@ fn makeStatObjectWithSymlink(ctx: jsc.JSContextRef, is_file: bool, is_dir: bool,
     return obj;
 }
 
-/// read/write 在内存不足等 fallback 时仍用脚本创建 Promise（仅此二处）；其余异步 fs 一律走 createDeferredFsPromise 纯 Zig
+/// read/write 在内存不足等 fallback 时用微任务 + Shu.fs.xxxSync 纯 Zig 路径（无内联 JS）；path_json 由调用方提供，本函数 dupeZ 后由 payload 持有
 fn makeDeferredPromiseOne(ctx: jsc.JSContextRef, allocator: std.mem.Allocator, syncMethod: []const u8, path_json: []const u8) jsc.JSValueRef {
-    var script: [4096]u8 = undefined;
-    const written = std.fmt.bufPrint(&script, "(function(){{ var p = {s}; return new Promise(function(resolve,reject){{ setTimeout(function(){{ try {{ resolve(Shu.fs.{s}(p)); }} catch(e) {{ reject(e); }} }}, 0); }}); }})();", .{ path_json, syncMethod }) catch return jsc.JSValueMakeUndefined(ctx);
-    _ = allocator;
-    return common.evalPromiseScript(ctx, written);
+    const path_z = allocator.dupeZ(u8, path_json) catch return jsc.JSValueMakeUndefined(ctx);
+    const payload = allocator.create(FsSyncFallbackPayload) catch {
+        allocator.free(path_z);
+        return jsc.JSValueMakeUndefined(ctx);
+    };
+    payload.* = .{
+        .allocator = allocator,
+        .ctx = ctx,
+        .resolve = undefined,
+        .reject = undefined,
+        .method_name = syncMethod,
+        .path_json = path_z,
+        .path2_json = null,
+    };
+    return promise.createWithExecutor(ctx, fsSyncFallbackOnExecutor, payload);
 }
+/// 双参 Sync 回退（如 writeSync(path, content)）：a_json/b_json 由调用方提供，本函数 dupeZ 后由 payload 持有
 fn makeDeferredPromiseTwo(ctx: jsc.JSContextRef, allocator: std.mem.Allocator, syncMethod: []const u8, a_json: []const u8, b_json: []const u8) jsc.JSValueRef {
-    var script: [8192]u8 = undefined;
-    const written = std.fmt.bufPrint(&script, "(function(){{ var a = {s}, b = {s}; return new Promise(function(resolve,reject){{ setTimeout(function(){{ try {{ Shu.fs.{s}(a, b); resolve(); }} catch(e) {{ reject(e); }} }}, 0); }}); }})();", .{ a_json, b_json, syncMethod }) catch return jsc.JSValueMakeUndefined(ctx);
-    _ = allocator;
-    return common.evalPromiseScript(ctx, written);
+    const a_z = allocator.dupeZ(u8, a_json) catch return jsc.JSValueMakeUndefined(ctx);
+    const b_z = allocator.dupeZ(u8, b_json) catch {
+        allocator.free(a_z);
+        return jsc.JSValueMakeUndefined(ctx);
+    };
+    const payload = allocator.create(FsSyncFallbackPayload) catch {
+        allocator.free(a_z);
+        allocator.free(b_z);
+        return jsc.JSValueMakeUndefined(ctx);
+    };
+    payload.* = .{
+        .allocator = allocator,
+        .ctx = ctx,
+        .resolve = undefined,
+        .reject = undefined,
+        .method_name = syncMethod,
+        .path_json = a_z,
+        .path2_json = b_z,
+    };
+    return promise.createWithExecutor(ctx, fsSyncFallbackOnExecutor, payload);
 }
 
 /// 纯 Zig 创建 Promise：将 op 挂到 current_deferred_fs_op，用 Zig 回调作为 executor，drain 时执行同步逻辑并 resolve/reject；path/path2/content 所有权转入队列
@@ -1559,16 +1718,7 @@ fn createDeferredFsPromise(
         .reject = undefined,
     };
     current_deferred_fs_op = &deferred_fs_current_op;
-    const global = jsc.JSContextGetGlobalObject(ctx);
-    const k_promise = jsc.JSStringCreateWithUTF8CString("Promise");
-    defer jsc.JSStringRelease(k_promise);
-    const promise_val = jsc.JSObjectGetProperty(ctx, global, k_promise, null);
-    const promise_ctor = jsc.JSValueToObject(ctx, promise_val, null) orelse return jsc.JSValueMakeUndefined(ctx);
-    const k_exec = jsc.JSStringCreateWithUTF8CString("executor");
-    defer jsc.JSStringRelease(k_exec);
-    const executor_fn = jsc.JSObjectMakeFunctionWithCallback(ctx, k_exec, deferredFsExecutor);
-    var one: [1]jsc.JSValueRef = .{executor_fn};
-    return jsc.JSObjectCallAsConstructor(ctx, promise_ctor, 1, &one, null);
+    return promise.createWithExecutor(ctx, fsDeferredOnExecutor, current_deferred_fs_op);
 }
 
 // ---------- 同步回调 ----------
@@ -2496,11 +2646,7 @@ fn readFileAsyncCallback(
         return makeDeferredPromiseOne(ctx, allocator, "readSync", path_json);
     };
     fs_read_promise_args = .{ .resolved = resolved_owned, .return_buffer = return_buffer };
-    const global = jsc.JSContextGetGlobalObject(ctx);
-    const k_promise = jsc.JSStringCreateWithUTF8CString("Promise");
-    defer jsc.JSStringRelease(k_promise);
-    const promise_val = jsc.JSObjectGetProperty(ctx, global, k_promise, null);
-    const promise_ctor = jsc.JSValueToObject(ctx, promise_val, null) orelse {
+    const Promise_ctor = promise.getPromiseConstructor(ctx) orelse {
         fs_read_promise_args = null;
         allocator.free(resolved_owned);
         const path_json = jsonEscapeString(allocator, path) orelse return jsc.JSValueMakeUndefined(ctx);
@@ -2511,7 +2657,7 @@ fn readFileAsyncCallback(
     defer jsc.JSStringRelease(executor_name);
     const executor_fn = jsc.JSObjectMakeFunctionWithCallback(ctx, executor_name, fsReadExecutorCallback);
     var executor_arg: [1]jsc.JSValueRef = .{executor_fn};
-    return jsc.JSObjectCallAsConstructor(ctx, promise_ctor, 1, &executor_arg, null);
+    return jsc.JSObjectCallAsConstructor(ctx, Promise_ctor, 1, &executor_arg, null);
 }
 
 /// Shu.fs.write(path, content)：异步写文件，走 libs_io.AsyncFileIO；Zig 侧直接 new Promise(executor) 无脚本解析；init 失败或 content 超 512KB 时回退 setTimeout+writeSync
@@ -2560,11 +2706,7 @@ fn writeFileAsyncCallback(
     };
     allocator.free(content); // getArgString 返回的切片，dupe 后不再需要
     fs_write_promise_args = .{ .resolved = resolved, .content = content_owned };
-    const global = jsc.JSContextGetGlobalObject(ctx);
-    const k_promise = jsc.JSStringCreateWithUTF8CString("Promise");
-    defer jsc.JSStringRelease(k_promise);
-    const promise_val = jsc.JSObjectGetProperty(ctx, global, k_promise, null);
-    const promise_ctor = jsc.JSValueToObject(ctx, promise_val, null) orelse {
+    const Promise_ctor = promise.getPromiseConstructor(ctx) orelse {
         fs_write_promise_args = null;
         const path_json = jsonEscapeString(allocator, resolved) orelse {
             allocator.free(resolved);
@@ -2586,7 +2728,7 @@ fn writeFileAsyncCallback(
     defer jsc.JSStringRelease(executor_name);
     const executor_fn = jsc.JSObjectMakeFunctionWithCallback(ctx, executor_name, fsWriteExecutorCallback);
     var one: [1]jsc.JSValueRef = .{executor_fn};
-    const result = jsc.JSObjectCallAsConstructor(ctx, promise_ctor, 1, &one, null);
+    const result = jsc.JSObjectCallAsConstructor(ctx, Promise_ctor, 1, &one, null);
     if (jsc.JSValueIsUndefined(ctx, result)) {
         fs_write_promise_args = null;
         allocator.free(resolved);
