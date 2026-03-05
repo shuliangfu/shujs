@@ -24,7 +24,7 @@
 | **describe.skip/ignore** | — | describe.ignore | describe.skip | ✅ **describe.skip** / **describe.ignore**（整 suite 跳过） |
 | **test.each** | — | — | test.each(table)(name, fn) | ✅ **it.each(table)(name, fn)** / **test.each(table)(name, fn)** |
 | **test.serial** | — | — | test.serial | ✅ **test.serial = test**（顺序执行，与当前一致） |
-| **多文件并发（CLI）** | node --test 可并行 | deno test 可并行 | bun test 可并行 | ✅ **shu test** 默认按 **CPU 核心数**并行；**--jobs=1** 顺序；**--filter=pattern** 路径过滤；**--test-name-pattern** / **-t**、**--test-skip-pattern** 用例名过滤；**--bail** / **--fail-fast** 首失败即停；**--shard=i/n** 分片；**--timeout=N**、**--retry=N** |
+| **多文件并发（CLI）** | node --test 可并行 | deno test 可并行 | bun test 可并行 | ✅ **shu test** 默认 **单文件顺序**（--jobs=1），输出不交错；**--jobs=N** 多文件并行；**--filter=pattern** 路径过滤；**--test-name-pattern** / **-t**、**--test-skip-pattern** 用例名过滤；**--bail** / **--fail-fast** 首失败即停；**--shard=i/n** 分片；**--timeout=N**、**--retry=N** |
 
 ---
 
