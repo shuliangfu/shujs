@@ -276,6 +276,8 @@ pub fn build(b: *std.Build) void {
     });
     test_module.addImport("hpack_huffman", hpack_huffman_module);
     test_module.addImport("libs_io", io_core_module);
+    test_module.addImport("errors", errors_module);
+    test_module.addImport("libs_process", libs_process_module);
     const test_exe = b.addTest(.{
         .root_module = test_module,
     });
