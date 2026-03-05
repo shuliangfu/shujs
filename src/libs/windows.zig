@@ -684,3 +684,13 @@ pub fn sendFile(stream: std.Io.net.Stream, file: std.fs.File, offset: u64, count
 }
 
 // 异步文件 I/O（AsyncFileIO）已迁至 io_core/file.zig，Windows 实现为 file.zig 内 AsyncFileIOWindows，由 mod 统一导出 file.AsyncFileIO。
+
+// ------------------------------------------------------------------------------
+// NUMA：Windows 无 mbind；NUMA 需在分配时用 VirtualAllocExNuma，对已分配区间无等价 API
+// ------------------------------------------------------------------------------
+
+/// [Windows] 本平台无 mbind；NUMA 亲和需在分配时用 VirtualAllocExNuma；no-op 以保持与 libs_io 接口一致
+pub fn mbindToCurrentNode(ptr: [*]align(std.heap.page_size_min) const u8, len: usize) void {
+    _ = ptr;
+    _ = len;
+}
