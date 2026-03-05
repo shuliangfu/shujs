@@ -1,4 +1,5 @@
 // shu:module — 对应 node:module，供 ESM 中 createRequire(import.meta.url) 或 CJS 中 require('shu:module').createRequire(__filename) 使用
+// 所有权：createRequire、findPackageJSON、isBuiltin、stripTypeScriptTypes 等返回值为 JSC 持有或栈/调用方缓冲；路径解析内部 [Allocates] 由本模块在回调内 free。
 //
 // ========== 已实现 / 与 node:module 兼容的 API ==========
 //
@@ -60,6 +61,19 @@ fn getPathStringFromValue(ctx: jsc.JSContextRef, val: jsc.JSValueRef, buf: []u8)
     return buf[0 .. n - 1];
 }
 
+/// 两切片相等：先比长度，≤8 字节用单次 u64 比较（00 §2.1），否则 std.mem.eql；用于 parent/dir 路径段比较
+fn sliceEqlShort(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    if (a.len <= 8) {
+        var x: [8]u8 = [_]u8{0} ** 8;
+        var y: [8]u8 = [_]u8{0} ** 8;
+        @memcpy(x[0..a.len], a);
+        @memcpy(y[0..b.len], b);
+        return @as(u64, @bitCast(x)) == @as(u64, @bitCast(y));
+    }
+    return std.mem.eql(u8, a, b);
+}
+
 /// createRequire(filenameOrUrl)：入参可为路径字符串、file:// 字符串或 URL 对象（.href/.pathname），返回 require 函数
 fn createRequireCallback(
     ctx: jsc.JSContextRef,
@@ -119,7 +133,7 @@ fn findPackageJSONCallback(
         defer allocator.free(pkg_path);
         const file = libs_io.openFileAbsolute(pkg_path, .{}) catch {
             const parent = std.fs.path.dirname(dir) orelse break;
-            if (std.mem.eql(u8, parent, dir)) break;
+            if (sliceEqlShort(parent, dir)) break;
             const new_dir = allocator.dupe(u8, parent) catch break;
             if (dir.ptr != start_dir.ptr) allocator.free(dir);
             dir = new_dir;
