@@ -218,78 +218,30 @@ fn serverCallback(
     var host_buf: [256]u8 = undefined;
     const host_slice = options.getOptionalString(ctx, options_obj, "host", "0.0.0.0", &host_buf) orelse "0.0.0.0";
 
+    // 提前取 CPU 核数，供 workers / ioThreads 默认值使用（多进程默认=核数）
+    const cpu_count: u32 = @intCast(std.Thread.getCpuCount() catch 1);
+
     // 读取 options.fetch 或 options.handler（可调用函数）
     const handler_fn = options.getHandlerFromOptions(ctx, options_obj) orelse {
         errors.reportToStderr(.{ .code = .type_error, .message = "Shu.server(options) requires options.fetch or options.handler (function)" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     };
 
-    // runLoop 节流：每 N 个请求执行一次 runMicrotasks+runLoop（默认 1）；或按时间间隔 runLoopIntervalMs（0 表示不按时间）
-    const run_loop_every = options.getOptionalNumber(ctx, options_obj, "runLoopEveryRequests", 1);
-    const run_loop_interval_ms = options.getOptionalNumber(ctx, options_obj, "runLoopIntervalMs", 0);
-    // 请求 body 上限（字节），用于文件上传等；0 或未配则用默认 1MB，不设最高限制，由用户自行负责
-    var max_request_body = options.getOptionalNumber(ctx, options_obj, "maxRequestBodySize", DEFAULT_MAX_REQUEST_BODY);
-    if (max_request_body == 0) max_request_body = DEFAULT_MAX_REQUEST_BODY;
-    // 响应压缩：默认开启，按 Accept-Encoding 做 br/gzip/deflate；options.compression === false 可关闭
-    const compression_enabled = options.getOptionalBoolDefault(ctx, options_obj, "compression", true);
-
-    // 可自定义配置：keepAliveTimeout / chunkedResponseThreshold / chunkedWriteChunkSize / maxRequestLineLength / minBodyToCompress / listenBacklog
-    const keep_alive_timeout_sec = options.getOptionalNumber(ctx, options_obj, "keepAliveTimeout", DEFAULT_KEEP_ALIVE_TIMEOUT_SEC);
-    var chunked_response_threshold = options.getOptionalNumber(ctx, options_obj, "chunkedResponseThreshold", DEFAULT_CHUNKED_RESPONSE_THRESHOLD);
-    if (chunked_response_threshold == 0) chunked_response_threshold = DEFAULT_CHUNKED_RESPONSE_THRESHOLD;
-    var chunked_write_chunk_size = options.getOptionalNumber(ctx, options_obj, "chunkedWriteChunkSize", DEFAULT_CHUNKED_WRITE_CHUNK_SIZE);
-    if (chunked_write_chunk_size == 0) chunked_write_chunk_size = DEFAULT_CHUNKED_WRITE_CHUNK_SIZE;
-    const max_request_line = options.getOptionalNumber(ctx, options_obj, "maxRequestLineLength", DEFAULT_MAX_REQUEST_LINE);
-    if (max_request_line == 0) {
+    // 公共参数统一由 parseCommonOptions 解析（start 传 defaults=null 使用常量默认）
+    const parsed = parseCommonOptions(ctx, options_obj, cpu_count, null);
+    const config = parsed.config;
+    const compression_enabled = parsed.compression_enabled;
+    const run_loop_every = parsed.run_loop_every;
+    const run_loop_interval_ms = parsed.run_loop_interval_ms;
+    const io_threads = parsed.io_threads;
+    if (config.max_request_line == 0) {
         errors.reportToStderr(.{ .code = .type_error, .message = "Shu.server options.maxRequestLineLength must be > 0" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    const min_body_to_compress = options.getOptionalNumber(ctx, options_obj, "minBodyToCompress", DEFAULT_MIN_BODY_TO_COMPRESS);
-    const listen_backlog = options.getOptionalNumber(ctx, options_obj, "listenBacklog", DEFAULT_LISTEN_BACKLOG);
-    if (listen_backlog == 0) {
+    if (config.listen_backlog == 0) {
         errors.reportToStderr(.{ .code = .type_error, .message = "Shu.server options.listenBacklog must be > 0" }) catch {};
         return jsc.JSValueMakeUndefined(ctx);
     }
-    var max_connections_u = options.getOptionalNumber(ctx, options_obj, "maxConnections", 512);
-    if (max_connections_u < 1) max_connections_u = 1;
-    if (max_connections_u > 5120) max_connections_u = 5120;
-    const max_connections: usize = max_connections_u;
-    const max_accept_per_tick = options.getOptionalNumber(ctx, options_obj, "maxAcceptPerTick", DEFAULT_MAX_ACCEPT_PER_TICK);
-    const ws_max_write_per_tick_u = options.getOptionalNumberFromWebSocket(ctx, options_obj, "maxWritePerTick", @intCast(DEFAULT_WS_MAX_WRITE_PER_TICK));
-    const ws_max_write_per_tick = if (ws_max_write_per_tick_u == 0) DEFAULT_WS_MAX_WRITE_PER_TICK else @as(usize, ws_max_write_per_tick_u);
-    const read_buf_sz = options.clampSize(options.getOptionalNumber(ctx, options_obj, "readBufferSize", @intCast(DEFAULT_READ_BUFFER_SIZE)), 4096, 256 * 1024);
-    const write_cap = options.clampSize(options.getOptionalNumber(ctx, options_obj, "writeBufInitialCapacity", @intCast(DEFAULT_WRITE_BUF_INITIAL_CAPACITY)), 256, 65536);
-    const header_cap = options.clampSize(options.getOptionalNumber(ctx, options_obj, "headerListInitialCapacity", @intCast(DEFAULT_WRITE_BUF_INITIAL_CAPACITY)), 256, 65536);
-    const ws_read_sz = options.clampSize(options.getOptionalNumberFromWebSocket(ctx, options_obj, "readBufferSize", @intCast(DEFAULT_WS_READ_BUFFER_SIZE)), 4096, 512 * 1024);
-    const ws_payload_sz = options.clampSize(options.getOptionalNumberFromWebSocket(ctx, options_obj, "maxPayloadSize", @intCast(DEFAULT_WS_MAX_PAYLOAD_SIZE)), 1024, 1024 * 1024);
-    const ws_frame_sz = options.clampSize(options.getOptionalNumberFromWebSocket(ctx, options_obj, "frameBufferSize", @intCast(DEFAULT_WS_FRAME_BUFFER_SIZE)), 4096, 512 * 1024);
-    var max_completions_u = options.getOptionalNumber(ctx, options_obj, "maxCompletions", @intCast(DEFAULT_MAX_COMPLETIONS));
-    if (max_completions_u == 0) max_completions_u = @intCast(DEFAULT_MAX_COMPLETIONS);
-    const max_completions = options.clampSize(max_completions_u, 64, 5120);
-    const linux_sq_cpu = options.getOptionalNumberOptional(ctx, options_obj, "linuxSqThreadCpu");
-    const use_huge_pages = options.getOptionalBoolDefault(ctx, options_obj, "useHugePages", false);
-    const config = ServerConfig{
-        .keep_alive_timeout_sec = keep_alive_timeout_sec,
-        .chunked_response_threshold = chunked_response_threshold,
-        .chunked_write_chunk_size = chunked_write_chunk_size,
-        .max_request_line = max_request_line,
-        .min_body_to_compress = min_body_to_compress,
-        .listen_backlog = listen_backlog,
-        .max_request_body = max_request_body,
-        .max_connections = max_connections,
-        .max_completions = max_completions,
-        .max_accept_per_tick = if (max_accept_per_tick == 0) DEFAULT_MAX_ACCEPT_PER_TICK else max_accept_per_tick,
-        .ws_max_write_per_tick = ws_max_write_per_tick,
-        .read_buffer_size = if (read_buf_sz == 0) DEFAULT_READ_BUFFER_SIZE else read_buf_sz,
-        .write_buf_initial_capacity = if (write_cap == 0) DEFAULT_WRITE_BUF_INITIAL_CAPACITY else write_cap,
-        .header_list_initial_capacity = if (header_cap == 0) DEFAULT_WRITE_BUF_INITIAL_CAPACITY else header_cap,
-        .ws_read_buffer_size = if (ws_read_sz == 0) DEFAULT_WS_READ_BUFFER_SIZE else ws_read_sz,
-        .ws_max_payload_size = if (ws_payload_sz == 0) DEFAULT_WS_MAX_PAYLOAD_SIZE else ws_payload_sz,
-        .ws_frame_buffer_size = if (ws_frame_sz == 0) DEFAULT_WS_FRAME_BUFFER_SIZE else ws_frame_sz,
-        .io_core_poll_idle_ms = @as(i64, @intCast(options.getOptionalNumber(ctx, options_obj, "pollIdleMs", 100))),
-        .linux_sq_thread_cpu = linux_sq_cpu,
-        .use_huge_pages = use_huge_pages,
-    };
 
     // 可选：options.onError(err) 在 handler 抛错或返回无效响应时调用，与 onListen 命名一致；开发时错误页可由 onError 返回自定义 Response 实现
     const error_callback = options.getOptionalCallback(ctx, options_obj, "onError");
@@ -316,7 +268,6 @@ fn serverCallback(
     }
 
     // options.workers：未设置时默认按 CPU 核数开多进程（方案 B）；上限为 min(核数×倍数, 绝对上限)，不写死
-    const cpu_count: u32 = @intCast(std.Thread.getCpuCount() catch 1);
     var workers_u = options.getOptionalNumber(ctx, options_obj, "workers", 0);
     if (workers_u == 0) workers_u = cpu_count;
     if (workers_u < 1) workers_u = 1;
@@ -325,12 +276,6 @@ fn serverCallback(
     const workers: usize = workers_u;
     const is_cluster_worker = (std.c.getenv("SHU_CLUSTER_WORKER") != null);
     const is_cluster_master = (workers > 1 and !is_cluster_worker and opts.permissions.allow_run);
-
-    // options.ioThreads：Thread-per-Core 单进程内 I/O 线程数；1=当前单线程 tick（默认），>1 时 N 环 + 无锁 Ring 投递（见 io_threads.zig）
-    var io_threads_u = options.getOptionalNumber(ctx, options_obj, "ioThreads", 1);
-    if (io_threads_u < 1) io_threads_u = 1;
-    if (io_threads_u > constants.MAX_IO_THREADS) io_threads_u = constants.MAX_IO_THREADS;
-    const io_threads: u32 = io_threads_u;
 
     const ws_options = options.getOptionalWebSocket(ctx, options_obj);
     const signal_ref = options.getOptionalAbortSignal(ctx, options_obj);
@@ -609,57 +554,126 @@ fn serverCallback(
     return server_obj;
 }
 
-/// 从 options 对象解析并更新 state 中的 handler、config、compression、error_callback、run_loop、ws_options（用于 reload）
+/// start / reload / restart 共用的「未传 key 时的默认值」：start 传 null 用常量，reload 传当前 state 的对应字段以保留原值
+const CommonOptionDefaults = struct {
+    io_threads: u32,
+    max_connections: usize,
+    max_completions: usize,
+    listen_backlog: u32,
+};
+
+/// start 与 reload/restart 共用的解析结果：仅含 config 与标量，不含 JS 引用（handler/onError/ws_options 等由调用方按需读并做 protect）
+const ParsedCommonOptions = struct {
+    config: ServerConfig,
+    io_threads: u32,
+    compression_enabled: bool,
+    run_loop_every: u32,
+    run_loop_interval_ms: i64,
+};
+
+/// 从 options 对象解析出 config、io_threads、compression、run_loop 等公共参数，供 start 与 updateStateFromOptions 共用，避免两处重复写。
+/// cpu_count：仅当 defaults == null 时用于 ioThreads 默认值（start 时传核数）；defaults 非 null 时忽略。
+/// defaults：null = start 场景，未传的 ioThreads/maxConnections/maxCompletions/listenBacklog 用常量；非 null = reload 场景，用 defaults.* 保留当前值。
+fn parseCommonOptions(ctx: jsc.JSContextRef, options_obj: jsc.JSObjectRef, cpu_count: u32, defaults: ?*const CommonOptionDefaults) ParsedCommonOptions {
+    const default_io = if (defaults) |d| d.io_threads else cpu_count;
+    const default_max_conn: u32 = if (defaults) |d| @intCast(d.max_connections) else 2048;
+    const default_max_comp: u32 = if (defaults) |d| @intCast(d.max_completions) else @intCast(DEFAULT_MAX_COMPLETIONS);
+    const default_lb = if (defaults) |d| d.listen_backlog else DEFAULT_LISTEN_BACKLOG;
+
+    const keep_alive_timeout_sec = options.getOptionalNumber(ctx, options_obj, "keepAliveTimeout", DEFAULT_KEEP_ALIVE_TIMEOUT_SEC);
+    var ct = options.getOptionalNumber(ctx, options_obj, "chunkedResponseThreshold", DEFAULT_CHUNKED_RESPONSE_THRESHOLD);
+    if (ct == 0) ct = DEFAULT_CHUNKED_RESPONSE_THRESHOLD;
+    var cw = options.getOptionalNumber(ctx, options_obj, "chunkedWriteChunkSize", DEFAULT_CHUNKED_WRITE_CHUNK_SIZE);
+    if (cw == 0) cw = DEFAULT_CHUNKED_WRITE_CHUNK_SIZE;
+    const max_request_line = options.getOptionalNumber(ctx, options_obj, "maxRequestLineLength", DEFAULT_MAX_REQUEST_LINE);
+    const min_body_to_compress = options.getOptionalNumber(ctx, options_obj, "minBodyToCompress", DEFAULT_MIN_BODY_TO_COMPRESS);
+    var lb = options.getOptionalNumber(ctx, options_obj, "listenBacklog", default_lb);
+    if (lb == 0) lb = DEFAULT_LISTEN_BACKLOG;
+    var max_body = options.getOptionalNumber(ctx, options_obj, "maxRequestBodySize", DEFAULT_MAX_REQUEST_BODY);
+    if (max_body == 0) max_body = DEFAULT_MAX_REQUEST_BODY;
+    var max_conn_u = options.getOptionalNumber(ctx, options_obj, "maxConnections", default_max_conn);
+    if (max_conn_u < 1) max_conn_u = 1;
+    if (max_conn_u > 5120) max_conn_u = 5120;
+    const max_connections: usize = max_conn_u;
+    const max_accept_per_tick = options.getOptionalNumber(ctx, options_obj, "maxAcceptPerTick", DEFAULT_MAX_ACCEPT_PER_TICK);
+    var max_completions_u = options.getOptionalNumber(ctx, options_obj, "maxCompletions", default_max_comp);
+    if (max_completions_u == 0) max_completions_u = default_max_comp;
+    const max_completions = options.clampSize(max_completions_u, 64, 5120);
+    const ws_max_write_per_tick_u = options.getOptionalNumberFromWebSocket(ctx, options_obj, "maxWritePerTick", @intCast(DEFAULT_WS_MAX_WRITE_PER_TICK));
+    const ws_max_write_per_tick = if (ws_max_write_per_tick_u == 0) DEFAULT_WS_MAX_WRITE_PER_TICK else @as(usize, ws_max_write_per_tick_u);
+    const read_buf_sz = options.clampSize(options.getOptionalNumber(ctx, options_obj, "readBufferSize", @intCast(DEFAULT_READ_BUFFER_SIZE)), 4096, 256 * 1024);
+    const write_cap = options.clampSize(options.getOptionalNumber(ctx, options_obj, "writeBufInitialCapacity", @intCast(DEFAULT_WRITE_BUF_INITIAL_CAPACITY)), 256, 65536);
+    const header_cap = options.clampSize(options.getOptionalNumber(ctx, options_obj, "headerListInitialCapacity", @intCast(DEFAULT_WRITE_BUF_INITIAL_CAPACITY)), 256, 65536);
+    const ws_read_sz = options.clampSize(options.getOptionalNumberFromWebSocket(ctx, options_obj, "readBufferSize", @intCast(DEFAULT_WS_READ_BUFFER_SIZE)), 4096, 512 * 1024);
+    const ws_payload_sz = options.clampSize(options.getOptionalNumberFromWebSocket(ctx, options_obj, "maxPayloadSize", @intCast(DEFAULT_WS_MAX_PAYLOAD_SIZE)), 1024, 1024 * 1024);
+    const ws_frame_sz = options.clampSize(options.getOptionalNumberFromWebSocket(ctx, options_obj, "frameBufferSize", @intCast(DEFAULT_WS_FRAME_BUFFER_SIZE)), 4096, 512 * 1024);
+    const compression_enabled = options.getOptionalBoolDefault(ctx, options_obj, "compression", true);
+    const run_loop_every = options.getOptionalNumber(ctx, options_obj, "runLoopEveryRequests", 1);
+    const run_loop_interval_ms = options.getOptionalNumber(ctx, options_obj, "runLoopIntervalMs", 0);
+    var io_threads_u = options.getOptionalNumber(ctx, options_obj, "ioThreads", default_io);
+    if (io_threads_u < 1) io_threads_u = 1;
+    if (io_threads_u > constants.MAX_IO_THREADS) io_threads_u = constants.MAX_IO_THREADS;
+    const io_threads: u32 = io_threads_u;
+
+    const config = ServerConfig{
+        .keep_alive_timeout_sec = keep_alive_timeout_sec,
+        .chunked_response_threshold = ct,
+        .chunked_write_chunk_size = cw,
+        .max_request_line = if (max_request_line > 0) max_request_line else DEFAULT_MAX_REQUEST_LINE,
+        .min_body_to_compress = min_body_to_compress,
+        .listen_backlog = lb,
+        .max_request_body = max_body,
+        .max_connections = max_connections,
+        .max_completions = max_completions,
+        .max_accept_per_tick = if (max_accept_per_tick == 0) DEFAULT_MAX_ACCEPT_PER_TICK else max_accept_per_tick,
+        .ws_max_write_per_tick = ws_max_write_per_tick,
+        .read_buffer_size = if (read_buf_sz == 0) DEFAULT_READ_BUFFER_SIZE else read_buf_sz,
+        .write_buf_initial_capacity = if (write_cap == 0) DEFAULT_WRITE_BUF_INITIAL_CAPACITY else write_cap,
+        .header_list_initial_capacity = if (header_cap == 0) DEFAULT_WRITE_BUF_INITIAL_CAPACITY else header_cap,
+        .ws_read_buffer_size = if (ws_read_sz == 0) DEFAULT_WS_READ_BUFFER_SIZE else ws_read_sz,
+        .ws_max_payload_size = if (ws_payload_sz == 0) DEFAULT_WS_MAX_PAYLOAD_SIZE else ws_payload_sz,
+        .ws_frame_buffer_size = if (ws_frame_sz == 0) DEFAULT_WS_FRAME_BUFFER_SIZE else ws_frame_sz,
+        .io_core_poll_idle_ms = @as(i64, @intCast(options.getOptionalNumber(ctx, options_obj, "pollIdleMs", 100))),
+        .linux_sq_thread_cpu = options.getOptionalNumberOptional(ctx, options_obj, "linuxSqThreadCpu"),
+        .use_huge_pages = options.getOptionalBoolDefault(ctx, options_obj, "useHugePages", false),
+    };
+
+    return .{
+        .config = config,
+        .io_threads = io_threads,
+        .compression_enabled = compression_enabled,
+        .run_loop_every = @intCast(run_loop_every),
+        .run_loop_interval_ms = @as(i64, @intCast(run_loop_interval_ms)),
+    };
+}
+
+/// 从 options 对象解析并更新 state 中的 handler、config、compression、error_callback、run_loop、ws_options（用于 reload/restart）。
+/// 公共参数经 parseCommonOptions 统一解析；ioThreads/maxConnections 等需 restart 后 doListen 才生效，其余 reload 即生效。
 fn updateStateFromOptions(ctx: jsc.JSContextRef, options_obj: jsc.JSObjectRef, state: *ServerState) void {
+    const defaults = CommonOptionDefaults{
+        .io_threads = state.io_threads,
+        .max_connections = state.config.max_connections,
+        .max_completions = state.config.max_completions,
+        .listen_backlog = state.config.listen_backlog,
+    };
+    const parsed = parseCommonOptions(ctx, options_obj, 0, &defaults);
+    state.config = parsed.config;
+    state.listen_backlog = @intCast(parsed.config.listen_backlog);
+    state.io_threads = parsed.io_threads;
+    state.compression_enabled = parsed.compression_enabled;
+    state.run_loop_every = parsed.run_loop_every;
+    state.run_loop_interval_ms = parsed.run_loop_interval_ms;
+
     if (options.getHandlerFromOptions(ctx, options_obj)) |new_fn| {
         jsc.JSValueUnprotect(ctx, state.handler_fn);
         state.handler_fn = new_fn;
         jsc.JSValueProtect(ctx, state.handler_fn);
     }
-    state.config.keep_alive_timeout_sec = options.getOptionalNumber(ctx, options_obj, "keepAliveTimeout", DEFAULT_KEEP_ALIVE_TIMEOUT_SEC);
-    var ct = options.getOptionalNumber(ctx, options_obj, "chunkedResponseThreshold", DEFAULT_CHUNKED_RESPONSE_THRESHOLD);
-    if (ct == 0) ct = DEFAULT_CHUNKED_RESPONSE_THRESHOLD;
-    state.config.chunked_response_threshold = ct;
-    var cw = options.getOptionalNumber(ctx, options_obj, "chunkedWriteChunkSize", DEFAULT_CHUNKED_WRITE_CHUNK_SIZE);
-    if (cw == 0) cw = DEFAULT_CHUNKED_WRITE_CHUNK_SIZE;
-    state.config.chunked_write_chunk_size = cw;
-    const mrl = options.getOptionalNumber(ctx, options_obj, "maxRequestLineLength", DEFAULT_MAX_REQUEST_LINE);
-    if (mrl > 0) state.config.max_request_line = mrl;
-    state.config.min_body_to_compress = options.getOptionalNumber(ctx, options_obj, "minBodyToCompress", DEFAULT_MIN_BODY_TO_COMPRESS);
-    var lb = options.getOptionalNumber(ctx, options_obj, "listenBacklog", DEFAULT_LISTEN_BACKLOG);
-    if (lb == 0) lb = DEFAULT_LISTEN_BACKLOG;
-    state.config.listen_backlog = lb;
-    state.listen_backlog = @intCast(lb);
-    var max_body = options.getOptionalNumber(ctx, options_obj, "maxRequestBodySize", DEFAULT_MAX_REQUEST_BODY);
-    if (max_body == 0) max_body = DEFAULT_MAX_REQUEST_BODY;
-    state.config.max_request_body = max_body;
-    state.compression_enabled = options.getOptionalBoolDefault(ctx, options_obj, "compression", true);
-    state.run_loop_every = @intCast(options.getOptionalNumber(ctx, options_obj, "runLoopEveryRequests", 1));
-    state.run_loop_interval_ms = @as(i64, @intCast(options.getOptionalNumber(ctx, options_obj, "runLoopIntervalMs", 0)));
     if (options.getOptionalCallback(ctx, options_obj, "onError")) |ec| {
         if (state.error_callback) |old| jsc.JSValueUnprotect(ctx, old);
         state.error_callback = ec;
         jsc.JSValueProtect(ctx, ec);
     }
-    state.config.max_accept_per_tick = options.getOptionalNumber(ctx, options_obj, "maxAcceptPerTick", DEFAULT_MAX_ACCEPT_PER_TICK);
-    if (state.config.max_accept_per_tick == 0) state.config.max_accept_per_tick = DEFAULT_MAX_ACCEPT_PER_TICK;
-    const ws_mw = options.getOptionalNumberFromWebSocket(ctx, options_obj, "maxWritePerTick", @intCast(DEFAULT_WS_MAX_WRITE_PER_TICK));
-    state.config.ws_max_write_per_tick = if (ws_mw == 0) DEFAULT_WS_MAX_WRITE_PER_TICK else @as(usize, ws_mw);
-    state.config.read_buffer_size = options.clampSize(options.getOptionalNumber(ctx, options_obj, "readBufferSize", @intCast(DEFAULT_READ_BUFFER_SIZE)), 4096, 256 * 1024);
-    if (state.config.read_buffer_size == 0) state.config.read_buffer_size = DEFAULT_READ_BUFFER_SIZE;
-    state.config.write_buf_initial_capacity = options.clampSize(options.getOptionalNumber(ctx, options_obj, "writeBufInitialCapacity", @intCast(DEFAULT_WRITE_BUF_INITIAL_CAPACITY)), 256, 65536);
-    if (state.config.write_buf_initial_capacity == 0) state.config.write_buf_initial_capacity = DEFAULT_WRITE_BUF_INITIAL_CAPACITY;
-    state.config.header_list_initial_capacity = options.clampSize(options.getOptionalNumber(ctx, options_obj, "headerListInitialCapacity", @intCast(DEFAULT_WRITE_BUF_INITIAL_CAPACITY)), 256, 65536);
-    if (state.config.header_list_initial_capacity == 0) state.config.header_list_initial_capacity = DEFAULT_WRITE_BUF_INITIAL_CAPACITY;
-    state.config.ws_read_buffer_size = options.clampSize(options.getOptionalNumberFromWebSocket(ctx, options_obj, "readBufferSize", @intCast(DEFAULT_WS_READ_BUFFER_SIZE)), 4096, 512 * 1024);
-    if (state.config.ws_read_buffer_size == 0) state.config.ws_read_buffer_size = DEFAULT_WS_READ_BUFFER_SIZE;
-    state.config.ws_max_payload_size = options.clampSize(options.getOptionalNumberFromWebSocket(ctx, options_obj, "maxPayloadSize", @intCast(DEFAULT_WS_MAX_PAYLOAD_SIZE)), 1024, 1024 * 1024);
-    if (state.config.ws_max_payload_size == 0) state.config.ws_max_payload_size = DEFAULT_WS_MAX_PAYLOAD_SIZE;
-    state.config.ws_frame_buffer_size = options.clampSize(options.getOptionalNumberFromWebSocket(ctx, options_obj, "frameBufferSize", @intCast(DEFAULT_WS_FRAME_BUFFER_SIZE)), 4096, 512 * 1024);
-    if (state.config.ws_frame_buffer_size == 0) state.config.ws_frame_buffer_size = DEFAULT_WS_FRAME_BUFFER_SIZE;
-    state.config.io_core_poll_idle_ms = @as(i64, @intCast(options.getOptionalNumber(ctx, options_obj, "pollIdleMs", 100)));
-    state.config.linux_sq_thread_cpu = options.getOptionalNumberOptional(ctx, options_obj, "linuxSqThreadCpu");
-    state.config.use_huge_pages = options.getOptionalBoolDefault(ctx, options_obj, "useHugePages", false);
     // 自适应 poll 超时：reload 后有效值不得超过新上限
     if (state.config.io_core_poll_idle_ms >= 0 and state.poll_idle_effective_ms > state.config.io_core_poll_idle_ms) {
         state.poll_idle_effective_ms = state.config.io_core_poll_idle_ms;
