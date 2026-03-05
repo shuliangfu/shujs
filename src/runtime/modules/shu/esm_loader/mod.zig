@@ -1,6 +1,10 @@
 // ESM 模块：import/export（与 CJS require 分开实现，各写各的）
 // 解析 import/export、构建模块图、按依赖顺序执行；入口为 .mjs/.mts 时由此加载器执行
 // 仅支持相对路径（./ ../），需 --allow-read；说明符可带 ?query（如 "xxx.ts?v=time"），路径用于读文件，path+query 作为模块键实现不缓存/缓存隔离
+//
+// 所有权：parseModule [Allocates] ParseResult（调用方负责对 parse.imports/named_exports/body 依次 deinit(allocator)）；
+// loadModuleGraph [Allocates] ArrayList(ModuleRecord)，调用方负责遍历并对每项的 parse 三列表与 dep_indices 做 deinit，再 deinit 列表本身；
+// runESMEntry 内使用 Arena，构建与执行阶段一次分配、结束时 arena.deinit() 统一释放。
 
 const std = @import("std");
 const jsc = @import("jsc");
@@ -26,36 +30,36 @@ const ImportSpec = struct {
 
 /// 模块解析结果：依赖说明符、导出信息、以及用于生成包装体的原始源码
 const ParseResult = struct {
-    imports: std.ArrayList(ImportSpec),
+    imports: std.ArrayListUnmanaged(ImportSpec),
     /// 是否有 export default
     has_default_export: bool,
     /// export default 后面的表达式原文（到分号止）
     default_expr: []const u8,
     /// export { a, b } 或 export const/let/var 的名字
-    named_exports: std.ArrayList([]const u8),
+    named_exports: std.ArrayListUnmanaged([]const u8),
     /// 去掉 import/export 行后的“体”源码（保留 export const x = 1 中的 const x = 1，并追加 __exports.x = x）
-    body: std.ArrayList(u8),
+    body: std.ArrayListUnmanaged(u8),
 };
 
-/// 图中一个模块：路径、源码、解析结果、依赖在该图中的下标；node:path / node:fs 等内置仅有 prebuilt_exports，不执行源码
+/// 图中一个模块：路径、源码、解析结果、依赖在该图中的下标；node:path / node:fs 等内置仅有 prebuilt_exports，不执行源码。
+/// parse 与 dep_indices 为 Unmanaged，释放时由调用方对各自 deinit(allocator)。
 const ModuleRecord = struct {
     path: []const u8,
     source: []const u8,
     parse: ParseResult,
-    /// 依赖模块在 modules 列表中的下标（与 parse.imports 一一对应）
-    dep_indices: std.ArrayList(usize),
-    /// 非 null 时表示内置模块（node:xxx），直接使用此 exports，不执行 transform/IIFE
+    dep_indices: std.ArrayListUnmanaged(usize),
     prebuilt_exports: ?jsc.JSValueRef = null,
 };
 
-/// 解析 ESM 源码：提取 import、export default、export { ... }、export const/let/var，并生成可执行 body
-/// §1.3 解析期：imports/named_exports 用 initCapacity(8) 减少扩容；body 按 source.len 预分配
+/// [Allocates] 解析 ESM 源码：提取 import、export default、export { ... }、export const/let/var，并生成可执行 body。
+/// 返回的 ParseResult 中 imports、named_exports、body 由调用方依次 deinit(allocator)。
+/// §1.3 解析期：imports/named_exports 用 initCapacity(8) 减少扩容；body 按 source.len 预分配。
 fn parseModule(allocator: std.mem.Allocator, source: []const u8) !ParseResult {
-    var imports = try std.ArrayList(ImportSpec).initCapacity(allocator, 8);
+    var imports = try std.ArrayListUnmanaged(ImportSpec).initCapacity(allocator, 8);
     errdefer imports.deinit(allocator);
-    var named_exports = try std.ArrayList([]const u8).initCapacity(allocator, 8);
+    var named_exports = try std.ArrayListUnmanaged([]const u8).initCapacity(allocator, 8);
     errdefer named_exports.deinit(allocator);
-    var body = std.ArrayList(u8).initCapacity(allocator, source.len) catch return error.OutOfMemory;
+    var body = std.ArrayListUnmanaged(u8).initCapacity(allocator, source.len) catch return error.OutOfMemory;
     errdefer body.deinit(allocator);
 
     var has_default_export = false;
@@ -93,7 +97,7 @@ fn parseModule(allocator: std.mem.Allocator, source: []const u8) !ParseResult {
                             continue;
                         };
                         const inner = std.mem.trim(u8, before_from[1..close], " \t\r\n");
-                        var names = try std.ArrayList([]const u8).initCapacity(allocator, 4);
+                        var names = try std.ArrayListUnmanaged([]const u8).initCapacity(allocator, 4);
                         defer names.deinit(allocator);
                         var it = std.mem.splitScalar(u8, inner, ',');
                         while (it.next()) |part| {
@@ -258,8 +262,9 @@ fn readFileContent(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
     return file_reader.interface.allocRemaining(allocator, std.Io.Limit.unlimited);
 }
 
-/// 构建模块图：从入口开始递归加载，返回线性列表（含入口），dep_indices 指向同列表下标；入口 source 会被复制一份以统一释放
-/// 入口无 query 时 cache_key 与 file_path 均为 entry_path；ctx 用于 node: 内置模块
+/// [Allocates] 构建模块图：从入口开始递归加载，返回线性列表（含入口），dep_indices 指向同列表下标；入口 source 会被复制一份以统一释放。
+/// 调用方负责对每个 ModuleRecord 的 parse 三列表与 dep_indices 做 deinit(allocator)，再对返回的 ArrayList 做 deinit(allocator)；runAsEsmModule 内由 Arena 统一释放。
+/// 入口无 query 时 cache_key 与 file_path 均为 entry_path；ctx 用于 node: 内置模块。
 fn loadModuleGraph(
     allocator: std.mem.Allocator,
     ctx: jsc.JSContextRef,
@@ -294,7 +299,7 @@ fn loadOneModule(
     }
 
     const parent_dir = std.fs.path.dirname(file_path) orelse ".";
-    var dep_indices = try std.ArrayList(usize).initCapacity(allocator, 8);
+    var dep_indices = try std.ArrayListUnmanaged(usize).initCapacity(allocator, 8);
     errdefer dep_indices.deinit(allocator);
 
     for (parse.imports.items) |imp| {
@@ -353,7 +358,7 @@ fn ensureNodeBuiltinModule(
         parse.named_exports.deinit(allocator);
         parse.body.deinit(allocator);
     }
-    const dep_indices = try std.ArrayList(usize).initCapacity(allocator, 0);
+    const dep_indices = try std.ArrayListUnmanaged(usize).initCapacity(allocator, 0);
     try path_to_index.put(path_owned, modules.items.len);
     try modules.append(allocator, .{
         .path = path_owned,
@@ -383,7 +388,7 @@ fn ensureShuBuiltinModule(
         parse.named_exports.deinit(allocator);
         parse.body.deinit(allocator);
     }
-    const dep_indices = try std.ArrayList(usize).initCapacity(allocator, 0);
+    const dep_indices = try std.ArrayListUnmanaged(usize).initCapacity(allocator, 0);
     try path_to_index.put(path_owned, modules.items.len);
     try modules.append(allocator, .{
         .path = path_owned,
@@ -399,7 +404,7 @@ fn visitTopo(
     idx: usize,
     mods: []const ModuleRecord,
     vis: []bool,
-    out: *std.ArrayList(usize),
+    out: *std.ArrayListUnmanaged(usize),
     alloc: std.mem.Allocator,
 ) !void {
     if (vis[idx]) return;
@@ -410,7 +415,7 @@ fn visitTopo(
 
 /// 拓扑排序：依赖在前；§1.3 initCapacity(8) 减少扩容
 fn topologicalOrder(allocator: std.mem.Allocator, modules: []const ModuleRecord) ![]usize {
-    var order = try std.ArrayList(usize).initCapacity(allocator, 8);
+    var order = try std.ArrayListUnmanaged(usize).initCapacity(allocator, 8);
     const visited = try allocator.alloc(bool, modules.len);
     defer allocator.free(visited);
     @memset(visited, false);
@@ -425,7 +430,7 @@ fn transformModuleToIIFE(
     parse: *const ParseResult,
     dep_indices: []const usize,
 ) ![]const u8 {
-    var out = std.ArrayList(u8).initCapacity(allocator, parse.body.items.len + 2048) catch return error.OutOfMemory;
+    var out = std.ArrayListUnmanaged(u8).initCapacity(allocator, parse.body.items.len + 2048) catch return error.OutOfMemory;
     defer out.deinit(allocator);
 
     out.appendSlice(allocator, "(function(__filename, __dirname, ") catch return error.OutOfMemory;
