@@ -686,13 +686,14 @@ fn shuPerfNotifyCallback(
     const deferred_name = jsc.JSStringCreateWithUTF8CString("__shuPerfDeferred");
     defer jsc.JSStringRelease(deferred_name);
     const deferred_fn = jsc.JSObjectMakeFunctionWithCallback(ctx, deferred_name, shuPerfNotifyDeferredCallback);
-    if (jsc.JSValueIsUndefined(ctx, set_imm) or !jsc.JSObjectIsFunction(ctx, @ptrCast(set_imm))) {
+    const set_imm_obj = jsc.JSValueToObject(ctx, set_imm, null);
+    if (set_imm_obj == null or !jsc.JSObjectIsFunction(ctx, set_imm_obj.?)) {
         var no_args: [0]jsc.JSValueRef = .{};
-        _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(deferred_fn), null, 0, &no_args, null);
+        _ = jsc.JSObjectCallAsFunction(ctx, deferred_fn, null, 0, &no_args, null);
         return jsc.JSValueMakeUndefined(ctx);
     }
     var zero: [1]jsc.JSValueRef = .{deferred_fn};
-    _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(set_imm), null, 1, &zero, null);
+    _ = jsc.JSObjectCallAsFunction(ctx, set_imm_obj.?, null, 1, &zero, null);
     return jsc.JSValueMakeUndefined(ctx);
 }
 
@@ -738,9 +739,10 @@ fn shuPerfNotifyDeferredCallback(
         const types_arr = jsc.JSValueToObject(ctx, types_val, null) orelse continue;
         if (jsArrayIndexOfEntryType(ctx, types_arr, entry_type_val) < 0) continue;
         const cb_val = jsc.JSObjectGetProperty(ctx, obs, k_cb, null);
-        if (jsc.JSValueIsUndefined(ctx, cb_val) or !jsc.JSObjectIsFunction(ctx, @ptrCast(cb_val))) continue;
+        const cb_obj = jsc.JSValueToObject(ctx, cb_val, null) orelse continue;
+        if (!jsc.JSObjectIsFunction(ctx, cb_obj)) continue;
         var args: [2]jsc.JSValueRef = .{ list, obs_val };
-        _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(cb_val), null, 2, &args, null);
+        _ = jsc.JSObjectCallAsFunction(ctx, cb_obj, null, 2, &args, null);
     }
     return jsc.JSValueMakeUndefined(ctx);
 }
