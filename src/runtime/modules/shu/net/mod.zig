@@ -48,18 +48,18 @@ const NetServerEntry = struct {
     allow_half_open: bool,
 };
 
-/// 全局 net server 列表；首次 listen 时用 current_allocator 创建
-var g_net_servers: ?std.ArrayList(NetServerEntry) = null;
-/// socket id -> stream，供 socket.write/end/destroy 使用
-var g_net_sockets: ?std.AutoHashMap(u32, std.Io.net.Stream) = null;
-/// socket id -> socket JS 对象（供 read tick 取 on('data') 等）
-var g_net_socket_objs: ?std.AutoHashMap(u32, jsc.JSObjectRef) = null;
-/// Node 兼容：每个 socket 的 bytesWritten/bytesRead 计数
-var g_net_socket_meta: ?std.AutoHashMap(u32, SocketMeta) = null;
+/// 全局 net server 列表；Unmanaged，append/deinit 显式传 allocator（01 §1.2、00 §1.5）
+var g_net_servers: ?std.ArrayListUnmanaged(NetServerEntry) = null;
+/// socket id -> stream，供 socket.write/end/destroy 使用。Unmanaged，put/fetchRemove/deinit 显式传 allocator（01 §1.2）
+var g_net_sockets: ?std.AutoHashMapUnmanaged(u32, std.Io.net.Stream) = null;
+/// socket id -> socket JS 对象（供 read tick 取 on('data') 等）。Unmanaged
+var g_net_socket_objs: ?std.AutoHashMapUnmanaged(u32, jsc.JSObjectRef) = null;
+/// Node 兼容：每个 socket 的 bytesWritten/bytesRead 计数。Unmanaged
+var g_net_socket_meta: ?std.AutoHashMapUnmanaged(u32, SocketMeta) = null;
 var g_next_socket_id: u32 = 1;
 var g_next_server_id: u32 = 1;
-/// 启用 TLS 时：socket id -> *TlsStream，升级后读写经 TLS；由 shu:tls 调用 setSocketTls 设置；未启用 TLS 时恒为 null
-var g_net_socket_tls: ?std.AutoHashMap(u32, *tls.TlsStream) = null;
+/// 启用 TLS 时：socket id -> *TlsStream；Unmanaged
+var g_net_socket_tls: ?std.AutoHashMapUnmanaged(u32, *tls.TlsStream) = null;
 
 const SocketMeta = struct {
     bytes_written: u64,
@@ -89,9 +89,10 @@ const PendingConnect = struct {
     timeout_ms: ?u32 = null, // createConnection(options) 的 options.timeout，连接成功后对 socket 设 setTimeout
 };
 var g_net_pending_mutex: std.Io.Mutex = .{ .state = std.atomic.Value(std.Io.Mutex.State).init(.unlocked) };
-var g_net_pending_connects: ?std.ArrayList(PendingConnect) = null;
-/// 未处理完的 createConnection 数量（spawn 时 +1，主线程处理一条时 -1），用于 has_work 调度
-var g_net_pending_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+/// Unmanaged，append/swapRemove 显式传 allocator
+var g_net_pending_connects: ?std.ArrayListUnmanaged(PendingConnect) = null;
+/// 未处理完的 createConnection 数量（spawn 时 +1，主线程处理一条时 -1），用于 has_work 调度。按缓存行隔离，避免与其它全局原子 false sharing（00 §5.3）。
+var g_net_pending_count: std.atomic.Value(usize) align(64) = std.atomic.Value(usize).init(0);
 
 /// 将 fd 设为非阻塞（POSIX: fcntl O_NONBLOCK，Windows: ioctlsocket FIONBIO）。0.16：fcntl 在 std.c
 fn setNonBlocking(fd: std.posix.socket_t) void {
@@ -181,9 +182,9 @@ pub fn setSocketTls(socket_id: u32, tls_stream: *tls.TlsStream) void {
     if (!build_options.have_tls) return;
     const allocator = globals.current_allocator orelse return;
     if (g_net_socket_tls == null) {
-        g_net_socket_tls = std.AutoHashMap(u32, *tls.TlsStream).init(allocator);
+        g_net_socket_tls = .{};
     }
-    g_net_socket_tls.?.put(socket_id, tls_stream) catch {};
+    g_net_socket_tls.?.put(allocator, socket_id, tls_stream) catch {};
 }
 
 /// net.Socket()：Node 兼容构造器；返回带 connect(port[, host][, callback]) 的对象，connect 内部调 createConnection，callback(err, socket) 收到连接后的 socket
@@ -232,7 +233,7 @@ fn socketConnectCallback(
     jsc.JSValueProtect(ctx, connect_listener);
     _ = g_net_pending_count.fetchAdd(1, .monotonic);
     if (g_net_pending_connects == null) {
-        g_net_pending_connects = std.ArrayList(PendingConnect).initCapacity(allocator, 4) catch {
+        g_net_pending_connects = std.ArrayListUnmanaged(PendingConnect).initCapacity(allocator, 4) catch {
             jsc.JSValueUnprotect(ctx, connect_listener);
             _ = g_net_pending_count.fetchSub(1, .monotonic);
             if (host.len > 0) allocator.free(host);
@@ -389,17 +390,17 @@ fn listenCallback(
     }
     setNonBlocking(server.socket.handle);
     if (g_net_servers == null) {
-        const list = std.ArrayList(NetServerEntry).initCapacity(allocator, 4) catch {
+        const list = std.ArrayListUnmanaged(NetServerEntry).initCapacity(allocator, 4) catch {
             server.deinit(proc_io);
             return jsc.JSValueMakeUndefined(ctx);
         };
         g_net_servers = list;
     }
     if (g_net_sockets == null) {
-        g_net_sockets = std.AutoHashMap(u32, std.Io.net.Stream).init(allocator);
+        g_net_sockets = .{};
     }
     if (g_net_socket_objs == null) {
-        g_net_socket_objs = std.AutoHashMap(u32, jsc.JSObjectRef).init(allocator);
+        g_net_socket_objs = .{};
     }
     const server_id = g_next_server_id;
     g_next_server_id +%= 1;
@@ -564,7 +565,7 @@ fn getOptStrFromObj(ctx: jsc.JSContextRef, obj: jsc.JSObjectRef, key: [*]const u
 fn drainPendingConnects(ctx: jsc.JSContextRef) void {
     const allocator = globals.current_allocator orelse return;
     const io = libs_process.getProcessIo() orelse return;
-    var taken = std.ArrayList(PendingConnect).initCapacity(allocator, 0) catch return;
+    var taken = std.ArrayListUnmanaged(PendingConnect).initCapacity(allocator, 0) catch return;
     defer taken.deinit(allocator);
     {
         g_net_pending_mutex.lock(io) catch return;
@@ -587,23 +588,23 @@ fn drainPendingConnects(ctx: jsc.JSContextRef) void {
         defer jsc.JSValueUnprotect(ctx, item.callback);
         if (item.stream) |stream| {
             if (g_net_sockets == null) {
-                g_net_sockets = std.AutoHashMap(u32, std.Io.net.Stream).init(allocator);
+                g_net_sockets = .{};
             }
             if (g_net_socket_objs == null) {
-                g_net_socket_objs = std.AutoHashMap(u32, jsc.JSObjectRef).init(allocator);
+                g_net_socket_objs = .{};
             }
             const sockets = &g_net_sockets.?;
             const objs = &g_net_socket_objs.?;
             const id = g_next_socket_id;
             g_next_socket_id +%= 1;
             setNonBlocking(stream.socket.handle);
-            sockets.put(id, stream) catch {
+            sockets.put(allocator, id, stream) catch {
                 stream.close(io);
                 continue;
             };
-            if (g_net_socket_meta == null) g_net_socket_meta = std.AutoHashMap(u32, SocketMeta).init(allocator);
+            if (g_net_socket_meta == null) g_net_socket_meta = .{};
             const now_ms = @as(u64, @intCast(@divTrunc(std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds, 1_000_000)));
-            g_net_socket_meta.?.put(id, .{ .bytes_written = 0, .bytes_read = 0, .last_activity_ms = now_ms }) catch {};
+            g_net_socket_meta.?.put(allocator, id, .{ .bytes_written = 0, .bytes_read = 0, .last_activity_ms = now_ms }) catch {};
             const remote_opt = getStreamRemoteAddress(stream);
             const local_opt = getStreamLocalAddress(stream);
             var socket_obj: jsc.JSObjectRef = undefined;
@@ -622,7 +623,7 @@ fn drainPendingConnects(ctx: jsc.JSContextRef) void {
             } else {
                 socket_obj = makeSocketObject(ctx, id, null, false);
             }
-            objs.put(id, socket_obj) catch {};
+            objs.put(allocator, id, socket_obj) catch {};
             if (item.timeout_ms) |ms| {
                 const k_t = jsc.JSStringCreateWithUTF8CString("_timeout");
                 defer jsc.JSStringRelease(k_t);
@@ -691,9 +692,9 @@ fn netTickCallback(
     const servers = &g_net_servers.?;
     // 有 server 时确保 g_net_sockets/g_net_socket_objs/g_net_socket_meta 已初始化，以便 accept 可放入 socket
     if (g_net_sockets == null) {
-        g_net_sockets = std.AutoHashMap(u32, std.Io.net.Stream).init(allocator);
-        g_net_socket_objs = std.AutoHashMap(u32, jsc.JSObjectRef).init(allocator);
-        g_net_socket_meta = std.AutoHashMap(u32, SocketMeta).init(allocator);
+        g_net_sockets = .{};
+        g_net_socket_objs = .{};
+        g_net_socket_meta = .{};
     }
     const sockets = &g_net_sockets.?;
     const now_ms = @as(u64, @intCast(@divTrunc(std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds, 1_000_000)));
@@ -710,12 +711,12 @@ fn netTickCallback(
             setNonBlocking(accepted.socket.handle);
             const id = g_next_socket_id;
             g_next_socket_id +%= 1;
-            sockets.put(id, accepted) catch {
+            sockets.put(allocator, id, accepted) catch {
                 accepted.close(io);
                 continue;
             };
-            if (g_net_socket_meta == null) g_net_socket_meta = std.AutoHashMap(u32, SocketMeta).init(allocator);
-            g_net_socket_meta.?.put(id, .{ .bytes_written = 0, .bytes_read = 0, .last_activity_ms = now_ms }) catch {};
+            if (g_net_socket_meta == null) g_net_socket_meta = .{};
+            g_net_socket_meta.?.put(allocator, id, .{ .bytes_written = 0, .bytes_read = 0, .last_activity_ms = now_ms }) catch {};
             var socket_obj: jsc.JSObjectRef = undefined;
             if (getStreamLocalAddress(accepted)) |local_addr| {
                 const remote_addr = getStreamRemoteAddress(accepted) orelse {
@@ -733,7 +734,7 @@ fn netTickCallback(
             } else {
                 socket_obj = makeSocketObject(ctx, id, null, entry.allow_half_open);
             }
-            if (g_net_socket_objs) |*objs| objs.put(id, socket_obj) catch {};
+            if (g_net_socket_objs) |*objs| objs.put(allocator, id, socket_obj) catch {};
             var args = [_]jsc.JSValueRef{socket_obj};
             _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(entry.listener), null, 1, &args, null);
         }
@@ -775,7 +776,7 @@ fn netTickRead(ctx: jsc.JSContextRef) void {
     const objs = &g_net_socket_objs.?;
     var read_buf: [8192]u8 = undefined;
     const allocator = globals.current_allocator orelse return;
-    var to_remove = std.ArrayList(u32).initCapacity(allocator, 0) catch return;
+    var to_remove = std.ArrayListUnmanaged(u32).initCapacity(allocator, 0) catch return;
     defer to_remove.deinit(allocator);
     var it = sockets.iterator();
     while (it.next()) |kv| {
@@ -904,7 +905,7 @@ fn makeDataForSocket(ctx: jsc.JSContextRef, socket_obj: jsc.JSObjectRef, slice: 
     defer jsc.JSStringRelease(enc_str);
     var buf: [16]u8 = undefined;
     const n = jsc.JSStringGetUTF8CString(enc_str, buf[0..].ptr, buf.len);
-    if (n > 0 and std.mem.eql(u8, buf[0 .. n - 1], "utf8")) return makeBufferOrString(ctx, slice);
+    if (n == 5 and eventPrefix(buf[0 .. n - 1]) == eventPrefix8("utf8")) return makeBufferOrString(ctx, slice);
     return makeBufferOrString(ctx, slice);
 }
 
@@ -917,13 +918,27 @@ fn makeBufferOrString(ctx: jsc.JSContextRef, slice: []const u8) jsc.JSValueRef {
     return jsc.JSValueMakeString(ctx, js_str);
 }
 
-/// socket 事件名集合固定；按长度分派后比较，comptime 友好（§2.1），返回对应 _on* 属性名（null 结尾）
+/// 取 event 前 8 字节转 u64（不足零填充），用于与 comptime 常量整型比较（00 §2.1）
+fn eventPrefix(event: []const u8) u64 {
+    var buf: [8]u8 = [_]u8{0} ** 8;
+    const n = @min(8, event.len);
+    @memcpy(buf[0..n], event[0..n]);
+    return @as(u64, @bitCast(buf));
+}
+fn eventPrefix8(comptime s: []const u8) u64 {
+    var buf: [8]u8 = [_]u8{0} ** 8;
+    const n = @min(8, s.len);
+    for (s[0..n], buf[0..n]) |a, *b| b.* = a;
+    return @as(u64, @bitCast(buf));
+}
+
+/// socket 事件名集合固定；按长度分派 + u64 前缀比较（00 §2.1），返回对应 _on* 属性名（null 结尾）
 fn socketEventToPropNameZ(event: []const u8) ?[*:0]const u8 {
     return switch (event.len) {
-        3 => if (std.mem.eql(u8, event, "end")) "_onEnd" else null,
-        4 => if (std.mem.eql(u8, event, "data")) "_onData" else null,
-        5 => if (std.mem.eql(u8, event, "error")) "_onError" else null,
-        7 => if (std.mem.eql(u8, event, "timeout")) "_onTimeout" else null,
+        3 => if (eventPrefix(event) == eventPrefix8("end")) "_onEnd" else null,
+        4 => if (eventPrefix(event) == eventPrefix8("data")) "_onData" else null,
+        5 => if (eventPrefix(event) == eventPrefix8("error")) "_onError" else null,
+        7 => if (eventPrefix(event) == eventPrefix8("timeout")) "_onTimeout" else null,
         else => null,
     };
 }
@@ -1494,7 +1509,7 @@ fn createConnectionCallback(
     jsc.JSValueProtect(ctx, connect_listener);
     _ = g_net_pending_count.fetchAdd(1, .monotonic);
     if (g_net_pending_connects == null) {
-        g_net_pending_connects = std.ArrayList(PendingConnect).initCapacity(allocator, 4) catch {
+        g_net_pending_connects = std.ArrayListUnmanaged(PendingConnect).initCapacity(allocator, 4) catch {
             jsc.JSValueUnprotect(ctx, connect_listener);
             _ = g_net_pending_count.fetchSub(1, .monotonic);
             if (!is_unix) allocator.free(host);
