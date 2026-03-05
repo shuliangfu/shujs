@@ -1,6 +1,6 @@
 {
   "name": "shujs",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "type": "module",
   "dependencies": {
     "preact": "^10.28.4"
@@ -8,5 +8,12 @@
   "imports": {
     "@dreamer/view": "jsr:@dreamer/view@^1.1.2",
     "@dreamer/dweb": "jsr:@dreamer/dweb@^3.0.95"
+  },
+  "test": {
+    "include": [
+      "tests/**/*.test.js",
+      "tests/**/*.test.ts"
+    ],
+    "exclude": []
   }
 }
