@@ -1,5 +1,6 @@
 // shu:zlib 压缩模块：gzip / deflate / brotli
 // 供 Shu.zlib、require("shu:zlib") / node:zlib 与 Shu.server 响应压缩共用
+// 所有权：gzipSync/deflateSync 等返回值 JSC 持有；getBytesFromArg [Allocates] 调用方 free；内部压缩缓冲在回调内分配并 free。
 
 const std = @import("std");
 const jsc = @import("jsc");
@@ -32,7 +33,7 @@ pub fn register(ctx: jsc.JSGlobalContextRef, shu_obj: jsc.JSObjectRef) void {
 
 // ---------- 内部辅助与回调 ----------
 
-/// 从 JS 第一个参数取字节：支持 string（按 UTF-8）；调用方 free 返回的 slice
+/// [Allocates] 从 JS 第一个参数取字节：支持 string（按 UTF-8）；调用方负责 free 返回的 slice。
 fn getBytesFromArg(ctx: jsc.JSContextRef, arguments: [*]const jsc.JSValueRef, allocator: std.mem.Allocator) ?[]const u8 {
     const val = arguments[0];
     const js_str = jsc.JSValueToStringCopy(ctx, val, null);
