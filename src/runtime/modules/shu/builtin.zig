@@ -80,6 +80,181 @@ const shu_webstreams = @import("webstreams/mod.zig");
 const shu_cluster = @import("cluster/mod.zig");
 const shu_debugger = @import("debugger/mod.zig");
 
+/// 取 specifier 前 8 字节转 u64（不足零填充），用于与 comptime 常量整型比较（00 §2.1）
+fn specPrefix(specifier: []const u8) u64 {
+    var buf: [8]u8 = [_]u8{0} ** 8;
+    const n = @min(8, specifier.len);
+    @memcpy(buf[0..n], specifier[0..n]);
+    return @as(u64, @bitCast(buf));
+}
+/// comptime 字符串前 8 字节转 u64
+fn prefix8(comptime s: []const u8) u64 {
+    var buf: [8]u8 = [_]u8{0} ** 8;
+    const n = @min(8, s.len);
+    for (s[0..n], buf[0..n]) |a, *b| b.* = a;
+    return @as(u64, @bitCast(buf));
+}
+
+/// 内置模块标签，用于 getShuBuiltin 的 (len,prefix) 表 + switch 分派（00 §2.1）
+const ShuBuiltinTag = enum {
+    fs,
+    path,
+    system,
+    zlib,
+    archive,
+    crypto,
+    assert,
+    events,
+    util,
+    querystring,
+    url,
+    string_decoder,
+    os,
+    process,
+    timers,
+    console,
+    threads,
+    buffer,
+    stream,
+    server,
+    http,
+    https,
+    net,
+    tls,
+    dgram,
+    dns,
+    readline,
+    vm,
+    async_hooks,
+    async_context,
+    perf_hooks,
+    module,
+    diagnostics_channel,
+    repl,
+    test_runner,
+    inspector,
+    wasi,
+    report,
+    tracing,
+    tty,
+    permissions,
+    intl,
+    webcrypto,
+    webstreams,
+    cluster,
+    debugger,
+};
+
+/// (len, u64 前缀) -> tag 表，comptime 生成；运行时一次整型比较匹配（00 §2.1）
+const SPEC_TABLE = blk: {
+    const Entry = struct { len: usize, prefix: u64, tag: ShuBuiltinTag };
+    var list: [46]Entry = undefined;
+    const specs = .{
+        .{ "shu:fs", .fs },
+        .{ "shu:path", .path },
+        .{ "shu:system", .system },
+        .{ "shu:zlib", .zlib },
+        .{ "shu:archive", .archive },
+        .{ "shu:crypto", .crypto },
+        .{ "shu:assert", .assert },
+        .{ "shu:events", .events },
+        .{ "shu:util", .util },
+        .{ "shu:querystring", .querystring },
+        .{ "shu:url", .url },
+        .{ "shu:string_decoder", .string_decoder },
+        .{ "shu:os", .os },
+        .{ "shu:process", .process },
+        .{ "shu:timers", .timers },
+        .{ "shu:console", .console },
+        .{ "shu:threads", .threads },
+        .{ "shu:buffer", .buffer },
+        .{ "shu:stream", .stream },
+        .{ "shu:server", .server },
+        .{ "shu:http", .http },
+        .{ "shu:https", .https },
+        .{ "shu:net", .net },
+        .{ "shu:tls", .tls },
+        .{ "shu:dgram", .dgram },
+        .{ "shu:dns", .dns },
+        .{ "shu:readline", .readline },
+        .{ "shu:vm", .vm },
+        .{ "shu:async_hooks", .async_hooks },
+        .{ "shu:async_context", .async_context },
+        .{ "shu:perf_hooks", .perf_hooks },
+        .{ "shu:module", .module },
+        .{ "shu:diagnostics_channel", .diagnostics_channel },
+        .{ "shu:repl", .repl },
+        .{ "shu:test", .test_runner },
+        .{ "shu:inspector", .inspector },
+        .{ "shu:wasi", .wasi },
+        .{ "shu:report", .report },
+        .{ "shu:tracing", .tracing },
+        .{ "shu:tty", .tty },
+        .{ "shu:permissions", .permissions },
+        .{ "shu:intl", .intl },
+        .{ "shu:webcrypto", .webcrypto },
+        .{ "shu:webstreams", .webstreams },
+        .{ "shu:cluster", .cluster },
+        .{ "shu:debugger", .debugger },
+    };
+    for (specs, 0..) |s, i| {
+        list[i] = .{ .len = s.@"0".len, .prefix = prefix8(s.@"0"), .tag = s.@"1" };
+    }
+    break :blk list;
+};
+
+/// 根据 tag 调用对应模块 getExports（00 §2.1 单 switch 分派）
+fn getExportsByTag(tag: ShuBuiltinTag, ctx: jsc.JSContextRef, allocator: std.mem.Allocator) jsc.JSValueRef {
+    return switch (tag) {
+        .fs => shu_fs.getExports(ctx, allocator),
+        .path => shu_path.getExports(ctx, allocator),
+        .system => shu_system.getExports(ctx, allocator),
+        .zlib => shu_zlib.getExports(ctx, allocator),
+        .archive => shu_archive.getExports(ctx, allocator),
+        .crypto => shu_crypto.getExports(ctx, allocator),
+        .assert => shu_assert.getExports(ctx, allocator),
+        .events => shu_events.getExports(ctx, allocator),
+        .util => shu_util.getExports(ctx, allocator),
+        .querystring => shu_querystring.getExports(ctx, allocator),
+        .url => shu_url.getExports(ctx, allocator),
+        .string_decoder => shu_string_decoder.getExports(ctx, allocator),
+        .os => shu_os.getExports(ctx, allocator),
+        .process => shu_process.getExports(ctx, allocator),
+        .timers => shu_timers.getExports(ctx, allocator),
+        .console => shu_console.getExports(ctx, allocator),
+        .threads => shu_threads.getExports(ctx, allocator),
+        .buffer => shu_buffer.getExports(ctx, allocator),
+        .stream => shu_stream.getExports(ctx, allocator),
+        .server => shu_server.getExports(ctx, allocator),
+        .http => shu_http.getExports(ctx, allocator),
+        .https => shu_https.getExports(ctx, allocator),
+        .net => shu_net.getExports(ctx, allocator),
+        .tls => shu_tls.getExports(ctx, allocator),
+        .dgram => shu_dgram.getExports(ctx, allocator),
+        .dns => shu_dns.getExports(ctx, allocator),
+        .readline => shu_readline.getExports(ctx, allocator),
+        .vm => shu_vm.getExports(ctx, allocator),
+        .async_hooks => shu_async_hooks.getExports(ctx, allocator),
+        .async_context => shu_async_context.getExports(ctx, allocator),
+        .perf_hooks => shu_perf_hooks.getExports(ctx, allocator),
+        .module => shu_module.getExports(ctx, allocator),
+        .diagnostics_channel => shu_diagnostics_channel.getExports(ctx, allocator),
+        .repl => shu_repl.getExports(ctx, allocator),
+        .test_runner => shu_test.getExports(ctx, allocator),
+        .inspector => shu_inspector.getExports(ctx, allocator),
+        .wasi => shu_wasi.getExports(ctx, allocator),
+        .report => shu_report.getExports(ctx, allocator),
+        .tracing => shu_tracing.getExports(ctx, allocator),
+        .tty => shu_tty.getExports(ctx, allocator),
+        .permissions => shu_permissions.getExports(ctx, allocator),
+        .intl => shu_intl.getExports(ctx, allocator),
+        .webcrypto => shu_webcrypto.getExports(ctx, allocator),
+        .webstreams => shu_webstreams.getExports(ctx, allocator),
+        .cluster => shu_cluster.getExports(ctx, allocator),
+        .debugger => shu_debugger.getExports(ctx, allocator),
+    };
+}
+
 /// 支持的 shu: 说明符列表（与 BUILTINS.md 一致）。此处“支持”表示 require/import 可解析到本 builtin，不报错；部分为占位（见下方注释）。v8/punycode/domain 由 node 兼容侧直接走 shu_stub。
 pub const SUPPORTED: []const []const u8 = &.{
     "shu:fs",
@@ -129,111 +304,20 @@ pub const SUPPORTED: []const []const u8 = &.{
     "shu:debugger",
 };
 
-/// 判断是否为已支持的 shu: 内置说明符（用于 require/import 分支）
+/// 判断是否为已支持的 shu: 内置说明符（用于 require/import 分支）；(len, u64) 表匹配（00 §2.1）
 pub fn isSupportedShuBuiltin(specifier: []const u8) bool {
-    for (SUPPORTED) |s| {
-        if (std.mem.eql(u8, specifier, s)) return true;
+    const p = specPrefix(specifier);
+    for (SPEC_TABLE) |e| {
+        if (specifier.len == e.len and p == e.prefix) return true;
     }
     return false;
 }
 
-/// 返回 shu:xxx 的 exports：各模块 getExports(ctx, allocator)；调用方负责 JSValueProtect 若需长期缓存
+/// 返回 shu:xxx 的 exports：各模块 getExports(ctx, allocator)；调用方负责 JSValueProtect 若需长期缓存。00 §2.1 (len,u64) 表 + switch 分派。
 pub fn getShuBuiltin(ctx: jsc.JSContextRef, allocator: std.mem.Allocator, specifier: []const u8) jsc.JSValueRef {
-    // --- 已实现模块（对应 Node 内置，可直接使用）---
-
-    // shu:fs — 文件系统。读写文件、目录操作、流式 read/write、exists、stat、mkdir 等。对应 node:fs/deno:fs，用于脚本里读配置、写日志、遍历目录等。
-    if (std.mem.eql(u8, specifier, "shu:fs")) return shu_fs.getExports(ctx, allocator);
-    // shu:path — 路径处理。join、resolve、dirname、basename、extname、normalize 等，跨平台路径拼接与解析。对应 node:path。
-    if (std.mem.eql(u8, specifier, "shu:path")) return shu_path.getExports(ctx, allocator);
-    // shu:system — 子进程与系统命令。spawn、exec、run 等执行外部程序、管道、获取输出。对应 node:child_process。
-    if (std.mem.eql(u8, specifier, "shu:system")) return shu_system.getExports(ctx, allocator);
-    // shu:zlib — 压缩/解压。gzip、deflate、brotli 等，用于 HTTP 响应压缩或文件压缩。对应 node:zlib。
-    if (std.mem.eql(u8, specifier, "shu:zlib")) return shu_zlib.getExports(ctx, allocator);
-    if (std.mem.eql(u8, specifier, "shu:archive")) return shu_archive.getExports(ctx, allocator);
-    // shu:crypto — 加密与哈希。randomBytes、createHash、createHmac、scrypt、pbkdf2 等，用于密码、签名、随机数。对应 node:crypto。
-    if (std.mem.eql(u8, specifier, "shu:crypto")) return shu_crypto.getExports(ctx, allocator);
-    // shu:assert — 断言。ok、equal、strictEqual、throws 等，测试中做条件检查。对应 node:assert。
-    if (std.mem.eql(u8, specifier, "shu:assert")) return shu_assert.getExports(ctx, allocator);
-    // shu:events — 事件与发布订阅。EventEmitter、on/emit/once，自定义事件流。对应 node:events。
-    if (std.mem.eql(u8, specifier, "shu:events")) return shu_events.getExports(ctx, allocator);
-    // shu:util — 工具函数。inspect、format、deprecate、types 等，调试与格式化。对应 node:util。
-    if (std.mem.eql(u8, specifier, "shu:util")) return shu_util.getExports(ctx, allocator);
-    // shu:querystring — URL 查询字符串。parse、stringify，解析 ?key=value&... 或序列化对象。对应 node:querystring。
-    if (std.mem.eql(u8, specifier, "shu:querystring")) return shu_querystring.getExports(ctx, allocator);
-    // shu:url — URL 解析与构造。URL 类、pathname、search、host 等，处理完整 URL。对应 node:url。
-    if (std.mem.eql(u8, specifier, "shu:url")) return shu_url.getExports(ctx, allocator);
-    // shu:string_decoder — 字节到字符串解码。按 UTF-8 等编码把 Buffer 转字符串，避免乱码。对应 node:string_decoder。
-    if (std.mem.eql(u8, specifier, "shu:string_decoder")) return shu_string_decoder.getExports(ctx, allocator);
-    // shu:os — 操作系统信息。platform、hostname、cpus、freemem、totalmem、tmpdir 等。对应 node:os。
-    if (std.mem.eql(u8, specifier, "shu:os")) return shu_os.getExports(ctx, allocator);
-    // shu:process — 当前进程。env、cwd、argv、exit、stdin/stdout/stderr、version 等。对应 node:process。
-    if (std.mem.eql(u8, specifier, "shu:process")) return shu_process.getExports(ctx, allocator);
-    // shu:timers — 定时器。setTimeout、setInterval、setImmediate、clearTimeout 等。对应 node:timers。
-    if (std.mem.eql(u8, specifier, "shu:timers")) return shu_timers.getExports(ctx, allocator);
-    // shu:console — 控制台。log、error、warn、dir、time/timeEnd、trace 等。对应 node:console。
-    if (std.mem.eql(u8, specifier, "shu:console")) return shu_console.getExports(ctx, allocator);
-    // shu:threads — 工作线程。Worker、isMainThread、parentPort、workerData 等，多线程并行。对应 node:worker_threads。
-    if (std.mem.eql(u8, specifier, "shu:threads")) return shu_threads.getExports(ctx, allocator);
-    // shu:buffer — 二进制缓冲区。Buffer.alloc/from/concat/isBuffer、读写字节。对应 node:buffer。
-    if (std.mem.eql(u8, specifier, "shu:buffer")) return shu_buffer.getExports(ctx, allocator);
-    // shu:stream — 流抽象。Readable、Writable、Transform、Duplex、pipeline、finished，处理大文件或网络数据。对应 node:stream。
-    if (std.mem.eql(u8, specifier, "shu:stream")) return shu_stream.getExports(ctx, allocator);
-    // shu:server — HTTP/HTTPS 服务端底层。Shu.server(options) 的同一实现，require 得到 { server, default }，供 shu:http/https 内部使用。
-    if (std.mem.eql(u8, specifier, "shu:server")) return shu_server.getExports(ctx, allocator);
-    // shu:http — HTTP 服务与客户端。createServer、listen(port)、request 等，建 HTTP 服务或发 HTTP 请求。对应 node:http。
-    if (std.mem.eql(u8, specifier, "shu:http")) return shu_http.getExports(ctx, allocator);
-    // shu:https — HTTPS 服务与客户端。createServer(options)、listen，options 含 key/cert 等 TLS 配置。对应 node:https。
-    if (std.mem.eql(u8, specifier, "shu:https")) return shu_https.getExports(ctx, allocator);
-    // shu:net — TCP/Unix Socket。createServer(connectionListener)、listen、createConnection，底层网络。对应 node:net。
-    if (std.mem.eql(u8, specifier, "shu:net")) return shu_net.getExports(ctx, allocator);
-    // shu:tls — TLS/SSL 封装。createSecureContext、createServer(options)，在 TCP 上加密。对应 node:tls。
-    if (std.mem.eql(u8, specifier, "shu:tls")) return shu_tls.getExports(ctx, allocator);
-    // shu:dgram — UDP 数据报。createSocket、bind、send、on('message')，UDP 收发。对应 node:dgram。
-    if (std.mem.eql(u8, specifier, "shu:dgram")) return shu_dgram.getExports(ctx, allocator);
-    // shu:dns — DNS 解析。lookup、resolve/resolve4/resolve6、reverse、setServers，域名↔IP、反向解析。对应 node:dns。
-    if (std.mem.eql(u8, specifier, "shu:dns")) return shu_dns.getExports(ctx, allocator);
-    // shu:readline — 逐行读取与交互。createInterface、question、on('line'/'close')、clearLine、cursorTo，CLI 输入与 TTY 控制。对应 node:readline。
-    if (std.mem.eql(u8, specifier, "shu:readline")) return shu_readline.getExports(ctx, allocator);
-
-    // shu:vm — 沙箱执行 JS。createContext、runInContext、runInNewContext、runInThisContext、isContext、Script。对应 node:vm。
-    if (std.mem.eql(u8, specifier, "shu:vm")) return shu_vm.getExports(ctx, allocator);
-    // shu:async_hooks — 异步资源钩子，纯 Zig 实现，对应 node:async_hooks。
-    if (std.mem.eql(u8, specifier, "shu:async_hooks")) return shu_async_hooks.getExports(ctx, allocator);
-    // shu:async_context — AsyncLocalStorage，对应 node:async_context。
-    if (std.mem.eql(u8, specifier, "shu:async_context")) return shu_async_context.getExports(ctx, allocator);
-    // shu:perf_hooks — 性能测量（高精度时间、mark/measure、PerformanceObserver、timerify 等），纯 Zig 实现，对应 node:perf_hooks。
-    if (std.mem.eql(u8, specifier, "shu:perf_hooks")) return shu_perf_hooks.getExports(ctx, allocator);
-    // shu:module — 模块加载 API。builtinModules、createRequire、isBuiltin，对应 node:module。
-    if (std.mem.eql(u8, specifier, "shu:module")) return shu_module.getExports(ctx, allocator);
-
-    // shu:diagnostics_channel — 命名通道 pub/sub，与 node:diagnostics_channel API 一致，纯 Zig 实现。
-    if (std.mem.eql(u8, specifier, "shu:diagnostics_channel")) return shu_diagnostics_channel.getExports(ctx, allocator);
-    // shu:repl — 交互式 REPL；API 兼容占位（start、ReplServer），调用抛 Not implemented。
-    if (std.mem.eql(u8, specifier, "shu:repl")) return shu_repl.getExports(ctx, allocator);
-    // shu:test — 内置测试运行器；API 兼容占位（describe/it/mock/run 等）。
-    if (std.mem.eql(u8, specifier, "shu:test")) return shu_test.getExports(ctx, allocator);
-    // shu:inspector — 调试器协议；API 兼容占位（open/close/url）。
-    if (std.mem.eql(u8, specifier, "shu:inspector")) return shu_inspector.getExports(ctx, allocator);
-    // shu:wasi — WASI；API 兼容占位（WASI 类）。
-    if (std.mem.eql(u8, specifier, "shu:wasi")) return shu_wasi.getExports(ctx, allocator);
-    // shu:report — 进程报告；API 兼容占位（writeReport/getReport）。
-    if (std.mem.eql(u8, specifier, "shu:report")) return shu_report.getExports(ctx, allocator);
-    // shu:tracing — 追踪；API 兼容占位。
-    if (std.mem.eql(u8, specifier, "shu:tracing")) return shu_tracing.getExports(ctx, allocator);
-    // shu:tty — TTY；API 兼容占位（isTTY、ReadStream、WriteStream）。
-    if (std.mem.eql(u8, specifier, "shu:tty")) return shu_tty.getExports(ctx, allocator);
-    // shu:permissions — 权限策略；API 兼容占位（has/request）。
-    if (std.mem.eql(u8, specifier, "shu:permissions")) return shu_permissions.getExports(ctx, allocator);
-    // shu:intl — 国际化；API 兼容占位（getIntl、Segmenter）。
-    if (std.mem.eql(u8, specifier, "shu:intl")) return shu_intl.getExports(ctx, allocator);
-    // shu:webcrypto — Web Crypto；API 兼容占位（getRandomValues、randomUUID、subtle）。
-    if (std.mem.eql(u8, specifier, "shu:webcrypto")) return shu_webcrypto.getExports(ctx, allocator);
-    // shu:webstreams — Web Streams；API 兼容占位（ReadableStream/WritableStream/TransformStream 等）。
-    if (std.mem.eql(u8, specifier, "shu:webstreams")) return shu_webstreams.getExports(ctx, allocator);
-    // shu:cluster — 集群多进程；API 兼容占位（fork、isMaster、isWorker 等）。
-    if (std.mem.eql(u8, specifier, "shu:cluster")) return shu_cluster.getExports(ctx, allocator);
-    // shu:debugger — 调试器入口；API 兼容占位（port、host）。
-    if (std.mem.eql(u8, specifier, "shu:debugger")) return shu_debugger.getExports(ctx, allocator);
-
+    const p = specPrefix(specifier);
+    for (SPEC_TABLE) |e| {
+        if (specifier.len == e.len and p == e.prefix) return getExportsByTag(e.tag, ctx, allocator);
+    }
     return jsc.JSValueMakeUndefined(ctx);
 }
