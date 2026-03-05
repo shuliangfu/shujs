@@ -126,6 +126,17 @@ fn requireCallback(
         cache_ptr.put(allocator, allocator.dupe(u8, id) catch return exports_val, .{ .exports = exports_val }) catch return exports_val;
         return exports_val;
     }
+    // bun:sql / bun:mongo 映射到 shu:sql / shu:mongo（Bun 无 node: 对应，用 shu 占位）
+    if (std.mem.eql(u8, id, "bun:sql") or std.mem.eql(u8, id, "bun:mongo")) {
+        const shu_id = if (std.mem.eql(u8, id, "bun:sql")) "shu:sql" else "shu:mongo";
+        const cache_ptr = g_cache orelse return jsc.JSValueMakeUndefined(ctx);
+        if (cache_ptr.get(id)) |entry| return entry.exports;
+        const exports_val = shu_builtin.getShuBuiltin(ctx, allocator, shu_id);
+        if (jsc.JSValueIsUndefined(ctx, exports_val)) return exports_val;
+        jsc.JSValueProtect(ctx, exports_val);
+        cache_ptr.put(allocator, allocator.dupe(u8, id) catch return exports_val, .{ .exports = exports_val }) catch return exports_val;
+        return exports_val;
+    }
     // shu:fs / shu:path / shu:zlib 等内置：从 globalThis.Shu 取子对象并缓存
     if (shu_builtin.isSupportedShuBuiltin(id)) {
         const cache_ptr = g_cache orelse return jsc.JSValueMakeUndefined(ctx);
