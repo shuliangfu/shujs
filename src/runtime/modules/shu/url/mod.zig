@@ -1,5 +1,6 @@
 // shu:url 内置：Node 风格 parse/format + 全局 URL/URLSearchParams（当 JSC 未提供时）
 // 基于 std.Uri；register 由 bindings 调用，getExports 供 require("shu:url")/node:url
+// 所有权：parse/format/URL 等返回 JSC 持有；从 JS 取 UTF-8 的辅助函数 [Allocates]，调用方负责 free。
 
 const std = @import("std");
 const jsc = @import("jsc");
@@ -37,6 +38,19 @@ fn setMethod(ctx: jsc.JSGlobalContextRef, obj: jsc.JSObjectRef, method_name: [*]
     _ = jsc.JSObjectSetProperty(ctx, obj, name_ref, fn_ref, jsc.kJSPropertyAttributeNone, null);
 }
 
+/// 两切片相等：先比长度，≤8 字节用单次 u64 比较（00 §2.1），否则回退 std.mem.eql
+fn sliceEqlShort(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    if (a.len <= 8) {
+        var x: [8]u8 = [_]u8{0} ** 8;
+        var y: [8]u8 = [_]u8{0} ** 8;
+        @memcpy(x[0..a.len], a);
+        @memcpy(y[0..b.len], b);
+        return @as(u64, @bitCast(x)) == @as(u64, @bitCast(y));
+    }
+    return std.mem.eql(u8, a, b);
+}
+
 /// 给 URL 对象设置字符串属性（name 为字面量 [*]const u8，value 会 dupeZ 后设到 JSC）
 fn setStringPropertyUrl(ctx: jsc.JSContextRef, obj: jsc.JSObjectRef, name: [*]const u8, value: []const u8) void {
     const allocator = g_url_allocator orelse globals.current_allocator orelse return;
@@ -64,7 +78,7 @@ fn setStringProperty(ctx: jsc.JSContextRef, obj: jsc.JSObjectRef, name: []const 
     _ = jsc.JSObjectSetProperty(ctx, obj, name_ref, jsc.JSValueMakeString(ctx, value_ref), jsc.kJSPropertyAttributeNone, null);
 }
 
-/// 从 JS 值取 UTF-8 字符串，调用方 free
+/// [Allocates] 从 JS 值取 UTF-8 字符串；调用方负责 free。
 fn jsValueToUtf8(ctx: jsc.JSContextRef, value: jsc.JSValueRef, allocator: std.mem.Allocator) ?[]const u8 {
     const js_str = jsc.JSValueToStringCopy(ctx, value, null);
     defer jsc.JSStringRelease(js_str);
@@ -158,7 +172,7 @@ fn searchParamsGetCallback(
     var list = parseQuery(allocator, search) catch return jsc.JSValueMakeUndefined(ctx);
     defer list.deinit(allocator);
     for (list.items) |pair| {
-        if (std.mem.eql(u8, pair.k, name)) {
+        if (sliceEqlShort(pair.k, name)) {
             const v_z = allocator.dupeZ(u8, pair.v) catch return jsc.JSValueMakeUndefined(ctx);
             defer allocator.free(v_z);
             const ref = jsc.JSStringCreateWithUTF8CString(v_z.ptr);
@@ -188,7 +202,7 @@ fn searchParamsGetAllCallback(
     var values = std.ArrayList(jsc.JSValueRef).initCapacity(allocator, 0) catch return jsc.JSValueMakeUndefined(ctx);
     defer values.deinit(allocator);
     for (list.items) |pair| {
-        if (std.mem.eql(u8, pair.k, name)) {
+        if (sliceEqlShort(pair.k, name)) {
             const v_z = allocator.dupeZ(u8, pair.v) catch continue;
             defer allocator.free(v_z);
             const ref = jsc.JSStringCreateWithUTF8CString(v_z.ptr);
