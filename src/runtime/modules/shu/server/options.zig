@@ -78,14 +78,15 @@ pub fn getOptionalBoolDefault(ctx: jsc.JSContextRef, obj: jsc.JSObjectRef, key: 
 }
 
 /// 从 options 中取指定名的可选回调（若存在且为函数则返回其 JSValueRef）
-/// 必须先检查 undefined/null，再调 JSObjectIsFunction，否则 JSC 的 tagged 值被当指针会 segfault。
+/// 必须先 JSValueToObject 再调 JSObjectIsFunction，否则 JSC 的 tagged 值被当指针会 segfault。
 pub fn getOptionalCallback(ctx: jsc.JSContextRef, options_obj: jsc.JSObjectRef, key: [*]const u8) ?jsc.JSValueRef {
     const k_ref = jsc.JSStringCreateWithUTF8CString(key);
     defer jsc.JSStringRelease(k_ref);
     const v = jsc.JSObjectGetProperty(ctx, options_obj, k_ref, null);
     if (jsc.JSValueIsUndefined(ctx, v) or jsc.JSValueIsNull(ctx, v)) return null;
-    if (jsc.JSObjectIsFunction(ctx, @ptrCast(v))) return v;
-    return null;
+    const obj = jsc.JSValueToObject(ctx, v, null);
+    if (obj == null or !jsc.JSObjectIsFunction(ctx, obj.?)) return null;
+    return v;
 }
 
 /// 从 options 中取 options.signal（AbortSignal）；若存在且为对象则返回其 JSValueRef
@@ -151,7 +152,8 @@ pub fn getOptionalWebSocket(ctx: jsc.JSContextRef, options_obj: jsc.JSObjectRef)
     const k_msg = jsc.JSStringCreateWithUTF8CString("onMessage");
     defer jsc.JSStringRelease(k_msg);
     const on_msg = jsc.JSObjectGetProperty(ctx, obj, k_msg, null);
-    if (!jsc.JSObjectIsFunction(ctx, @ptrCast(on_msg))) return null;
+    const on_msg_obj = jsc.JSValueToObject(ctx, on_msg, null);
+    if (on_msg_obj == null or !jsc.JSObjectIsFunction(ctx, on_msg_obj.?)) return null;
     const k_open = jsc.JSStringCreateWithUTF8CString("onOpen");
     defer jsc.JSStringRelease(k_open);
     const k_close = jsc.JSStringCreateWithUTF8CString("onClose");
@@ -161,23 +163,33 @@ pub fn getOptionalWebSocket(ctx: jsc.JSContextRef, options_obj: jsc.JSObjectRef)
     const on_open = jsc.JSObjectGetProperty(ctx, obj, k_open, null);
     const on_close = jsc.JSObjectGetProperty(ctx, obj, k_close, null);
     const on_error = jsc.JSObjectGetProperty(ctx, obj, k_err, null);
+    const on_open_obj = jsc.JSValueToObject(ctx, on_open, null);
+    const on_close_obj = jsc.JSValueToObject(ctx, on_close, null);
+    const on_error_obj = jsc.JSValueToObject(ctx, on_error, null);
     return .{
-        .on_open = if (jsc.JSObjectIsFunction(ctx, @ptrCast(on_open))) on_open else null,
+        .on_open = if (on_open_obj != null and jsc.JSObjectIsFunction(ctx, on_open_obj.?)) on_open else null,
         .on_message = on_msg,
-        .on_close = if (jsc.JSObjectIsFunction(ctx, @ptrCast(on_close))) on_close else null,
-        .on_error = if (jsc.JSObjectIsFunction(ctx, @ptrCast(on_error))) on_error else null,
+        .on_close = if (on_close_obj != null and jsc.JSObjectIsFunction(ctx, on_close_obj.?)) on_close else null,
+        .on_error = if (on_error_obj != null and jsc.JSObjectIsFunction(ctx, on_error_obj.?)) on_error else null,
     };
 }
 
-/// 从 options 中取 options.fetch 或 options.handler，且为函数则返回其 JSValueRef
+/// 从 options 中取 options.fetch 或 options.handler，且为函数则返回其 JSValueRef。
+/// 仅当值非 undefined/null 时才调用 JSValueToObject，避免对原始类型调用导致崩溃。
 pub fn getHandlerFromOptions(ctx: jsc.JSContextRef, options_obj: jsc.JSObjectRef) ?jsc.JSValueRef {
     const k_fetch = jsc.JSStringCreateWithUTF8CString("fetch");
     defer jsc.JSStringRelease(k_fetch);
     const k_handler = jsc.JSStringCreateWithUTF8CString("handler");
     defer jsc.JSStringRelease(k_handler);
     const fetch_val = jsc.JSObjectGetProperty(ctx, options_obj, k_fetch, null);
-    if (jsc.JSObjectIsFunction(ctx, @ptrCast(fetch_val))) return fetch_val;
+    if (!jsc.JSValueIsUndefined(ctx, fetch_val) and !jsc.JSValueIsNull(ctx, fetch_val)) {
+        const fetch_obj = jsc.JSValueToObject(ctx, fetch_val, null);
+        if (fetch_obj != null and jsc.JSObjectIsFunction(ctx, fetch_obj.?)) return fetch_val;
+    }
     const handler_val = jsc.JSObjectGetProperty(ctx, options_obj, k_handler, null);
-    if (jsc.JSObjectIsFunction(ctx, @ptrCast(handler_val))) return handler_val;
+    if (!jsc.JSValueIsUndefined(ctx, handler_val) and !jsc.JSValueIsNull(ctx, handler_val)) {
+        const handler_obj = jsc.JSValueToObject(ctx, handler_val, null);
+        if (handler_obj != null and jsc.JSObjectIsFunction(ctx, handler_obj.?)) return handler_val;
+    }
     return null;
 }
