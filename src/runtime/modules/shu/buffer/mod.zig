@@ -1,7 +1,7 @@
 // shu:buffer 内置：Node 风格 Buffer，纯 Zig + JSC Typed Array C API
 // 提供 Buffer.alloc、allocUnsafe、from、isBuffer、concat 及构造函数，对应 node:buffer
 // 零拷贝：from(string/array)、concat、以及 Shu.fs.readSync(..., { encoding: null }) 均用 JSObjectMakeTypedArrayWithBytesNoCopy 将 Zig 内存直接交给 JS，避免二次拷贝。
-// 池化：Buffer.alloc(BUFFER_POOL_CHUNK_SIZE) 时从 io_core ChunkAllocator 取块，GC 时归还，减少 allocator 压力。
+// 池化：Buffer.alloc(BUFFER_POOL_CHUNK_SIZE) 时从 libs_io ChunkAllocator 取块（块为 libs_io.BufferPool 切分，64-byte 对齐，00 §1.6），GC 时归还，减少 allocator 压力。
 
 const std = @import("std");
 const jsc = @import("jsc");
@@ -71,7 +71,8 @@ fn bufferConstructor(
     return fromCallback(ctx, global, global, argumentCount, arguments, @ptrCast(&exc));
 }
 
-/// Buffer.alloc(size [, fill [, encoding]])：创建零填充的 Uint8Array；size==64KB 时从 ChunkAllocator 池取块（NoCopy 归还），fill 暂不实现
+/// Buffer.alloc(size [, fill [, encoding]])：创建零填充的 Uint8Array；size==64KB 时从 ChunkAllocator 池取块（[Borrows] NoCopy 归还池，生命周期至 JS 回收）；否则 [Allocates] 由 JSC TypedArray 持有并回收。
+// Hot-path
 fn allocCallback(
     ctx: jsc.JSContextRef,
     _: jsc.JSObjectRef,
@@ -151,7 +152,8 @@ fn allocUnsafeCallback(
 }
 
 /// Buffer.from(value [, encodingOrOffset [, length]] | value, options)：支持 TypedArray/ArrayBuffer、array、string。
-/// options 可为 { copy: false }：对 TypedArray 零拷贝引用其 backing store，不 dupe；约定：使用期间须保持原 TypedArray 引用，不得 detach/修改（§3.1）
+/// options 可为 { copy: false }：对 TypedArray 零拷贝引用其 backing store（[Borrows]）；约定：使用期间须保持原 TypedArray 引用，不得 detach/修改。否则 [Allocates] 由 JSC 持有，回收时释放。
+// Hot-path
 fn fromCallback(
     ctx: jsc.JSContextRef,
     _: jsc.JSObjectRef,
@@ -330,7 +332,8 @@ fn isBufferCallback(
     return jsc.JSValueMakeBoolean(ctx, typ == .Uint8Array);
 }
 
-/// Buffer.concat(list [, totalLength])：Zig 分配一块内存，拷贝所有 list 项后通过 NoCopy 交给 JS，零拷贝暴露给 JS 侧
+/// [Allocates] Buffer.concat(list [, totalLength])：Zig 分配一块内存，拷贝所有 list 项后通过 NoCopy 交给 JS；内存由 JSC 回收时释放。
+// Hot-path
 fn concatCallback(
     ctx: jsc.JSContextRef,
     _: jsc.JSObjectRef,
