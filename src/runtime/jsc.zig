@@ -93,6 +93,8 @@ pub extern "c" fn JSObjectGetPropertyAtIndex(JSContextRef, JSObjectRef, c_uint, 
 pub extern "c" fn JSValueIsUndefined(JSContextRef, JSValueRef) bool;
 /// 判断值是否为 null（用于 createConnection 回调 err 判断）
 pub extern "c" fn JSValueIsNull(JSContextRef, JSValueRef) bool;
+/// 判断值是否为字符串（用于 Web Crypto algorithm 参数等）
+pub extern "c" fn JSValueIsString(JSContextRef, JSValueRef) bool;
 
 // ---------- 属性名枚举（vm 模块复制 sandbox 与 global 间属性用） ----------
 /// 属性名数组句柄（JSObjectCopyPropertyNames 返回，调用者 Release）
