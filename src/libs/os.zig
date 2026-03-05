@@ -65,6 +65,24 @@ const builtin = @import("builtin");
 const posix = std.posix;
 const win = std.os.windows;
 
+// POSIX statvfs：Zig 0.16 的 std.posix 未导出 statvfs，故在 Linux/macOS 上通过 libc 声明自用
+const posix_statvfs = if (builtin.os.tag == .windows) struct {} else struct {
+    pub const statvfs_t = extern struct {
+        f_bsize: c_ulong,
+        f_frsize: c_ulong,
+        f_blocks: c_ulong,
+        f_bfree: c_ulong,
+        f_bavail: c_ulong,
+        f_files: c_ulong,
+        f_ffree: c_ulong,
+        f_favail: c_ulong,
+        f_fsid: c_ulong,
+        f_flag: c_ulong,
+        f_namemax: c_ulong,
+    };
+    pub extern "c" fn statvfs(path: [*:0]const u8, buf: *statvfs_t) c_int;
+};
+
 // Windows psapi：GetProcessMemoryInfo（仅 Windows 构建时使用）
 const win_psapi = if (builtin.os.tag == .windows) struct {
     pub const PROCESS_MEMORY_COUNTERS = extern struct {
@@ -138,9 +156,55 @@ pub fn getPlatform() Platform {
     };
 }
 
+/// Node/os 风格平台名：'darwin' | 'linux' | 'win32' | 'freebsd' | 'openbsd' | 'netbsd' | 'unknown'。无分配，comptime 确定。
+pub fn platformName() [:0]const u8 {
+    return switch (builtin.os.tag) {
+        .macos => "darwin",
+        .linux => "linux",
+        .windows => "win32",
+        .freebsd => "freebsd",
+        .openbsd => "openbsd",
+        .netbsd => "netbsd",
+        else => "unknown",
+    };
+}
+
+/// Node/os 风格架构名：'x64' | 'arm64' | 'ia32' | 'arm' | 'ppc64' | 'ppc64le' | 's390x' | 'mips' | 'unknown'。无分配，comptime 确定。
+pub fn archName() [:0]const u8 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => "x64",
+        .aarch64 => "arm64",
+        .x86 => "ia32",
+        .arm => "arm",
+        .powerpc64 => "ppc64",
+        .powerpc64le => "ppc64le",
+        .s390x => "s390x",
+        .mips, .mipsel => "mips",
+        else => "unknown",
+    };
+}
+
+/// Node/os 风格系统类型名：'Darwin' | 'Linux' | 'Windows_NT' | 'FreeBSD' | 'OpenBSD' | 'NetBSD' | 'Unknown'。无分配，comptime 确定。
+pub fn typeName() [:0]const u8 {
+    return switch (builtin.os.tag) {
+        .macos => "Darwin",
+        .linux => "Linux",
+        .windows => "Windows_NT",
+        .freebsd => "FreeBSD",
+        .openbsd => "OpenBSD",
+        .netbsd => "NetBSD",
+        else => "Unknown",
+    };
+}
+
 // -----------------------------------------------------------------------------
 // CPU 占用（Linux：/proc/stat 两次采样；macOS/Windows 待实现）
 // -----------------------------------------------------------------------------
+
+/// 逻辑 CPU 核数（用于 Node os.cpus().length 等）。无 I/O，无分配。
+pub fn getCpuCount() u32 {
+    return @intCast(std.Thread.getCpuCount() catch 1);
+}
 
 /// 获取系统整体 CPU 利用率（0..100）。需两次采样，首次或缓存过期时会阻塞约 CPU_SAMPLE_INTERVAL_MS。
 /// Linux 读 /proc/stat 首行 "cpu " 的 user+nice+system+idle+... 求 delta，(total-idle)/total*100。
@@ -685,14 +749,14 @@ pub fn getDiskFreeSpace(path: []const u8, allocator: std.mem.Allocator) OsError!
     };
 }
 
-/// [Allocates] 内部用 allocator 分配 path 的 null 结尾副本，调用 statvfs 后即释放，避免栈上大数组。
+/// [Allocates] 内部用 allocator 分配 path 的 null 结尾副本，调用 libc statvfs 后即释放，避免栈上大数组。
 fn getDiskFreeSpacePosix(allocator: std.mem.Allocator, path: []const u8) OsError!DiskSpace {
     const path_z = allocator.dupeZ(u8, path) catch return error.OutOfMemory;
     defer allocator.free(path_z);
-    var stat: std.posix.statvfs = undefined;
-    if (std.posix.statvfs(path_z.ptr, &stat) != 0) return error.IoError;
-    const total = stat.f_blocks * stat.f_frsize;
-    const free = stat.f_bavail * stat.f_frsize;
+    var stat: posix_statvfs.statvfs_t = undefined;
+    if (posix_statvfs.statvfs(path_z.ptr, &stat) != 0) return error.IoError;
+    const total = @as(u64, stat.f_blocks) * @as(u64, stat.f_frsize);
+    const free = @as(u64, stat.f_bavail) * @as(u64, stat.f_frsize);
     return .{ .total_bytes = total, .free_bytes = free };
 }
 
@@ -871,24 +935,32 @@ fn getNetworkRttMsPosix(allocator: std.mem.Allocator, host: []const u8, port: u1
     const host_z = allocator.dupeZ(u8, host) catch return null;
     defer allocator.free(host_z);
     var port_buf: [6]u8 = undefined;
-    const port_len = std.fmt.formatIntBuf(&port_buf, port, 10, .lower, .{});
-    const port_z = allocator.dupeZ(u8, port_buf[0..port_len]) catch return null;
+    const port_slice = std.fmt.bufPrint(port_buf[0..], "{d}", .{port}) catch return null;
+    const port_z = allocator.dupeZ(u8, port_slice) catch return null;
     defer allocator.free(port_z);
     var hints: std.c.addrinfo = undefined;
     @memset(std.mem.asBytes(&hints), 0);
     hints.family = std.c.AF.UNSPEC;
     hints.socktype = std.c.SOCK.STREAM;
     var res: ?*std.c.addrinfo = null;
-    if (std.c.getaddrinfo(host_z.ptr, port_z.ptr, &hints, &res) != 0) return null;
+    const gai_ret = std.c.getaddrinfo(host_z.ptr, port_z.ptr, &hints, &res);
+    if (@intFromEnum(gai_ret) != 0) return null;
     defer if (res) |r| std.c.freeaddrinfo(r);
     const first = res orelse return null;
-    const fd = std.c.socket(first.family, first.socktype, first.protocol);
+    const fd = std.c.socket(@as(u32, @intCast(first.family)), @as(u32, @intCast(first.socktype)), @as(u32, @intCast(first.protocol)));
     if (fd == -1) return null;
     defer _ = std.c.close(fd);
-    const t0 = std.time.nanoTimestamp();
-    if (std.c.connect(fd, first.addr, first.addrlen) != 0) return null;
-    const t1 = std.time.nanoTimestamp();
-    const ns = t1 - t0;
+    var tp0: std.c.timespec = undefined;
+    var tp1: std.c.timespec = undefined;
+    if (std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &tp0) != 0) return null;
+    const addr = first.addr orelse return null;
+    if (std.c.connect(fd, addr, first.addrlen) != 0) return null;
+    if (std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &tp1) != 0) return null;
+    const sec0: i64 = if (builtin.os.tag == .linux) @as(i64, tp0.tv_sec) else @as(i64, @intCast(tp0.sec));
+    const sec1: i64 = if (builtin.os.tag == .linux) @as(i64, tp1.tv_sec) else @as(i64, @intCast(tp1.sec));
+    const nsec0: i64 = if (builtin.os.tag == .linux) @as(i64, tp0.tv_nsec) else @as(i64, @intCast(tp0.nsec));
+    const nsec1: i64 = if (builtin.os.tag == .linux) @as(i64, tp1.tv_nsec) else @as(i64, @intCast(tp1.nsec));
+    const ns: i64 = (sec1 - sec0) * std.time.ns_per_s + (nsec1 - nsec0);
     if (ns < 0) return 0;
     return @as(u32, @intCast(@min(0xFFFF_FFFF, @as(u64, @intCast(ns)) / std.time.ns_per_ms)));
 }
@@ -929,7 +1001,7 @@ fn getLoadAverageMacos() ?LoadAverage {
         @cInclude("sys/sysctl.h");
     });
     var load: c.struct_loadavg = undefined;
-    var size: c.size_t = @sizeOf(c.struct_loadavg);
+    var size: usize = @sizeOf(c.struct_loadavg);
     if (c.sysctlbyname("vm.loadavg", &load, &size, null, 0) != 0) return null;
     const scale: f32 = if (load.fscale > 0) @floatFromInt(load.fscale) else 1.0;
     return .{
@@ -966,7 +1038,7 @@ fn getUptimeSecondsMacos() ?u64 {
         @cInclude("sys/time.h");
     });
     var boot: c.struct_timeval = undefined;
-    var size: c.size_t = @sizeOf(c.struct_timeval);
+    var size: usize = @sizeOf(c.struct_timeval);
     if (c.sysctlbyname("kern.boottime", &boot, &size, null, 0) != 0) return null;
     var now: c.struct_timeval = undefined;
     if (c.gettimeofday(&now, null) != 0) return null;
