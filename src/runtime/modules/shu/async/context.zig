@@ -18,20 +18,19 @@ const StorageKey = struct {
 const StorageEntry = struct { ref: jsc.JSValueRef, ctx: jsc.JSContextRef };
 
 var g_alloc: std.mem.Allocator = std.heap.page_allocator;
-var g_stack: std.ArrayList(AsyncFrame) = undefined;
-var g_hooks: std.ArrayList(jsc.JSObjectRef) = undefined;
+/// Unmanaged，append/orderedRemove/deinit 显式传 g_alloc（01 §1.2）
+var g_stack: std.ArrayListUnmanaged(AsyncFrame) = .{};
+var g_hooks: std.ArrayListUnmanaged(jsc.JSObjectRef) = .{};
 var g_next_id: std.atomic.Value(u64) = .{ .raw = 1 };
 var g_inited: bool = false;
-var g_storage_map: std.AutoHashMap(StorageKey, StorageEntry) = undefined;
+/// Unmanaged，put/fetchRemove 显式传 g_alloc
+var g_storage_map: std.AutoHashMapUnmanaged(StorageKey, StorageEntry) = .{};
 var g_storage_id_next: std.atomic.Value(u32) = .{ .raw = 1 };
 
 /// 由 async hooks getExports 在首次加载时调用，初始化栈、钩子列表与 AsyncLocalStorage 存储表
 pub fn init(allocator: std.mem.Allocator) void {
     if (g_inited) return;
     g_alloc = allocator;
-    g_stack = std.ArrayList(AsyncFrame).initCapacity(g_alloc, 0) catch return;
-    g_hooks = std.ArrayList(jsc.JSObjectRef).initCapacity(g_alloc, 0) catch return;
-    g_storage_map = std.AutoHashMap(StorageKey, StorageEntry).init(g_alloc);
     g_inited = true;
 }
 
@@ -161,7 +160,7 @@ pub fn setStorageStore(ctx: jsc.JSContextRef, storage_id: u32, async_id: u64, st
     const key = StorageKey{ .storage_id = storage_id, .async_id = async_id };
     if (g_storage_map.fetchRemove(key)) |kv| jsc.JSValueUnprotect(kv.value.ctx, kv.value.ref);
     jsc.JSValueProtect(ctx, store);
-    g_storage_map.put(key, .{ .ref = store, .ctx = ctx }) catch {};
+    g_storage_map.put(g_alloc, key, .{ .ref = store, .ctx = ctx }) catch {};
 }
 
 pub fn deleteStorageStore(_: jsc.JSContextRef, storage_id: u32, async_id: u64) void {
