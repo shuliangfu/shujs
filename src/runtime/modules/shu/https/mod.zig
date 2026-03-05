@@ -27,8 +27,10 @@ fn createServerHttpsCallback(
     if (argumentCount < 2) return jsc.JSValueMakeUndefined(ctx);
     const options = arguments[0];
     const requestListener = arguments[1];
-    if (jsc.JSValueToObject(ctx, options, null) == null or !jsc.JSObjectIsFunction(ctx, @ptrCast(requestListener)))
-        return jsc.JSValueMakeUndefined(ctx);
+    if (jsc.JSValueToObject(ctx, options, null) == null) return jsc.JSValueMakeUndefined(ctx);
+    if (jsc.JSValueIsUndefined(ctx, requestListener) or jsc.JSValueIsNull(ctx, requestListener)) return jsc.JSValueMakeUndefined(ctx);
+    const listener_obj = jsc.JSValueToObject(ctx, requestListener, null);
+    if (listener_obj == null or !jsc.JSObjectIsFunction(ctx, listener_obj.?)) return jsc.JSValueMakeUndefined(ctx);
     const server = jsc.JSObjectMake(ctx, null, null);
     const k_listener = jsc.JSStringCreateWithUTF8CString("_requestListener");
     defer jsc.JSStringRelease(k_listener);
@@ -53,7 +55,9 @@ fn listenHttpsCallback(
     const k_listener = jsc.JSStringCreateWithUTF8CString("_requestListener");
     defer jsc.JSStringRelease(k_listener);
     const listener_val = jsc.JSObjectGetProperty(ctx, this, k_listener, null);
-    if (!jsc.JSObjectIsFunction(ctx, @ptrCast(listener_val))) return jsc.JSValueMakeUndefined(ctx);
+    if (jsc.JSValueIsUndefined(ctx, listener_val) or jsc.JSValueIsNull(ctx, listener_val)) return jsc.JSValueMakeUndefined(ctx);
+    const listener_obj = jsc.JSValueToObject(ctx, listener_val, null);
+    if (listener_obj == null or !jsc.JSObjectIsFunction(ctx, listener_obj.?)) return jsc.JSValueMakeUndefined(ctx);
     const port_n = jsc.JSValueToNumber(ctx, arguments[0], null);
     if (port_n != port_n or port_n < 1 or port_n > 65535) return jsc.JSValueMakeUndefined(ctx);
     const port = @as(u16, @intFromFloat(port_n));
@@ -65,7 +69,9 @@ fn listenHttpsCallback(
     const create_fn = jsc.JSValueToObject(ctx, create_val, null) orelse return jsc.JSValueMakeUndefined(ctx);
     var listener_args = [_]jsc.JSValueRef{listener_val};
     const fetch_val = jsc.JSObjectCallAsFunction(ctx, create_fn, null, 1, &listener_args, null);
-    if (!jsc.JSObjectIsFunction(ctx, @ptrCast(fetch_val))) return jsc.JSValueMakeUndefined(ctx);
+    if (jsc.JSValueIsUndefined(ctx, fetch_val) or jsc.JSValueIsNull(ctx, fetch_val)) return jsc.JSValueMakeUndefined(ctx);
+    const fetch_obj = jsc.JSValueToObject(ctx, fetch_val, null);
+    if (fetch_obj == null or !jsc.JSObjectIsFunction(ctx, fetch_obj.?)) return jsc.JSValueMakeUndefined(ctx);
     var host_buf: [256]u8 = undefined;
     const host_slice: []const u8 = blk: {
         if (argumentCount < 2 or jsc.JSValueIsUndefined(ctx, arguments[1])) break :blk "0.0.0.0";
