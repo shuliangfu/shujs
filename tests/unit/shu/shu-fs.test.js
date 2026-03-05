@@ -348,4 +348,59 @@ describe("shu:fs", () => {
     const nonExistent = path.join(dir, "nonexistent-realpath-" + Date.now());
     assert.throws(() => fs.realpathSync(nonExistent));
   });
+
+  // ---------- fs.watch：需 --allow-read，事件由主线程 drain 回调 listener(eventType, filename) ----------
+  describe("fs.watch", () => {
+    it("watch: returns watcher with close method", () => {
+      const dir = getTestDataDir("fs");
+      const watcher = fs.watch(dir, () => {});
+      assert.ok(watcher != null && typeof watcher === "object");
+      assert.strictEqual(typeof watcher.close, "function");
+      watcher.close();
+    });
+
+    it("watch: receives event when file is written in watched dir", (done) => {
+      const dir = getTestDataDir("fs");
+      const name = "watch-change-" + Date.now() + ".txt";
+      const events = [];
+      const watcher = fs.watch(dir, (eventType, filename) => {
+        events.push({ eventType, filename: filename || "" });
+      });
+      fs.writeFileSync(path.join(dir, name), "x");
+      // 多轮 setImmediate 让事件循环执行 drain_fs_watch，平台可能上报 change 或 rename
+      function pump(n) {
+        setImmediate(() => {
+          if (n <= 0) {
+            watcher.close();
+            assert.ok(events.length >= 1, "expected at least one watch event, got " + events.length);
+            assert.ok(
+              events.some((e) => e.eventType === "change" || e.eventType === "rename"),
+              "expected eventType change or rename, got " + JSON.stringify(events)
+            );
+            try { fs.unlinkSync(path.join(dir, name)); } catch (_) {}
+            done();
+            return;
+          }
+          pump(n - 1);
+        });
+      }
+      pump(5);
+    }, { timeout: 3000 });
+
+    it("watch: close() stops watcher", (done) => {
+      const dir = getTestDataDir("fs");
+      const name = "watch-close-" + Date.now() + ".txt";
+      let afterClose = 0;
+      const watcher = fs.watch(dir, () => { afterClose++; });
+      watcher.close();
+      fs.writeFileSync(path.join(dir, name), "y");
+      setImmediate(() => {
+        setImmediate(() => {
+          try { fs.unlinkSync(path.join(dir, name)); } catch (_) {}
+          assert.strictEqual(afterClose, 0, "listener should not run after close");
+          done();
+        });
+      });
+    }, { timeout: 2000 });
+  });
 });
