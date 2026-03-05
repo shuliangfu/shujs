@@ -24,34 +24,52 @@ fn getScopeArg(ctx: jsc.JSContextRef, argumentCount: usize, arguments: [*]const 
     return buf[0 .. n - 1];
 }
 
+/// 取 scope 前 8 字节转 u64（不足零填充），用于与 comptime 常量整型比较（00 §2.1）
+fn scopePrefix(scope: []const u8) u64 {
+    var buf: [8]u8 = [_]u8{0} ** 8;
+    const n = @min(8, scope.len);
+    @memcpy(buf[0..n], scope[0..n]);
+    return @as(u64, @bitCast(buf));
+}
+fn scopePrefix8(comptime s: []const u8) u64 {
+    var buf: [8]u8 = [_]u8{0} ** 8;
+    const n = @min(8, s.len);
+    for (s[0..n], buf[0..n]) |a, *b| b.* = a;
+    return @as(u64, @bitCast(buf));
+}
+
 /// 根据 scope 字符串判断当前是否具备该权限（与 RunOptions.permissions 对齐）
-/// 使用按长度分派的 switch + 固定串比较，减少热路径上的多次 eql 分支（§2.1 comptime 表/switch）
+/// 按长度分派 + u64 前缀整型比较（00 §2.1）
 fn scopeGranted(scope: []const u8) bool {
     const opts = globals.current_run_options orelse return false;
     const p = opts.permissions;
     switch (scope.len) {
         3 => {
-            if (std.mem.eql(u8, scope, "net")) return p.allow_net;
-            if (std.mem.eql(u8, scope, "env")) return p.allow_env;
-            if (std.mem.eql(u8, scope, "ffi")) return p.allow_ffi;
-            if (std.mem.eql(u8, scope, "run")) return p.allow_run;
+            const q = scopePrefix(scope);
+            if (q == scopePrefix8("net")) return p.allow_net;
+            if (q == scopePrefix8("env")) return p.allow_env;
+            if (q == scopePrefix8("ffi")) return p.allow_ffi;
+            if (q == scopePrefix8("run")) return p.allow_run;
             return false;
         },
         4 => {
-            if (std.mem.eql(u8, scope, "read")) return p.allow_read;
-            if (std.mem.eql(u8, scope, "exec")) return p.allow_run;
+            const q = scopePrefix(scope);
+            if (q == scopePrefix8("read")) return p.allow_read;
+            if (q == scopePrefix8("exec")) return p.allow_run;
             return false;
         },
         5 => {
-            if (std.mem.eql(u8, scope, "write")) return p.allow_write;
-            if (std.mem.eql(u8, scope, "child")) return p.allow_run;
+            const q = scopePrefix(scope);
+            if (q == scopePrefix8("write")) return p.allow_write;
+            if (q == scopePrefix8("child")) return p.allow_run;
             return false;
         },
-        6 => return std.mem.eql(u8, scope, "hrtime") and p.allow_hrtime,
-        7 => return std.mem.eql(u8, scope, "fs.read") and p.allow_read,
+        6 => return scopePrefix(scope) == scopePrefix8("hrtime") and p.allow_hrtime,
+        7 => return scopePrefix(scope) == scopePrefix8("fs.read") and p.allow_read,
         8 => {
-            if (std.mem.eql(u8, scope, "fs.write")) return p.allow_write;
-            if (std.mem.eql(u8, scope, "network")) return p.allow_net;
+            const q = scopePrefix(scope);
+            if (q == scopePrefix8("fs.write")) return p.allow_write;
+            if (q == scopePrefix8("network")) return p.allow_net;
             return false;
         },
         else => return false,
