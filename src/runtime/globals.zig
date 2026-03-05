@@ -18,3 +18,5 @@ pub threadlocal var current_timer_state: ?*timer_state.TimerState = null;
 pub threadlocal var current_async_file_io: ?*libs_io.AsyncFileIO = null;
 /// 每轮事件循环需调用的 drain：收割 AsyncFileIO 完成项并 resolve/reject 对应 Promise；由 fs 在创建 AsyncFileIO 时注册
 pub threadlocal var drain_async_file_io: ?*const fn (jsc.JSContextRef) void = null;
+/// 每轮事件循环需调用的 drain：收割 fetch worker 完成项并 resolve/reject 对应 Promise；由 fetch 模块在 register 时注册
+pub threadlocal var drain_fetch_results: ?*const fn (jsc.JSContextRef) void = null;
