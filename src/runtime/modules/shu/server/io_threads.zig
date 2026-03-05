@@ -79,6 +79,14 @@ fn isDualStackHost(host: []const u8) bool {
     return false;
 }
 
+/// Darwin/BSD 的 socket() 不支持 SOCK_CLOEXEC（会 EINVAL）；创建后用 fcntl(F_SETFD, FD_CLOEXEC) 设置
+const socket_type_with_cloexec = blk: {
+    if (builtin.os.tag == .linux) {
+        break :blk std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC;
+    }
+    break :blk std.posix.SOCK.STREAM;
+};
+
 /// 创建 N 个 IPv4 listen socket（SO_REUSEPORT），绑定给定地址；addr_bytes 为 null 时绑定 0.0.0.0
 fn createV4ListenFds(
     allocator: std.mem.Allocator,
@@ -96,17 +104,21 @@ fn createV4ListenFds(
         .addr = if (addr_bytes) |b| std.mem.readInt(u32, &b, .big) else 0,
         .zero = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 },
     };
+    // 两阶段：先对所有 socket bind，再统一 listen，避免 macOS 上第一个 listen 后第二个 bind 报 EADDRNOTAVAIL (errno 49)
     for (0..n) |i| {
-        const raw = std.c.socket(@intCast(posix.AF.INET), @intCast(posix.SOCK.STREAM | posix.SOCK.CLOEXEC), 0);
+        const raw = std.c.socket(@intCast(posix.AF.INET), @intCast(socket_type_with_cloexec), 0);
         if (raw == -1) {
             for (fds[0..i]) |f| _ = std.c.close(f);
             return std.posix.unexpectedErrno(std.c.errno(-1));
         }
         const fd = @as(i32, @intCast(raw));
+        fds[i] = fd;
+        if (builtin.os.tag == .macos or builtin.os.tag == .freebsd) {
+            _ = std.c.fcntl(fd, posix.F.SETFD, @as(c_int, @intCast(posix.FD_CLOEXEC)));
+        }
         var opt: c_int = 1;
         if (std.c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&opt).ptr, @sizeOf(c_int)) != 0) {
-            _ = std.c.close(fd);
-            for (fds[0..i]) |f| _ = std.c.close(f);
+            for (fds[0 .. i + 1]) |f| _ = std.c.close(f);
             return std.posix.unexpectedErrno(std.c.errno(-1));
         }
         if (builtin.os.tag == .linux) {
@@ -115,16 +127,19 @@ fn createV4ListenFds(
             _ = std.c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, std.mem.asBytes(&opt).ptr, @sizeOf(c_int));
         }
         if (std.c.bind(fd, @as(*const posix.sockaddr, @ptrCast(&sa)), @sizeOf(posix.sockaddr.in)) != 0) {
-            _ = std.c.close(fd);
-            for (fds[0..i]) |f| _ = std.c.close(f);
-            return std.posix.unexpectedErrno(std.c.errno(-1));
+            const e = std.c.errno(-1);
+            std.log.err("createV4ListenFds: bind fd[{d}] errno={d}", .{ i, e });
+            for (fds[0 .. i + 1]) |f| _ = std.c.close(f);
+            return std.posix.unexpectedErrno(e);
         }
+    }
+    for (fds, 0..) |fd, j| {
         if (std.c.listen(fd, backlog) != 0) {
-            _ = std.c.close(fd);
-            for (fds[0..i]) |f| _ = std.c.close(f);
-            return std.posix.unexpectedErrno(std.c.errno(-1));
+            const e = std.c.errno(-1);
+            std.log.err("createV4ListenFds: listen fd[{d}] errno={d}", .{ j, e });
+            for (fds) |f| _ = std.c.close(f);
+            return std.posix.unexpectedErrno(e);
         }
-        fds[i] = @intCast(fd);
     }
     return fds;
 }
@@ -147,17 +162,21 @@ fn createV6ListenFds(
         .addr = addr_bytes orelse [_]u8{0} ** 16,
         .scope_id = 0,
     };
+    // 两阶段：先对所有 socket bind，再统一 listen，避免 macOS 上第一个 listen 后第二个 bind 报 EADDRNOTAVAIL (errno 49)
     for (0..n) |i| {
-        const raw = std.c.socket(@intCast(posix.AF.INET6), @intCast(posix.SOCK.STREAM | posix.SOCK.CLOEXEC), 0);
+        const raw = std.c.socket(@intCast(posix.AF.INET6), @intCast(socket_type_with_cloexec), 0);
         if (raw == -1) {
             for (fds[0..i]) |f| _ = std.c.close(f);
             return std.posix.unexpectedErrno(std.c.errno(-1));
         }
         const fd = @as(i32, @intCast(raw));
+        fds[i] = fd;
+        if (builtin.os.tag == .macos or builtin.os.tag == .freebsd) {
+            _ = std.c.fcntl(fd, posix.F.SETFD, @as(c_int, @intCast(posix.FD_CLOEXEC)));
+        }
         var opt: c_int = 1;
         if (std.c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&opt).ptr, @sizeOf(c_int)) != 0) {
-            _ = std.c.close(fd);
-            for (fds[0..i]) |f| _ = std.c.close(f);
+            for (fds[0 .. i + 1]) |f| _ = std.c.close(f);
             return std.posix.unexpectedErrno(std.c.errno(-1));
         }
         if (builtin.os.tag == .linux) {
@@ -169,16 +188,19 @@ fn createV6ListenFds(
         // IPV6_V6ONLY = 1 (POSIX)
         _ = std.c.setsockopt(fd, posix.IPPROTO.IPV6, 1, @as(?*const anyopaque, @ptrCast(&v6only)), @as(std.c.socklen_t, @intCast(@sizeOf(c_int))));
         if (std.c.bind(fd, @as(*const posix.sockaddr, @ptrCast(&sa)), @sizeOf(posix.sockaddr.in6)) != 0) {
-            _ = std.c.close(fd);
-            for (fds[0..i]) |f| _ = std.c.close(f);
-            return std.posix.unexpectedErrno(std.c.errno(-1));
+            const e = std.c.errno(-1);
+            std.log.err("createV6ListenFds: bind fd[{d}] errno={d}", .{ i, e });
+            for (fds[0 .. i + 1]) |f| _ = std.c.close(f);
+            return std.posix.unexpectedErrno(e);
         }
+    }
+    for (fds, 0..) |fd, j| {
         if (std.c.listen(fd, backlog) != 0) {
-            _ = std.c.close(fd);
-            for (fds[0..i]) |f| _ = std.c.close(f);
-            return std.posix.unexpectedErrno(std.c.errno(-1));
+            const e = std.c.errno(-1);
+            std.log.err("createV6ListenFds: listen fd[{d}] errno={d}", .{ j, e });
+            for (fds) |f| _ = std.c.close(f);
+            return std.posix.unexpectedErrno(e);
         }
-        fds[i] = @intCast(fd);
     }
     return fds;
 }
@@ -292,6 +314,11 @@ pub fn init(
 ) !?*IoThreadsContext {
     if (n <= 1 or state.use_unix) return null;
     if (builtin.os.tag == .windows) return null;
+    // FreeBSD：需 SO_REUSEPORT_LB 才有负载均衡，SO_REUSEPORT 仅允许同端口绑定但 LIFO，暂不实现。
+    if (builtin.os.tag == .freebsd) return null;
+    // Darwin：SO_REUSEPORT 语义为 LIFO（仅最后 bind 的 fd 收到新连接），无 Linux 式多核负载均衡；
+    // 且多 fd bind 同端口时易出现 EADDRNOTAVAIL (49)，故暂不启用；若需调试可注释下一行并在失败处查看日志。
+    if (builtin.os.tag == .macos) return null;
 
     const config = &state.config;
     const listen_result = try createListenFdsReusePort(
