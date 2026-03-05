@@ -71,6 +71,7 @@ pub const TimerState = struct {
     pub fn runMicrotasks(self: *TimerState, ctx: jsc.JSGlobalContextRef) void {
         if (globals.drain_fetch_results) |drain| drain(ctx);
         if (globals.drain_cmd_results) |drain| drain(ctx);
+        if (globals.drain_dns_pending) |drain| drain(ctx);
         const list = &self.microtask_queue;
         while (list.items.len > 0) {
             const e = list.orderedRemove(0);
