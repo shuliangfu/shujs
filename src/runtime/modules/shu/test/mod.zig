@@ -63,6 +63,8 @@ const c_red = "\x1b[31m";
 const c_yellow = "\x1b[33m";
 const c_cyan = "\x1b[36m";
 const c_reset = "\x1b[0m";
+/// 文件头行：深灰（bright black / 90），与下方浅灰用例行区分。
+const c_header = "\x1b[90m";
 
 /// 判断是否为保留消息 "true"(4) 或 "false"(5)，用于 skip/todo 的 message 是否需复制（00 §2.1 len+整型比较）
 fn isReservedMessage(m: []const u8) bool {
@@ -169,14 +171,14 @@ const RunState = struct {
         }
         if (!state.retry_pending) state.retry_count = 0;
         state.retry_pending = false;
-        // 首次进入时打印 "running N tests from path"（Deno 风格）并记录 run_start_ms
+        // 首次进入时打印 "running N tests from path"（Deno 风格）并记录 run_start_ms；深灰（90）与下方浅灰用例行区分
         if (state.job_index == 0) {
             var run_test_count: usize = 0;
             for (state.jobs.items) |j| {
                 if (j == .run_test) run_test_count += 1;
             }
             const path = if (c.getenv("SHU_TEST_FILE_PATH")) |p| std.mem.span(p) else "unknown";
-            printTestLineStdout("\nrunning {d} tests from {s}\n", .{ run_test_count, path });
+            printTestLineStdout("\n{s}running {d} tests from {s}{s}\n", .{ c_header, run_test_count, path, c_reset });
             state.run_start_ms = nowMs();
         }
         state.last_run_job_index = state.job_index;
