@@ -15,8 +15,8 @@
 const std = @import("std");
 const version = @import("version.zig");
 
-// ANSI 转义：仅当 stdout 为 TTY 时启用，避免管道/重定向时输出乱码
-const SGR = struct {
+// ANSI 转义：仅当 stdout 为 TTY 时启用，避免管道/重定向时输出乱码。子命令 help（如 test）可复用。
+pub const SGR = struct {
     reset: []const u8 = "",
     bold: []const u8 = "",
     dim: []const u8 = "",
@@ -35,6 +35,11 @@ const SGR = struct {
         };
     }
 };
+
+/// 根据 stdout 是否为 TTY 返回带色或空 SGR，供 printGlobalUsage 及子命令（如 test）help 复用。
+pub fn getHelpSgr() SGR {
+    return SGR.withColor(std.c.isatty(1) != 0);
+}
 
 const CmdHelp = struct { name: []const u8, desc: []const u8 };
 
@@ -111,9 +116,7 @@ pub fn printGlobalUsage(io: std.Io) !void {
     var buf: [1024]u8 = undefined;
     var w = std.Io.File.Writer.init(std.Io.File.stdout(), io, &buf);
     const out = &w.interface;
-    // Zig 0.16：posix.isatty 已移/变更，用 C 库 isatty(stdout) 判断 TTY
-    const use_color = std.c.isatty(1) != 0; // stdout
-    const sgr = SGR.withColor(use_color);
+    const sgr = getHelpSgr();
 
     // 标题：粗体 + 青色
     try out.print("{s}{s}shu{s}: A JavaScript / TypeScript runtime (Node / Deno / Bun compatible){s}\n\n", .{ sgr.bold, sgr.cyan, sgr.reset, sgr.reset });
