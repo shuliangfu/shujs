@@ -34,6 +34,7 @@ const step_plain = @import("step_plain.zig");
 const step_tls = @import("step_tls.zig");
 const connection = @import("connection.zig");
 const tick = @import("tick.zig");
+const io_threads_mod = @import("io_threads.zig");
 const ParsedRequest = types.ParsedRequest;
 
 /// Cluster worker CPU 亲和性：Linux/Windows 硬绑核；macOS 用「软建议」（亲和性标签 + QoS），无硬绑定。
@@ -129,7 +130,8 @@ const ServerState = state_mod.ServerState;
 const PlainMuxState = state_mod.PlainMuxState;
 
 /// WebSocket send 回调：id -> fd 或 blocking 写，供 ws.send(data) 时入队或直接写
-var g_ws_send_registry: ?*std.AutoHashMap(u32, WsSendEntry) = null;
+/// 指向 state.ws_registry，类型为 Unmanaged（01 §1.2）
+var g_ws_send_registry: ?*std.AutoHashMapUnmanaged(u32, WsSendEntry) = null;
 var g_next_ws_id: u32 = 0;
 
 /// 当前运行中的 server 实例（非阻塞模式下单例），供 tick 与 stop/reload/restart 回调访问
@@ -146,17 +148,21 @@ fn wsWriteTls(ctx: *anyopaque, data: []const u8) void {
     const s: *tls.TlsStream = @ptrCast(@alignCast(ctx));
     s.writeAll(data) catch {};
 }
-fn wsReadNet(ctx: *anyopaque, buf: []u8) usize {
+/// 00 §1.6：buf 为 64 字节对齐；调用 stream.read 时转为 []u8 以匹配 std.Io 接口
+fn wsReadNet(ctx: *anyopaque, buf: []align(64) u8) usize {
     const s: *const std.Io.net.Stream = @ptrCast(@alignCast(ctx));
     const io = libs_process.getProcessIo() orelse return 0;
+    const as_u8: []u8 = @as([*]u8, @ptrCast(buf.ptr))[0..buf.len];
     var rbuf: [4096]u8 = undefined;
     var r = s.reader(io, &rbuf);
-    var dest = [1][]u8{buf};
+    var dest = [1][]u8{as_u8};
     return std.Io.Reader.readVec(&r.interface, &dest) catch 0;
 }
-fn wsReadTls(ctx: *anyopaque, buf: []u8) usize {
+/// 00 §1.6：buf 为 64 字节对齐；调用 s.read 时转为 []u8 以匹配 TlsStream 接口
+fn wsReadTls(ctx: *anyopaque, buf: []align(64) u8) usize {
     const s: *tls.TlsStream = @ptrCast(@alignCast(ctx));
-    return s.read(buf) catch 0;
+    const as_u8: []u8 = @as([*]u8, @ptrCast(buf.ptr))[0..buf.len];
+    return s.read(as_u8) catch 0;
 }
 
 /// 返回 server 模块的 exports 对象（供 require("shu:server") 等使用；若 builtin 未注册 shu:server 则仅作统一导出形态）
@@ -260,6 +266,8 @@ fn serverCallback(
     var max_completions_u = options.getOptionalNumber(ctx, options_obj, "maxCompletions", @intCast(DEFAULT_MAX_COMPLETIONS));
     if (max_completions_u == 0) max_completions_u = @intCast(DEFAULT_MAX_COMPLETIONS);
     const max_completions = options.clampSize(max_completions_u, 64, 5120);
+    const linux_sq_cpu = options.getOptionalNumberOptional(ctx, options_obj, "linuxSqThreadCpu");
+    const use_huge_pages = options.getOptionalBoolDefault(ctx, options_obj, "useHugePages", false);
     const config = ServerConfig{
         .keep_alive_timeout_sec = keep_alive_timeout_sec,
         .chunked_response_threshold = chunked_response_threshold,
@@ -279,6 +287,8 @@ fn serverCallback(
         .ws_max_payload_size = if (ws_payload_sz == 0) DEFAULT_WS_MAX_PAYLOAD_SIZE else ws_payload_sz,
         .ws_frame_buffer_size = if (ws_frame_sz == 0) DEFAULT_WS_FRAME_BUFFER_SIZE else ws_frame_sz,
         .io_core_poll_idle_ms = @as(i64, @intCast(options.getOptionalNumber(ctx, options_obj, "pollIdleMs", 100))),
+        .linux_sq_thread_cpu = linux_sq_cpu,
+        .use_huge_pages = use_huge_pages,
     };
 
     // 可选：options.onError(err) 在 handler 抛错或返回无效响应时调用，与 onListen 命名一致；开发时错误页可由 onError 返回自定义 Response 实现
@@ -305,16 +315,24 @@ fn serverCallback(
         return jsc.JSValueMakeUndefined(ctx);
     }
 
-    // options.workers：cluster 模式时主进程 fork 若干 worker，各 worker 同端口 listen（需 --allow-run）
-    var workers_u = options.getOptionalNumber(ctx, options_obj, "workers", 1);
+    // options.workers：未设置时默认按 CPU 核数开多进程（方案 B）；上限为 min(核数×倍数, 绝对上限)，不写死
+    const cpu_count: u32 = @intCast(std.Thread.getCpuCount() catch 1);
+    var workers_u = options.getOptionalNumber(ctx, options_obj, "workers", 0);
+    if (workers_u == 0) workers_u = cpu_count;
     if (workers_u < 1) workers_u = 1;
-    if (workers_u > 64) workers_u = 64;
+    const max_workers = @min(cpu_count * constants.WORKERS_MAX_MULTIPLIER, constants.WORKERS_ABSOLUTE_MAX);
+    if (workers_u > max_workers) workers_u = max_workers;
     const workers: usize = workers_u;
     const is_cluster_worker = (std.c.getenv("SHU_CLUSTER_WORKER") != null);
     const is_cluster_master = (workers > 1 and !is_cluster_worker and opts.permissions.allow_run);
 
+    // options.ioThreads：Thread-per-Core 单进程内 I/O 线程数；1=当前单线程 tick（默认），>1 时 N 环 + 无锁 Ring 投递（见 io_threads.zig）
+    var io_threads_u = options.getOptionalNumber(ctx, options_obj, "ioThreads", 1);
+    if (io_threads_u < 1) io_threads_u = 1;
+    if (io_threads_u > constants.MAX_IO_THREADS) io_threads_u = constants.MAX_IO_THREADS;
+    const io_threads: u32 = io_threads_u;
+
     const ws_options = options.getOptionalWebSocket(ctx, options_obj);
-    const ws_registry = std.AutoHashMap(u32, WsSendEntry).init(allocator);
     const signal_ref = options.getOptionalAbortSignal(ctx, options_obj);
 
     const use_unix = (unix_path != null and unix_path.?.len > 0);
@@ -372,13 +390,14 @@ fn serverCallback(
             var num_buf: [16]u8 = undefined;
             const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{i + 1}) catch return jsc.JSValueMakeUndefined(ctx);
             env.put("SHU_CLUSTER_WORKER", num_str) catch return jsc.JSValueMakeUndefined(ctx);
+            // worker 不继承 stdout/stderr，终端只显示主进程的一次打印，与 bun/deno 行为一致
             var child = std.process.spawn(proc_io, .{
                 .argv = argv_dup,
                 .cwd = .inherit,
                 .environ_map = &env,
                 .stdin = .inherit,
-                .stdout = .inherit,
-                .stderr = .inherit,
+                .stdout = .ignore,
+                .stderr = .ignore,
             }) catch {
                 for (pids[0..i]) |pid| std.posix.kill(pid, std.posix.SIG.TERM) catch {};
                 allocator.free(pids);
@@ -422,15 +441,22 @@ fn serverCallback(
                 errors.reportToStderr(.{ .code = .unknown, .message = msg }) catch {};
                 return jsc.JSValueMakeUndefined(ctx);
             };
-            server = std.Io.net.IpAddress.listen(addr, proc_io, .{ .kernel_backlog = @as(u31, @intCast(config.listen_backlog)) }) catch |e| {
-                var msg_buf: [128]u8 = undefined;
-                const msg = std.fmt.bufPrint(&msg_buf, "Shu.server listen failed: {s}", .{@errorName(e)}) catch "Shu.server listen failed";
-                errors.reportToStderr(.{ .code = .unknown, .message = msg }) catch {};
-                return jsc.JSValueMakeUndefined(ctx);
-            };
+            // io_threads > 1 时由 io_threads.init 创建 N 个 SO_REUSEPORT listen fd，此处不建单 listen（仅 Linux/macOS TCP）
+            if (io_threads <= 1 or builtin.os.tag == .windows) {
+                const tcp_listen_opts = std.Io.net.IpAddress.ListenOptions{
+                    .kernel_backlog = @as(u31, @intCast(config.listen_backlog)),
+                    .reuse_address = is_cluster_worker,
+                };
+                server = std.Io.net.IpAddress.listen(addr, proc_io, tcp_listen_opts) catch |e| {
+                    var msg_buf: [128]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&msg_buf, "Shu.server listen failed: {s}", .{@errorName(e)}) catch "Shu.server listen failed";
+                    errors.reportToStderr(.{ .code = .unknown, .message = msg }) catch {};
+                    return jsc.JSValueMakeUndefined(ctx);
+                };
+            }
         }
 
-        // reusePort 选项仅作 API 兼容；listen 已使用 reuse_address 与 kernel_backlog
+        // reusePort 选项仅作 API 兼容；cluster 时已通过 reuse_address（SO_REUSEPORT）实现同端口多进程
         _ = options.getOptionalBool(ctx, options_obj, "reusePort");
 
         // 若有 options.onListen，在 listen 成功后调用一次
@@ -465,7 +491,7 @@ fn serverCallback(
         .compression_enabled = compression_enabled,
         .error_callback = error_callback,
         .ws_options = ws_options,
-        .ws_registry = ws_registry,
+        .ws_registry = .{},
         .next_ws_id = g_next_ws_id,
         .tls_ctx = tls_ctx,
         .run_loop_every = @intCast(run_loop_every),
@@ -474,10 +500,12 @@ fn serverCallback(
         .last_run_loop_ms = 0,
         .signal_ref = signal_ref,
         .plain_mux = PlainMuxState.init(allocator, config.max_connections) catch return jsc.JSValueMakeUndefined(ctx),
+        .io_threads = io_threads,
+        .io_threads_ctx = null,
     };
     if (build_options.have_tls and state.tls_ctx != null) {
-        state.tls_pending = std.AutoHashMap(usize, TlsPendingEntry).init(allocator);
-        state.tls_conns = std.AutoHashMap(usize, TlsConnState).init(allocator);
+        state.tls_pending = .{};
+        state.tls_conns = .{};
         state.tls_poll_fds = state.allocator.alloc(std.posix.pollfd, 1 + state.plain_mux.max_conns) catch return jsc.JSValueMakeUndefined(ctx);
         state.tls_poll_client_fds = state.allocator.alloc(usize, state.plain_mux.max_conns) catch {
             state.allocator.free(state.tls_poll_fds.?);
@@ -492,7 +520,13 @@ fn serverCallback(
     // 有 listen socket 时即创建 io_core（TCP 与 Unix）：明文连接 I/O 全部走 io_core，便于统一维护与优化
     if (state.server != null) {
         const pool_size = config.max_connections * (64 * 1024);
-        state.buffer_pool = libs_io.api.BufferPool.allocAligned(state.allocator, pool_size) catch return jsc.JSValueMakeUndefined(ctx);
+        // Linux 下可选大页池（00 §4.2）；失败时回退到普通对齐分配
+        if (builtin.os.tag == .linux and config.use_huge_pages) {
+            state.buffer_pool = libs_io.api.BufferPool.allocHugePages(state.allocator, pool_size) catch
+                libs_io.api.BufferPool.allocAligned(state.allocator, pool_size) catch return jsc.JSValueMakeUndefined(ctx);
+        } else {
+            state.buffer_pool = libs_io.api.BufferPool.allocAligned(state.allocator, pool_size) catch return jsc.JSValueMakeUndefined(ctx);
+        }
         const hio = state.allocator.create(libs_io.HighPerfIO) catch {
             state.buffer_pool.?.deinit();
             state.buffer_pool = null;
@@ -501,6 +535,7 @@ fn serverCallback(
         hio.* = libs_io.HighPerfIO.init(state.allocator, .{
             .max_connections = config.max_connections,
             .max_completions = config.max_completions,
+            .linux_sq_thread_cpu = config.linux_sq_thread_cpu,
         }) catch {
             state.allocator.destroy(hio);
             state.buffer_pool.?.deinit();
@@ -509,12 +544,35 @@ fn serverCallback(
         };
         state.high_perf_io = hio;
         state.high_perf_io.?.registerBufferPool(&state.buffer_pool.?);
+        // NUMA：00 §4.2 多路服务器将 buffer 池绑定到当前 CPU 所在节点，可降约 30% 内存延迟；仅页对齐时生效
+        if (state.buffer_pool) |*pool| {
+            const s = pool.slice();
+            const page = std.heap.page_size_min;
+            if (@intFromPtr(s.ptr) % page == 0 and s.len % page == 0) {
+                const ptr_page = @as([*]align(std.heap.page_size_min) const u8, @alignCast(s.ptr));
+                libs_io.mbindToCurrentNode(ptr_page, s.len);
+            }
+        }
         if (builtin.os.tag == .windows) {
             state.high_perf_io.?.registerListenSocket(@ptrCast(state.server.?.stream.handle));
         }
     }
     if (!use_unix) @memcpy(state.host_buf[0..host_len], host_slice[0..host_len]);
     if (use_unix) @memcpy(state.unix_path_buf[0..unix_path_len], unix_path.?[0..unix_path_len]);
+
+    // Thread-per-Core：无单 listen 且 io_threads > 1 且 TCP 且非 Windows 时，由 io_threads 创建 N 环与 listen fd
+    if (state.server == null and state.io_threads > 1 and !state.use_unix and builtin.os.tag != .windows) {
+        const root = io_threads_mod.init(state.allocator, state, state.io_threads, state.host_buf[0..state.host_len], state.port) catch |e| {
+            var msg_buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "Shu.server io_threads.init failed: {s}", .{@errorName(e)}) catch "Shu.server io_threads.init failed";
+            errors.reportToStderr(.{ .code = .unknown, .message = msg }) catch {};
+            state.plain_mux.deinit();
+            state.allocator.destroy(state);
+            g_server_state = null;
+            return jsc.JSValueMakeUndefined(ctx);
+        };
+        if (root) |r| state.io_threads_ctx = @ptrCast(r);
+    }
 
     // options.server：自定义 Server 头值（如 "Shu/1.0"），由 state 持有，cleanup 时释放
     var server_opt_buf: [256]u8 = undefined;
@@ -599,6 +657,8 @@ fn updateStateFromOptions(ctx: jsc.JSContextRef, options_obj: jsc.JSObjectRef, s
     state.config.ws_frame_buffer_size = options.clampSize(options.getOptionalNumberFromWebSocket(ctx, options_obj, "frameBufferSize", @intCast(DEFAULT_WS_FRAME_BUFFER_SIZE)), 4096, 512 * 1024);
     if (state.config.ws_frame_buffer_size == 0) state.config.ws_frame_buffer_size = DEFAULT_WS_FRAME_BUFFER_SIZE;
     state.config.io_core_poll_idle_ms = @as(i64, @intCast(options.getOptionalNumber(ctx, options_obj, "pollIdleMs", 100)));
+    state.config.linux_sq_thread_cpu = options.getOptionalNumberOptional(ctx, options_obj, "linuxSqThreadCpu");
+    state.config.use_huge_pages = options.getOptionalBoolDefault(ctx, options_obj, "useHugePages", false);
     // 自适应 poll 超时：reload 后有效值不得超过新上限
     if (state.config.io_core_poll_idle_ms >= 0 and state.poll_idle_effective_ms > state.config.io_core_poll_idle_ms) {
         state.poll_idle_effective_ms = state.config.io_core_poll_idle_ms;
@@ -637,6 +697,10 @@ fn serverStateCleanup(ctx: jsc.JSContextRef, state: *ServerState) void {
         pool.deinit();
         state.buffer_pool = null;
     }
+    if (state.io_threads_ctx) |threads_ctx| {
+        io_threads_mod.deinit(@ptrCast(@alignCast(threads_ctx)));
+        state.io_threads_ctx = null;
+    }
     if (state.server) |*srv| {
         if (libs_process.getProcessIo()) |io| srv.deinit(io);
     }
@@ -661,16 +725,16 @@ fn serverStateCleanup(ctx: jsc.JSContextRef, state: *ServerState) void {
             e.value_ptr.pending.free();
             if (io_opt) |i| e.value_ptr.stream.close(i);
         }
-        state.tls_pending.?.deinit();
+        state.tls_pending.?.deinit(state.allocator);
         if (state.tls_conns != null) {
             var it_conn = state.tls_conns.?.iterator();
             while (it_conn.next()) |e| e.value_ptr.deinit(state.allocator, true);
-            state.tls_conns.?.deinit();
+            state.tls_conns.?.deinit(state.allocator);
         }
         if (state.tls_poll_fds) |p| state.allocator.free(p);
         if (state.tls_poll_client_fds) |c| state.allocator.free(c);
     }
-    state.ws_registry.deinit();
+    state.ws_registry.deinit(state.allocator);
     state.plain_mux.deinit();
     if (state.server_header_owned) |s| state.allocator.free(s);
     state.allocator.destroy(state);
@@ -695,6 +759,16 @@ fn doListen(state: *ServerState) !void {
             return e;
         };
     } else {
+        if (state.io_threads > 1 and builtin.os.tag != .windows) {
+            const root = io_threads_mod.init(state.allocator, state, state.io_threads, state.host_buf[0..state.host_len], state.port) catch |e| {
+                var msg_buf: [128]u8 = undefined;
+                const msg = std.fmt.bufPrint(&msg_buf, "Shu.server restart io_threads.init failed: {s}", .{@errorName(e)}) catch "restart io_threads.init failed";
+                errors.reportToStderr(.{ .code = .unknown, .message = msg }) catch {};
+                return e;
+            };
+            if (root) |r| state.io_threads_ctx = @ptrCast(r);
+            return;
+        }
         var addr_buf: [256]u8 = undefined;
         const host_slice = state.host_buf[0..state.host_len];
         const host_z = std.fmt.bufPrintZ(&addr_buf, "{s}", .{host_slice}) catch return error.RestartListenFailed;
@@ -840,10 +914,33 @@ fn makeListenInfoObject(ctx: jsc.JSContextRef, allocator: std.mem.Allocator, por
     return info;
 }
 
-/// WebSocket onMessage 回调的上下文：runFrameLoop 收到 payload 后调 JS onMessage(ws_obj, data)
+/// WebSocket onMessage 回调的上下文：runFrameLoop/stepFrames 收到 (opcode, payload) 后调 JS onMessage(ws_obj, data)
 const WsMessageCbContext = struct { jsc_ctx: jsc.JSContextRef, ws_obj: jsc.JSObjectRef, on_message_fn: jsc.JSValueRef };
-fn wsOnMessageCallback(ctx: *anyopaque, payload: []const u8) void {
+
+/// JSC 回收 NoCopy TypedArray 时调用的空实现；payload 来自 frame_buf，由 runFrameLoop 复用，不释放
+fn wsNoOpDeallocator(_: *anyopaque, _: ?*anyopaque) callconv(.c) void {}
+
+/// 收到 text/binary 帧时调用：binary 零拷贝传 Uint8Array，text 一次拷贝转 UTF-8 字符串；生命周期约定见注释
+fn wsOnMessageCallback(ctx: *anyopaque, opcode: ws_mod.Opcode, payload: []const u8) void {
     const c: *const WsMessageCbContext = @ptrCast(@alignCast(ctx));
+    if (opcode == .binary) {
+        // 00 §1.6：payload 指向 frame_buf，回调返回后才会 compact，故可 NoCopy 交给 JS；GC 时用 no-op 释放
+        var exc: jsc.JSValueRef = undefined;
+        const arr = jsc.JSObjectMakeTypedArrayWithBytesNoCopy(
+            c.jsc_ctx,
+            .Uint8Array,
+            @ptrCast(@constCast(payload.ptr)),
+            payload.len,
+            wsNoOpDeallocator,
+            null,
+            @ptrCast(&exc),
+        );
+        if (arr == null) return;
+        const args = [_]jsc.JSValueRef{ c.ws_obj, arr.? };
+        _ = jsc.JSObjectCallAsFunction(c.jsc_ctx, @ptrCast(c.on_message_fn), null, 2, &args, null);
+        return;
+    }
+    // text：JSC 需 null 结尾，一次拷贝到栈上并转字符串
     var buf: [65536]u8 = undefined;
     if (payload.len >= buf.len) return;
     @memcpy(buf[0..payload.len], payload);
@@ -935,9 +1032,9 @@ fn makeWebSocketObject(ctx: jsc.JSContextRef, ws_id: u32) ?jsc.JSObjectRef {
     return ws_obj;
 }
 
-/// sendH2ResponseToBuffer 的 void 包装，供 step_plain 回调使用
+/// sendH2ResponseToBuffer 的 void 包装，供 step_plain 回调使用（01 §1.2 Unmanaged）
 fn sendH2ResponseToBufferVoid(
-    write_buf: *std.ArrayList(u8),
+    write_buf: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,
     ctx: jsc.JSContextRef,
     stream_id: u31,
@@ -985,16 +1082,18 @@ fn handleConnectionPlain(
     compression_enabled: bool,
     error_callback: ?jsc.JSValueRef,
     ws_options: ?WsOptions,
-    ws_registry: *std.AutoHashMap(u32, WsSendEntry),
+    ws_registry: *std.AutoHashMapUnmanaged(u32, WsSendEntry),
     next_ws_id: *u32,
     initial_data: ?[]const u8,
 ) !u32 {
-    const read_buf = allocator.alloc(u8, 64 * 1024) catch return 0;
+    // 00 §1.6：读缓冲 64 字节对齐，供 parse/indexOfCrLfCrLf 与压缩路径
+    // 00 §1.6 Lane 填充：多分配 64 字节供 parse 传 padded 切片
+    const read_buf = allocator.alignedAlloc(u8, .@"64", 64 * 1024 + 64) catch return 0;
     defer allocator.free(read_buf);
     var response_ct_buf: [1024]u8 = undefined;
-    const response_body_buf = allocator.alloc(u8, connection.RESPONSE_BODY_BUF_SIZE) catch return 0;
+    const response_body_buf = allocator.alignedAlloc(u8, .@"64", connection.RESPONSE_BODY_BUF_SIZE) catch return 0;
     defer allocator.free(response_body_buf);
-    var header_list = std.ArrayList(u8).initCapacity(allocator, 4096) catch return 0;
+    var header_list = std.ArrayListUnmanaged(u8).initCapacity(allocator, 4096) catch return 0;
     defer header_list.deinit(allocator);
     var count: u32 = 0;
     var first_round = true;
@@ -1024,7 +1123,7 @@ fn handleConnectionPlain(
                 var net_adapter = connection.NetStreamAdapter{ .stream = stream, .io = io };
                 const nr = net_adapter.read(read_buf[0..24]) catch return count;
                 if (nr < 24) return count;
-                if (std.mem.eql(u8, read_buf[0..24], http2.CLIENT_PREFACE)) {
+                if (http2.eqlClientPreface(read_buf[0..24])) {
                     return connection.handleH2Connection(allocator, ctx, &net_adapter, handler_fn, config, compression_enabled, error_callback, true);
                 }
                 var pre_reader = connection.PreReadReader(connection.NetStreamAdapter){ .prefix = read_buf[0..24], .consumed = 0, .stream = &net_adapter };
@@ -1070,15 +1169,15 @@ fn handleConnectionPlain(
             const ws_id = next_ws_id.*;
             next_ws_id.* += 1;
             const write_entry: WsSendEntry = .{ .blocking = .{ .write_fn = wsWriteNet, .ctx = @ptrCast(@constCast(stream)) } };
-            ws_registry.put(ws_id, write_entry) catch return count;
-            defer _ = ws_registry.remove(ws_id);
+            ws_registry.put(allocator, ws_id, write_entry) catch return count;
+            defer _ = ws_registry.fetchRemove(ws_id);
             const ws_obj = makeWebSocketObject(ctx, ws_id) orelse return count;
             const opts = ws_options.?;
             if (opts.on_open) |on_open_fn| {
                 const args = [_]jsc.JSValueRef{ws_obj};
                 _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(on_open_fn), null, 1, &args, null);
             }
-            const frame_buf = allocator.alloc(u8, config.ws_frame_buffer_size) catch return count;
+            const frame_buf = allocator.alignedAlloc(u8, .@"64", config.ws_frame_buffer_size) catch return count;
             defer allocator.free(frame_buf);
             const reader: ws_mod.Reader = .{ .ctx = @ptrCast(@constCast(stream)), .read_fn = wsReadNet };
             const writer: ws_mod.Writer = .{ .ctx = @ptrCast(@constCast(stream)), .send_fn = wsWriteNet };
@@ -1157,17 +1256,19 @@ fn handleConnection(
     compression_enabled: bool,
     error_callback: ?jsc.JSValueRef,
     ws_options: ?WsOptions,
-    ws_registry: *std.AutoHashMap(u32, WsSendEntry),
+    ws_registry: *std.AutoHashMapUnmanaged(u32, WsSendEntry),
     next_ws_id: *u32,
 ) !u32 {
     // 连接内复用的读 buffer（规范 §1.2 禁止栈上 64KB，改为堆分配）
-    const read_buf = allocator.alloc(u8, 64 * 1024) catch return 0;
+    // 00 §1.6：读缓冲 64 字节对齐，供 parse/indexOfCrLfCrLf 与压缩路径
+    // 00 §1.6 Lane 填充：多分配 64 字节供 parse 传 padded 切片
+    const read_buf = allocator.alignedAlloc(u8, .@"64", 64 * 1024 + 64) catch return 0;
     defer allocator.free(read_buf);
     var response_ct_buf: [1024]u8 = undefined;
-    const response_body_buf = allocator.alloc(u8, connection.RESPONSE_BODY_BUF_SIZE) catch return 0;
+    const response_body_buf = allocator.alignedAlloc(u8, .@"64", connection.RESPONSE_BODY_BUF_SIZE) catch return 0;
     defer allocator.free(response_body_buf);
-    // keep-alive 连接上复用响应头 buffer，减少每请求 ArrayList 分配
-    var header_list = std.ArrayList(u8).initCapacity(allocator, 4096) catch return 0;
+    // keep-alive 连接上复用响应头 buffer，减少每请求分配（01 §1.2 Unmanaged）
+    var header_list = std.ArrayListUnmanaged(u8).initCapacity(allocator, 4096) catch return 0;
     defer header_list.deinit(allocator);
 
     var count: u32 = 0;
@@ -1208,8 +1309,8 @@ fn handleConnection(
             } else .{
                 .blocking = .{ .write_fn = wsWriteTls, .ctx = @ptrCast(@constCast(stream)) },
             };
-            ws_registry.put(ws_id, write_entry) catch return count;
-            defer _ = ws_registry.remove(ws_id);
+            ws_registry.put(allocator, ws_id, write_entry) catch return count;
+            defer _ = ws_registry.fetchRemove(ws_id);
 
             const ws_obj = makeWebSocketObject(ctx, ws_id) orelse return count;
             const opts = ws_options.?;
@@ -1217,7 +1318,7 @@ fn handleConnection(
                 const args = [_]jsc.JSValueRef{ws_obj};
                 _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(on_open_fn), null, 1, &args, null);
             }
-            const frame_buf = allocator.alloc(u8, config.ws_frame_buffer_size) catch return count;
+            const frame_buf = allocator.alignedAlloc(u8, .@"64", config.ws_frame_buffer_size) catch return count;
             defer allocator.free(frame_buf);
             const reader: ws_mod.Reader = if (@TypeOf(stream) == *const std.Io.net.Stream)
                 .{ .ctx = @ptrCast(@constCast(stream)), .read_fn = wsReadNet }
