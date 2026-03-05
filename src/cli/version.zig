@@ -1,7 +1,7 @@
 //! 版本号与打印（cli/version.zig）
 //!
 //! 职责
-//!   - 定义当前 shu 版本号常量 VERSION（占位 "0.1.0"，后续可由 build.zig 注入）。
+//!   - 从 build_options 暴露当前 shu 版本号 VERSION（由 build.zig 注入，发布时只改 build.zig 一处）。
 //!   - 提供 printVersion()：将 "shu <version>\n" 打印到 stdout，供子命令 version 或全局 -v/--version 使用。
 //!
 //! 主要 API
@@ -11,9 +11,10 @@
 //! 参考：README.md ⌨️ CLI 实用命令分析 P0
 
 const std = @import("std");
+const build_options = @import("build_options");
 
-/// 当前 shu 版本号（占位，后续可由 build.zig 注入）；供 help.zig 等引用
-pub const VERSION = "0.1.0";
+/// 当前 shu 版本号（由 build.zig 注入）；供 help.zig 等引用。发布时只改 build.zig 内 shu_version。
+pub const VERSION: []const u8 = build_options.version;
 
 /// 打印版本号到 stdout，供子命令 version 或全局 -v/--version 使用。Zig 0.16：使用 std.Io。
 pub fn printVersion(io: std.Io) !void {

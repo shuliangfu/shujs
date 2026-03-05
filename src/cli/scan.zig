@@ -2,7 +2,7 @@
 //!
 //! 职责
 //!   - 从给定根目录递归遍历，收集扩展名匹配的文件相对路径，跳过 default_exclude_dirs（node_modules、.git、dist、build 等，与 deno/npm 惯例一致）。
-//!   - 供 test、fmt、lint 的默认行为使用：test 扫描 tests/ 下 test/spec 文件，fmt/lint 扫描全项目对应扩展名。
+//!   - 供 test、fmt、lint 的默认行为使用：test 从项目根递归扫描 test/spec 文件（排除 default_exclude_dirs），fmt/lint 扫描全项目对应扩展名。
 //!
 //! 主要 API
 //!   - default_exclude_dirs：默认排除的目录名列表；isExcludedDir(name) 判断是否排除。
@@ -109,14 +109,44 @@ pub fn collectFilesRecursive(
     return list;
 }
 
-/// 默认 test 使用的扩展名：*.test.ts, *.test.js, *.spec.ts, *.spec.js
-pub const test_extensions = [_][]const u8{ ".test.ts", ".test.js", ".spec.ts", ".spec.js" };
+/// 默认 test 使用的扩展名：*.test.ts, *.test.js, *.test.tsx, *.test.jsx, *.spec.ts, *.spec.js, *.spec.tsx, *.spec.jsx
+pub const test_extensions = [_][]const u8{
+    ".test.ts",
+    ".test.js",
+    ".test.tsx",
+    ".test.jsx",
+    ".spec.ts",
+    ".spec.js",
+    ".spec.tsx",
+    ".spec.jsx",
+};
 
 /// 默认 fmt 使用的扩展名：.ts, .tsx, .js, .jsx, .mjs, .cjs, .json, .jsonc, .md, .mdc, .zig（暂不含 .c/.h）
-pub const fmt_extensions = [_][]const u8{ ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".jsonc", ".md", ".mdc", ".zig" };
+pub const fmt_extensions = [_][]const u8{
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".cjs",
+    ".json",
+    ".jsonc",
+    ".md",
+    ".mdc",
+    ".zig",
+};
 
 /// 默认 lint 使用的扩展名：JS/TS/JSON（暂不含 .zig/.c/.h）；.md/.mdc 需传 --md 时再检查
-pub const lint_extensions = [_][]const u8{ ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".jsonc" };
+pub const lint_extensions = [_][]const u8{
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".cjs",
+    ".json",
+    ".jsonc",
+};
 
 /// 启用 --md 时额外收集的扩展名，用于 markdown 语法检查
 pub const lint_md_extensions = [_][]const u8{ ".md", ".mdc" };

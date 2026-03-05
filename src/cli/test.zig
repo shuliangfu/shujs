@@ -2,13 +2,14 @@
 //!
 //! 职责
 //!   - 有 scripts.test 时：用 shell 执行该脚本（runScriptInCwd）。
-//!   - 无 script 时：默认扫描 tests/ 下 *.test.ts、*.test.js、*.spec.ts、*.spec.js（排除 scan.default_exclude_dirs），对每个文件执行 shu run；无 package.json 时仍可走默认扫描。
-//!   - 多文件时按「测试文件路径字母序」依次执行，保证顺序与文件管理器中一致且可复现（如先 example-mock.test.js，再 example.test.js）。
-//!   - 默认**按 CPU 核心数并发**执行多测试文件；需顺序执行时传 **--jobs=1**。支持 **--jobs=N** 覆盖并发数，上限 64。
+//!   - 无 script 时：默认从当前目录递归扫描全项目下 *.test.js/ts/jsx/tsx、*.spec.js/ts/jsx/tsx（排除 scan.default_exclude_dirs：node_modules、.git、dist、build 等），对每个文件执行 shu run；无 package.json 时仍可走默认扫描。
+//!   - 多文件时按「测试文件路径字母序」依次执行，保证顺序与文件管理器中一致且可复现。
+//!   - 默认**单文件顺序**执行（--jobs=1），避免多进程并发时输出交错；需多文件并发时传 **--jobs=N**（上限 64，如 --jobs=4）。
 //!   - **--filter=pattern** / **--filter pattern**：仅运行路径中包含 pattern 的测试文件，便于开发时只跑部分用例。
+//!   - 有 package.json/deno.json 时：**test.include**（glob，如 **/*.test.js）与 **test.exclude**（路径列表）会过滤扫描到的文件；无 include/exclude 时行为不变。
 //!
 //! 主要 API
-//!   - runTest(allocator, parsed, positional)：入口；无 tests/ 或无可匹配文件时给出英文提示。
+//!   - runTest(allocator, parsed, positional)：入口；无可匹配文件时给出英文提示。
 //!
 //! 约定
 //!   - 目录遍历与路径经 io_core；面向用户输出为英文；与 PACKAGE_DESIGN.md test 配置、deno test 对齐。
@@ -21,6 +22,7 @@ const libs_io = @import("libs_io");
 const libs_process = @import("libs_process");
 const manifest = @import("../package/manifest.zig");
 const scan = @import("scan.zig");
+const cli_help = @import("help.zig");
 
 /// 测试子命令的选项：用于 --bail、--shard、--test-name-pattern 等。字符串字段 [Allocates]，调用方负责 free。
 pub const TestOptions = struct {
@@ -93,7 +95,7 @@ fn parseTestFilter(allocator: std.mem.Allocator, positional: []const []const u8)
     return null;
 }
 
-/// 从 test 子命令的 positional 中解析 --jobs=N 或 --jobs N。未指定时返回 null（调用方用 CPU 核心数）；指定时返回 N（上限 64）。
+/// 从 test 子命令的 positional 中解析 --jobs=N 或 --jobs N。未指定时返回 null（调用方用默认 1，即单文件顺序）；指定时返回 N（上限 64）。
 fn parseTestJobs(positional: []const []const u8) ?u32 {
     var i: usize = 0;
     while (i < positional.len) : (i += 1) {
@@ -374,7 +376,7 @@ fn optionTakesNextArg(arg: []const u8) bool {
     return false;
 }
 
-/// [Allocates] 从 positional 解析「仅跑这些文件」：非选项且非选项值的参数视为文件路径。无则返回 null；有则返回列表，每项为 run_path 形式（如 tests/foo.test.js），调用方逐项 free 并 list.deinit。
+/// [Allocates] 从 positional 解析「仅跑这些文件」：非选项且非选项值的参数视为文件路径。无则返回 null；有则返回列表，每项为相对项目根的 run_path（如 tests/foo.test.js、src/bar.test.ts），调用方逐项 free 并 list.deinit。
 fn parsePositionalTestFiles(allocator: std.mem.Allocator, positional: []const []const u8) ?std.ArrayList([]const u8) {
     var list = std.ArrayList([]const u8).initCapacity(allocator, 0) catch return null;
     var i: usize = 0;
@@ -391,10 +393,9 @@ fn parsePositionalTestFiles(allocator: std.mem.Allocator, positional: []const []
             }
             continue;
         }
-        const run_path = if (std.mem.startsWith(u8, arg, "tests/"))
-            allocator.dupe(u8, arg) catch continue
-        else
-            libs_io.pathJoin(allocator, &.{ "tests", arg }) catch continue;
+        // 去掉前导 ./ 得到相对项目根路径，其余原样（可任意目录下的 test 文件）
+        const raw = if (std.mem.startsWith(u8, arg, "./")) arg[2..] else arg;
+        const run_path = allocator.dupe(u8, raw) catch continue;
         list.append(allocator, run_path) catch {
             allocator.free(run_path);
             continue;
@@ -430,10 +431,40 @@ fn parseTestOptions(allocator: std.mem.Allocator, positional: []const []const u8
     };
 }
 
-/// 执行 shu test：有 scripts.test 则用 shell 执行；否则默认扫描 tests/ 下 *.test.ts、*.test.js、*.spec.ts、*.spec.js（排除 default_exclude_dirs），对每个文件执行 shu run。
-/// 支持 positional 中的 --jobs=N 以并行执行多测试文件。
+/// 打印 shu test 子命令帮助（Usage + Options）；供 main 在 shu test --help / -h 时调用。输出为英文；TTY 下与全局 help 一致使用 ANSI 颜色（青/黄/灰）。
+pub fn printTestHelp(io: std.Io) !void {
+    var buf: [512]u8 = undefined;
+    var w = std.Io.File.Writer.init(std.Io.File.stdout(), io, &buf);
+    const out = &w.interface;
+    const sgr = cli_help.getHelpSgr();
+
+    try out.print("{s}Discover and run tests.{s}\n\n", .{ sgr.dim, sgr.reset });
+    try out.print("{s}Usage{s}: {s}shu test [OPTIONS] [files...]{s}\n\n", .{ sgr.cyan, sgr.reset, sgr.dim, sgr.reset });
+    try out.print("  {s}By default scans all directories for *.test.js/ts/jsx/tsx, *.spec.js/ts/jsx/tsx (excludes node_modules, .git, dist, build, etc.).{s}\n", .{ sgr.dim, sgr.reset });
+    try out.print("  {s}Respects package.json / deno.json \"test\".include and \"test\".exclude when present.{s}\n\n", .{ sgr.dim, sgr.reset });
+    try out.print("{s}Options{s}:\n", .{ sgr.cyan, sgr.reset });
+    try out.print("  {s}--jobs=N{s}              Run N test files in parallel (default: 1). Use --jobs=1 for sequential output.\n", .{ sgr.yellow, sgr.reset });
+    try out.print("  {s}--filter=PATTERN{s}      Only run files whose path contains PATTERN.\n", .{ sgr.yellow, sgr.reset });
+    try out.print("  {s}--test-name-pattern, -t{s}  Only run tests whose full name contains the given substring.\n", .{ sgr.yellow, sgr.reset });
+    try out.print("  {s}--test-skip-pattern{s}  Skip tests whose full name contains the given substring.\n", .{ sgr.yellow, sgr.reset });
+    try out.print("  {s}--bail, --fail-fast{s}  Stop after first failure.\n", .{ sgr.yellow, sgr.reset });
+    try out.print("  {s}--shard=INDEX/TOTAL{s}   Run only the INDEX-th shard of TOTAL (for CI).\n", .{ sgr.yellow, sgr.reset });
+    try out.print("  {s}--timeout=N{s}          Default test timeout in milliseconds.\n", .{ sgr.yellow, sgr.reset });
+    try out.print("  {s}--retry=N{s}            Retry failed tests N times.\n", .{ sgr.yellow, sgr.reset });
+    try out.print("  {s}--reporter=TYPE{s}      Reporter type (e.g. junit).\n", .{ sgr.yellow, sgr.reset });
+    try out.print("  {s}--reporter-outfile=PATH{s}  Write reporter output to PATH.\n", .{ sgr.yellow, sgr.reset });
+    try out.print("  {s}--preload=PATH{s}       Require PATH before each test file.\n", .{ sgr.yellow, sgr.reset });
+    try out.print("  {s}--update-snapshots{s}   Update snapshot files.\n", .{ sgr.yellow, sgr.reset });
+    try out.print("  {s}--todo{s}               Run only it.todo / test.todo tests.\n\n", .{ sgr.yellow, sgr.reset });
+    try out.print("{s}Global options{s}: {s}--allow-all (-A), --allow-net, --allow-read, --allow-env, --allow-write, --allow-run, etc.{s}\n\n", .{ sgr.cyan, sgr.reset, sgr.dim, sgr.reset });
+    w.flush() catch {};
+}
+
+/// 执行 shu test：有 scripts.test 则用 shell 执行；否则默认从当前目录递归扫描全项目 *.test.js/ts/jsx/tsx、*.spec.js/ts/jsx/tsx（排除 default_exclude_dirs），对每个文件执行 shu run。
+/// 支持 positional 中的 --jobs=N；默认 1（单文件顺序），传 N>1 时多文件并行。
 pub fn runTest(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional: []const []const u8, io: std.Io) !void {
-    const default_jobs = std.Thread.getCpuCount() catch 1;
+    // 默认 1：单文件顺序执行，输出不交错；显式传 --jobs=N 时多文件并发。
+    const default_jobs: u32 = 1;
     const jobs = @min(parseTestJobs(positional) orelse default_jobs, 64);
     try version.printCommandHeader(io, "test");
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -464,7 +495,7 @@ pub fn runTest(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional
                 for (list.items) |p| allocator.free(p);
                 list.deinit(allocator);
             };
-            return runDefaultTests(allocator, cwd_owned, io, jobs, filter, &options, &parsed, if (explicit) |*list_ptr| list_ptr else null);
+            return runDefaultTests(allocator, cwd_owned, io, jobs, filter, &options, &parsed, if (explicit) |*list_ptr| list_ptr else null, null);
         }
         return e;
     };
@@ -485,7 +516,7 @@ pub fn runTest(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional
         for (list.items) |p| allocator.free(p);
         list.deinit(allocator);
     };
-    return runDefaultTests(allocator, cwd_owned, io, jobs, filter, &options, &parsed, if (explicit) |*list_ptr| list_ptr else null);
+    return runDefaultTests(allocator, cwd_owned, io, jobs, filter, &options, &parsed, if (explicit) |*list_ptr| list_ptr else null, m.test_value);
 }
 
 /// 子进程 stderr 中 __SHU_TEST_CASES__ 行的解析结果；未找到时全为 0。
@@ -566,6 +597,23 @@ const TestWorkerCtx = struct {
     bail_requested: ?*std.atomic.Value(bool) = null,
 };
 
+/// 判断 run_path（如 tests/unit/shu/foo.test.js 或 src/foo.test.js）是否匹配 test.include 的单个 pattern（如 **/*.test.js 或 tests/**/*.test.js）。
+/// 支持 "prefix**/segment"：path 须以 prefix 开头；segment 若以 * 开头则用其后扩展名做 endsWith（如 *.test.js => .test.js），否则整段做 endsWith。
+fn pathMatchesInclude(run_path: []const u8, pattern: []const u8) bool {
+    if (std.mem.indexOf(u8, pattern, "**")) |idx| {
+        const prefix = pattern[0..idx];
+        const after_glob = pattern[idx + 2 ..];
+        var suffix = if (std.mem.lastIndexOf(u8, after_glob, "/")) |last_slash|
+            after_glob[last_slash + 1 ..]
+        else
+            after_glob;
+        if (suffix.len > 0 and suffix[0] == '*') suffix = suffix[1..];
+        return (prefix.len == 0 or std.mem.startsWith(u8, run_path, prefix)) and
+            (suffix.len == 0 or std.mem.endsWith(u8, run_path, suffix));
+    }
+    return std.mem.eql(u8, run_path, pattern) or std.mem.endsWith(u8, run_path, pattern);
+}
+
 /// [Allocates] 由 run_path（如 "tests/unit/shu/example.test.js"）计算对应 snapshot 文件路径：项目根下 snapshots/<dir>/<basename>.snap，与常见运行时约定一致。
 fn snapshotFilePathForRunPath(allocator: std.mem.Allocator, run_path: []const u8) ![]const u8 {
     const dir = libs_io.pathDirname(run_path) orelse ".";
@@ -615,7 +663,7 @@ fn buildTestEnvironMap(allocator: std.mem.Allocator, options: *const TestOptions
     return env;
 }
 
-/// Worker 线程入口：从 next_index 取任务，执行 shu run tests/<path>；支持 --bail 与 SHU_TEST_* 环境变量。
+/// Worker 线程入口：从 next_index 取任务，执行 shu run <run_path>（run_path 为相对项目根）；支持 --bail 与 SHU_TEST_* 环境变量。
 fn testFileWorker(ctx: *TestWorkerCtx) void {
     while (true) {
         if (ctx.bail_requested) |bail| {
@@ -760,26 +808,20 @@ fn testFileWorker(ctx: *TestWorkerCtx) void {
     }
 }
 
-/// 默认行为：若 explicit_run_paths 非 null 则只跑这些文件；否则扫描 tests/ 下 test/spec 并执行。jobs > 1 且多文件时并行。
-/// filter 仅在「未指定 explicit_run_paths」时生效；options 控制 --bail、--shard 等。permissions 为全局解析的 allow_net 等，会传给子进程 shu run。
-fn runDefaultTests(allocator: std.mem.Allocator, cwd_owned: []const u8, io: std.Io, jobs: u32, filter: ?[]const u8, options: *const TestOptions, permissions: *const args.ParsedArgs, explicit_run_paths: ?*std.ArrayList([]const u8)) !void {
+/// 默认行为：若 explicit_run_paths 非 null 则只跑这些文件；否则从当前目录递归扫描全项目下 *.test.js/ts/jsx/tsx、*.spec.js/ts/jsx/tsx（排除 node_modules、.git、dist、build 等），并执行。jobs > 1 且多文件时并行。
+/// filter 仅在「未指定 explicit_run_paths」时生效；test_value 为 package.json/deno.json 的 test 配置，用于 include/exclude 过滤。
+fn runDefaultTests(allocator: std.mem.Allocator, cwd_owned: []const u8, io: std.Io, jobs: u32, filter: ?[]const u8, options: *const TestOptions, permissions: *const args.ParsedArgs, explicit_run_paths: ?*std.ArrayList([]const u8), test_value: ?std.json.Value) !void {
     var run_paths = if (explicit_run_paths) |ex|
         ex.*
     else blk: {
-        const tests_dir_abs = try libs_io.pathJoin(allocator, &.{ cwd_owned, "tests" });
-        defer allocator.free(tests_dir_abs);
-        var tests_dir = libs_io.openDirAbsolute(tests_dir_abs, .{}) catch {
-            try printStderr(io, "shu test: no tests/ directory. Create tests/ with *.test.ts, *.test.js, *.spec.ts, or *.spec.js files.\n", .{});
-            return error.NoTestsDir;
-        };
-        tests_dir.close(io);
-        var list = try scan.collectFilesRecursive(allocator, tests_dir_abs, &scan.test_extensions, io);
+        // 从项目根（cwd）递归扫描，排除 scan.default_exclude_dirs（node_modules、.git、dist、build 等）
+        var list = try scan.collectFilesRecursive(allocator, cwd_owned, &scan.test_extensions, io);
         defer {
             for (list.items) |p| allocator.free(p);
             list.deinit(allocator);
         }
         if (list.items.len == 0) {
-            try printStderr(io, "shu test: no test files found under tests/\n", .{});
+            try printStderr(io, "shu test: no test files found (*.test.js/ts/jsx/tsx, *.spec.js/ts/jsx/tsx). Excluded dirs: node_modules, .git, dist, build, etc.\n", .{});
             try printToStdout(io, "\n", .{});
             return;
         }
@@ -790,7 +832,7 @@ fn runDefaultTests(allocator: std.mem.Allocator, cwd_owned: []const u8, io: std.
         }.lessThan);
         var paths = std.ArrayList([]const u8).initCapacity(allocator, 0) catch return error.OutOfMemory;
         for (list.items) |item| {
-            const rp = try libs_io.pathJoin(allocator, &.{ "tests", item });
+            const rp = try allocator.dupe(u8, item);
             paths.append(allocator, rp) catch {
                 allocator.free(rp);
                 for (paths.items) |p| allocator.free(p);
@@ -798,7 +840,6 @@ fn runDefaultTests(allocator: std.mem.Allocator, cwd_owned: []const u8, io: std.
                 return error.OutOfMemory;
             };
         }
-        // list 由上方 defer 在离开 blk 时统一释放，此处不再重复 free
         if (filter) |pat| {
             var write: usize = 0;
             for (paths.items) |rp| {
@@ -812,6 +853,61 @@ fn runDefaultTests(allocator: std.mem.Allocator, cwd_owned: []const u8, io: std.
             paths.shrinkRetainingCapacity(write);
             if (paths.items.len == 0) {
                 try printStderr(io, "shu test: no test files matching filter \"{s}\".\n", .{pat});
+                for (paths.items) |p| allocator.free(p);
+                paths.deinit(allocator);
+                try printToStdout(io, "\n", .{});
+                return;
+            }
+        }
+        // package.json / deno.json test.include 与 test.exclude 过滤
+        if (test_value) |tv| {
+            if (tv == .object) {
+                const obj = tv.object;
+                if (obj.get("exclude")) |ex_val| {
+                    if (ex_val == .array) {
+                        var write: usize = 0;
+                        for (paths.items) |rp| {
+                            var excluded = false;
+                            for (ex_val.array.items) |item| {
+                                if (item == .string and std.mem.eql(u8, rp, item.string)) {
+                                    excluded = true;
+                                    break;
+                                }
+                            }
+                            if (!excluded) {
+                                paths.items[write] = rp;
+                                write += 1;
+                            } else {
+                                allocator.free(rp);
+                            }
+                        }
+                        paths.shrinkRetainingCapacity(write);
+                    }
+                }
+                if (obj.get("include")) |in_val| {
+                    if (in_val == .array and in_val.array.items.len > 0) {
+                        var write: usize = 0;
+                        for (paths.items) |rp| {
+                            var included = false;
+                            for (in_val.array.items) |item| {
+                                if (item == .string and pathMatchesInclude(rp, item.string)) {
+                                    included = true;
+                                    break;
+                                }
+                            }
+                            if (included) {
+                                paths.items[write] = rp;
+                                write += 1;
+                            } else {
+                                allocator.free(rp);
+                            }
+                        }
+                        paths.shrinkRetainingCapacity(write);
+                    }
+                }
+            }
+            if (paths.items.len == 0) {
+                try printStderr(io, "shu test: no test files after applying package test.include/exclude.\n", .{});
                 for (paths.items) |p| allocator.free(p);
                 paths.deinit(allocator);
                 try printToStdout(io, "\n", .{});
