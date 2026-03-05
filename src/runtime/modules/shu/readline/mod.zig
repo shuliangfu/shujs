@@ -35,26 +35,26 @@ fn ensureStrings() void {
     strings_init = true;
 }
 
-/// 单个 Interface 的内部状态（行缓冲、question 回调等）
+/// 单个 Interface 的内部状态（行缓冲、question 回调等）。列表为 Unmanaged，调用处传 allocator（01 §1.2）
 const InterfaceState = struct {
     allocator: std.mem.Allocator,
     /// 未完成一行的缓冲
-    line_buffer: std.ArrayList(u8),
+    line_buffer: std.ArrayListUnmanaged(u8),
     /// question() 挂起的回调，收到一行后调用并置空
     question_callback: ?jsc.JSValueRef = null,
     closed: bool = false,
     /// 当前行内容（供 .line 属性）
-    current_line: std.ArrayList(u8),
+    current_line: std.ArrayListUnmanaged(u8),
     /// prompt 字符串（setPrompt 设置）
-    prompt_str: std.ArrayList(u8),
+    prompt_str: std.ArrayListUnmanaged(u8),
     input_ref: jsc.JSObjectRef,
     output_ref: ?jsc.JSObjectRef = null,
 };
 
-/// 按 input stream 分组：该 stream 上挂了多少个 readline Interface（用于注册/注销 data 监听）
-var g_stream_interfaces: std.AutoHashMap(usize, std.ArrayList(jsc.JSObjectRef)) = undefined;
-/// 每个 Interface 对象对应的状态
-var g_interface_state: std.AutoHashMap(usize, InterfaceState) = undefined;
+/// 按 input stream 分组：该 stream 上挂了多少个 readline Interface。Unmanaged，put/getOrPut 显式传 allocator
+var g_stream_interfaces: std.AutoHashMapUnmanaged(usize, std.ArrayListUnmanaged(jsc.JSObjectRef)) = .{};
+/// 每个 Interface 对象对应的状态。Unmanaged，put/fetchRemove 显式传 allocator
+var g_interface_state: std.AutoHashMapUnmanaged(usize, InterfaceState) = .{};
 var g_readline_mutex: std.Io.Mutex = .{ .state = std.atomic.Value(std.Io.Mutex.State).init(.unlocked) };
 var g_readline_init: bool = false;
 
@@ -64,9 +64,10 @@ fn initReadlineGlobals(allocator: std.mem.Allocator) void {
     g_readline_mutex.lock(io) catch return;
     defer g_readline_mutex.unlock(io);
     if (g_readline_init) return;
-    g_stream_interfaces = std.AutoHashMap(usize, std.ArrayList(jsc.JSObjectRef)).init(allocator);
-    g_interface_state = std.AutoHashMap(usize, InterfaceState).init(allocator);
+    g_stream_interfaces = .{};
+    g_interface_state = .{};
     g_readline_init = true;
+    _ = allocator;
 }
 
 fn ensureReadlineGlobals() void {
@@ -105,7 +106,7 @@ fn feedChunkToInterfaces(ctx: jsc.JSContextRef, input_stream_ref: jsc.JSObjectRe
     const io = libs_process.getProcessIo() orelse return;
     const key = @intFromPtr(input_stream_ref);
     var stack_refs: [32]jsc.JSObjectRef = undefined;
-    var heap_copy: ?std.ArrayList(jsc.JSObjectRef) = null;
+    var heap_copy: ?std.ArrayListUnmanaged(jsc.JSObjectRef) = null;
     defer if (heap_copy) |*h| h.deinit(allocator);
 
     g_readline_mutex.lock(io) catch return;
@@ -213,7 +214,7 @@ fn feedChunk(ctx: jsc.JSContextRef, interface_ref: jsc.JSObjectRef, chunk_utf8: 
     g_readline_mutex.lock(io) catch return;
     if (g_interface_state.getPtr(key)) |st| {
         if (start > 0 and start <= st.line_buffer.items.len) {
-            st.line_buffer.replaceRange(st.allocator, 0, start, "") catch {};
+            st.line_buffer.replaceRange(st.allocator, 0, start, &.{}) catch {};
         }
     }
     g_readline_mutex.unlock(io);
@@ -530,9 +531,9 @@ fn createInterfaceCallback(
     common.setMethod(ctx, iface, "prompt", interfacePromptCallback);
     common.setMethod(ctx, iface, "write", interfaceWriteCallback);
 
-    var line_buf = std.ArrayList(u8).initCapacity(allocator, 256) catch return jsc.JSValueMakeUndefined(ctx);
-    var current_line = std.ArrayList(u8).initCapacity(allocator, 256) catch return jsc.JSValueMakeUndefined(ctx);
-    var prompt_str = std.ArrayList(u8).initCapacity(allocator, 64) catch return jsc.JSValueMakeUndefined(ctx);
+    var line_buf = std.ArrayListUnmanaged(u8).initCapacity(allocator, 256) catch return jsc.JSValueMakeUndefined(ctx);
+    var current_line = std.ArrayListUnmanaged(u8).initCapacity(allocator, 256) catch return jsc.JSValueMakeUndefined(ctx);
+    var prompt_str = std.ArrayListUnmanaged(u8).initCapacity(allocator, 64) catch return jsc.JSValueMakeUndefined(ctx);
     const state = InterfaceState{
         .allocator = allocator,
         .line_buffer = line_buf,
@@ -545,37 +546,43 @@ fn createInterfaceCallback(
     const iface_key = @intFromPtr(iface);
     const stream_key = @intFromPtr(input_obj);
     g_readline_mutex.lock(io) catch return jsc.JSValueMakeUndefined(ctx);
-    g_interface_state.put(iface_key, state) catch {
+    g_interface_state.put(allocator, iface_key, state) catch {
         g_readline_mutex.unlock(io);
         line_buf.deinit(allocator);
         current_line.deinit(allocator);
         prompt_str.deinit(allocator);
         return jsc.JSValueMakeUndefined(ctx);
     };
-    const entry = g_stream_interfaces.getOrPut(stream_key) catch {
+    const entry = g_stream_interfaces.getOrPut(allocator, stream_key) catch {
         g_readline_mutex.unlock(io);
-        _ = g_interface_state.remove(iface_key);
-        line_buf.deinit(allocator);
-        current_line.deinit(allocator);
-        prompt_str.deinit(allocator);
+        if (g_interface_state.fetchRemove(iface_key)) |kv| {
+            var s = kv.value;
+            s.line_buffer.deinit(allocator);
+            s.current_line.deinit(allocator);
+            s.prompt_str.deinit(allocator);
+        }
         return jsc.JSValueMakeUndefined(ctx);
     };
     if (!entry.found_existing) {
-        entry.value_ptr.* = std.ArrayList(jsc.JSObjectRef).initCapacity(allocator, 4) catch {
+        entry.value_ptr.* = std.ArrayListUnmanaged(jsc.JSObjectRef).initCapacity(allocator, 4) catch {
             g_readline_mutex.unlock(io);
-            _ = g_interface_state.remove(iface_key);
-            line_buf.deinit(allocator);
-            current_line.deinit(allocator);
-            prompt_str.deinit(allocator);
+            if (g_interface_state.fetchRemove(iface_key)) |kv| {
+                var s = kv.value;
+                s.line_buffer.deinit(allocator);
+                s.current_line.deinit(allocator);
+                s.prompt_str.deinit(allocator);
+            }
             return jsc.JSValueMakeUndefined(ctx);
         };
     }
     entry.value_ptr.*.append(allocator, iface) catch {
         g_readline_mutex.unlock(io);
-        _ = g_interface_state.remove(iface_key);
-        line_buf.deinit(allocator);
-        current_line.deinit(allocator);
-        prompt_str.deinit(allocator);
+        if (g_interface_state.fetchRemove(iface_key)) |kv| {
+            var s = kv.value;
+            s.line_buffer.deinit(allocator);
+            s.current_line.deinit(allocator);
+            s.prompt_str.deinit(allocator);
+        }
         return jsc.JSValueMakeUndefined(ctx);
     };
     const need_register = entry.found_existing == false;
