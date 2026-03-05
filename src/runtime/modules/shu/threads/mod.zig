@@ -13,7 +13,7 @@ const thread_worker = @import("worker.zig");
 const libs_io = @import("libs_io");
 const strip_types = @import("../../../../transpiler/strip_types.zig");
 const jsx = @import("../../../../transpiler/jsx.zig");
-const run_mod = @import("../system/run.zig");
+const run_mod = @import("../cmd/run.zig");
 const vm = @import("../../../vm.zig");
 
 /// 传给工作线程的参数（由主线程分配，工作线程负责部分 free）
