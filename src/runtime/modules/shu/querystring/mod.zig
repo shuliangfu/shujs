@@ -8,7 +8,7 @@ const globals = @import("../../../globals.zig");
 
 const QueryPair = struct { k: []const u8, v: []const u8 };
 
-/// 解析 "a=1&b=2" 为键值对列表；strip 前导 '?'
+/// [Allocates] 解析 "a=1&b=2" 为键值对列表；strip 前导 '?'；返回的 ArrayList 由调用方 deinit(allocator)。
 fn parseQuery(allocator: std.mem.Allocator, search: []const u8) !std.ArrayList(QueryPair) {
     var list = try std.ArrayList(QueryPair).initCapacity(allocator, 0);
     var rest = search;
