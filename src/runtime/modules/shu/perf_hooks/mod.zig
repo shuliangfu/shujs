@@ -60,6 +60,29 @@ const globals = @import("../../../globals.zig");
 
 /// 条目类型：mark、measure、function（timerify 产生）
 const PerfEntryType = enum { mark, measure, function };
+/// 取 type 字符串前 8 字节转 u64（不足零填充），用于与 comptime 常量整型比较（00 §2.1）
+fn perfTypePrefix(s: []const u8) u64 {
+    var buf: [8]u8 = [_]u8{0} ** 8;
+    const n = @min(8, s.len);
+    @memcpy(buf[0..n], s[0..n]);
+    return @as(u64, @bitCast(buf));
+}
+fn perfTypePrefix8(comptime str: []const u8) u64 {
+    var buf: [8]u8 = [_]u8{0} ** 8;
+    const n = @min(8, str.len);
+    for (str[0..n], buf[0..n]) |a, *b| b.* = a;
+    return @as(u64, @bitCast(buf));
+}
+/// 从 type 字符串解析为 PerfEntryType（仅 "mark"(4)、"measure"(7)、"function"(8)），否则 null
+fn perfTypeFromSlice(s: []const u8) ?PerfEntryType {
+    return switch (s.len) {
+        4 => if (perfTypePrefix(s) == perfTypePrefix8("mark")) .mark else null,
+        7 => if (perfTypePrefix(s) == perfTypePrefix8("measure")) .measure else null,
+        8 => if (perfTypePrefix(s) == perfTypePrefix8("function")) .function else null,
+        else => null,
+    };
+}
+
 /// 单条性能条目：mark、measure 或 function；detail_owned 为 options.detail 序列化后的字符串（本模块持有，移除时需 free）
 const PerfEntry = struct {
     name: []const u8,
@@ -73,7 +96,8 @@ const PerfEntry = struct {
 var g_perf_alloc: std.mem.Allocator = undefined;
 var g_time_origin: f64 = 0;
 var g_marks: std.StringHashMap(f64) = undefined;
-var g_entries: std.ArrayList(PerfEntry) = undefined;
+/// Unmanaged，append/orderedRemove 显式传 g_perf_alloc（01 §1.2）
+var g_entries: std.ArrayListUnmanaged(PerfEntry) = .{};
 var g_perf_init: bool = false;
 
 /// 性能条目列表初始容量，减少 mark/measure 频繁时的扩容（§1.3）
@@ -86,14 +110,14 @@ pub fn initPerfStore(allocator: std.mem.Allocator) void {
     const io = libs_process.getProcessIo() orelse {
         g_time_origin = 0;
         g_marks = std.StringHashMap(f64).init(g_perf_alloc);
-        g_entries = std.ArrayList(PerfEntry).initCapacity(g_perf_alloc, PERF_ENTRIES_INIT_CAP) catch unreachable;
+        g_entries = std.ArrayListUnmanaged(PerfEntry).initCapacity(g_perf_alloc, PERF_ENTRIES_INIT_CAP) catch unreachable;
         g_perf_init = true;
         return;
     };
     const ns = std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds;
     g_time_origin = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
     g_marks = std.StringHashMap(f64).init(g_perf_alloc);
-    g_entries = std.ArrayList(PerfEntry).initCapacity(g_perf_alloc, PERF_ENTRIES_INIT_CAP) catch unreachable;
+    g_entries = std.ArrayListUnmanaged(PerfEntry).initCapacity(g_perf_alloc, PERF_ENTRIES_INIT_CAP) catch unreachable;
     g_perf_init = true;
 }
 
@@ -103,14 +127,14 @@ fn ensurePerfStore() void {
     const io = libs_process.getProcessIo() orelse {
         g_time_origin = 0;
         g_marks = std.StringHashMap(f64).init(g_perf_alloc);
-        g_entries = std.ArrayList(PerfEntry).initCapacity(g_perf_alloc, PERF_ENTRIES_INIT_CAP) catch unreachable;
+        g_entries = std.ArrayListUnmanaged(PerfEntry).initCapacity(g_perf_alloc, PERF_ENTRIES_INIT_CAP) catch unreachable;
         g_perf_init = true;
         return;
     };
     const ns = std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds;
     g_time_origin = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
     g_marks = std.StringHashMap(f64).init(g_perf_alloc);
-    g_entries = std.ArrayList(PerfEntry).initCapacity(g_perf_alloc, PERF_ENTRIES_INIT_CAP) catch unreachable;
+    g_entries = std.ArrayListUnmanaged(PerfEntry).initCapacity(g_perf_alloc, PERF_ENTRIES_INIT_CAP) catch unreachable;
     g_perf_init = true;
 }
 
@@ -475,6 +499,7 @@ fn jsArrayIndexOfEntryType(ctx: jsc.JSContextRef, arr: jsc.JSObjectRef, entry_ty
     const tn = jsc.JSStringGetUTF8CString(type_str, &type_buf, type_buf.len);
     if (tn == 0) return -1;
     const want = type_buf[0 .. tn - 1];
+    const want_ty = perfTypeFromSlice(want);
     const len = jsArrayLength(ctx, arr);
     var i: usize = 0;
     while (i < len) : (i += 1) {
@@ -487,7 +512,10 @@ fn jsArrayIndexOfEntryType(ctx: jsc.JSContextRef, arr: jsc.JSObjectRef, entry_ty
         defer jsc.JSStringRelease(et_str);
         var eb: [32]u8 = undefined;
         const en = jsc.JSStringGetUTF8CString(et_str, &eb, eb.len);
-        if (en > 0 and std.mem.eql(u8, eb[0 .. en - 1], want)) return @intCast(i);
+        if (en > 0) {
+            const elem_ty = perfTypeFromSlice(eb[0 .. en - 1]);
+            if (elem_ty != null and elem_ty == want_ty) return @intCast(i);
+        }
     }
     return -1;
 }
@@ -528,13 +556,13 @@ fn perfListGetEntriesByNameCallback(
     const name_n = jsc.JSStringGetUTF8CString(name_str, &name_buf, name_buf.len);
     if (name_n == 0) return jsc.JSObjectMakeArray(ctx, 0, &empty0, null);
     const want_name = name_buf[0 .. name_n - 1];
-    var want_type: ?[]const u8 = null;
+    var want_ty: ?PerfEntryType = null;
     if (argumentCount >= 2 and !jsc.JSValueIsUndefined(ctx, arguments[1])) {
         const t_str = jsc.JSValueToStringCopy(ctx, arguments[1], null);
         defer jsc.JSStringRelease(t_str);
         var tb: [16]u8 = undefined;
         const tn = jsc.JSStringGetUTF8CString(t_str, &tb, tb.len);
-        if (tn > 0) want_type = tb[0 .. tn - 1];
+        if (tn > 0) want_ty = perfTypeFromSlice(tb[0 .. tn - 1]);
     }
     var refs = std.ArrayList(jsc.JSValueRef).initCapacity(g_perf_alloc, len) catch return jsc.JSValueMakeUndefined(ctx);
     defer refs.deinit(g_perf_alloc);
@@ -550,7 +578,7 @@ fn perfListGetEntriesByNameCallback(
         var nb: [512]u8 = undefined;
         const nn = jsc.JSStringGetUTF8CString(n_str, &nb, nb.len);
         if (nn == 0 or !std.mem.eql(u8, nb[0 .. nn - 1], want_name)) continue;
-        if (want_type) |wt| {
+        if (want_ty) |wty| {
             const k_et = jsc.JSStringCreateWithUTF8CString("entryType");
             defer jsc.JSStringRelease(k_et);
             const et_val = jsc.JSObjectGetProperty(ctx, obj, k_et, null);
@@ -558,7 +586,8 @@ fn perfListGetEntriesByNameCallback(
             defer jsc.JSStringRelease(et_str);
             var eb: [16]u8 = undefined;
             const en = jsc.JSStringGetUTF8CString(et_str, &eb, eb.len);
-            if (en == 0 or !std.mem.eql(u8, eb[0 .. en - 1], wt)) continue;
+            const elem_ty = if (en > 0) perfTypeFromSlice(eb[0 .. en - 1]) else null;
+            if (elem_ty != wty) continue;
         }
         refs.append(g_perf_alloc, elem) catch {};
     }
@@ -588,20 +617,24 @@ fn perfListGetEntriesByTypeCallback(
     const type_n = jsc.JSStringGetUTF8CString(type_str, &type_buf, type_buf.len);
     if (type_n == 0) return jsc.JSObjectMakeArray(ctx, 0, &empty0, null);
     const want_type = type_buf[0 .. type_n - 1];
+    const want_ty = perfTypeFromSlice(want_type);
     var refs = std.ArrayList(jsc.JSValueRef).initCapacity(g_perf_alloc, len) catch return jsc.JSValueMakeUndefined(ctx);
     defer refs.deinit(g_perf_alloc);
-    var i: usize = 0;
-    while (i < len) : (i += 1) {
-        const elem = jsc.JSObjectGetPropertyAtIndex(ctx, entries, @intCast(i), null);
-        const obj = jsc.JSValueToObject(ctx, elem, null) orelse continue;
-        const k_et = jsc.JSStringCreateWithUTF8CString("entryType");
-        defer jsc.JSStringRelease(k_et);
-        const et_val = jsc.JSObjectGetProperty(ctx, obj, k_et, null);
-        const et_str = jsc.JSValueToStringCopy(ctx, et_val, null);
-        defer jsc.JSStringRelease(et_str);
-        var eb: [16]u8 = undefined;
-        const en = jsc.JSStringGetUTF8CString(et_str, &eb, eb.len);
-        if (en > 0 and std.mem.eql(u8, eb[0 .. en - 1], want_type)) refs.append(g_perf_alloc, elem) catch {};
+    if (want_ty) |wty| {
+        var i: usize = 0;
+        while (i < len) : (i += 1) {
+            const elem = jsc.JSObjectGetPropertyAtIndex(ctx, entries, @intCast(i), null);
+            const obj = jsc.JSValueToObject(ctx, elem, null) orelse continue;
+            const k_et = jsc.JSStringCreateWithUTF8CString("entryType");
+            defer jsc.JSStringRelease(k_et);
+            const et_val = jsc.JSObjectGetProperty(ctx, obj, k_et, null);
+            const et_str = jsc.JSValueToStringCopy(ctx, et_val, null);
+            defer jsc.JSStringRelease(et_str);
+            var eb: [16]u8 = undefined;
+            const en = jsc.JSStringGetUTF8CString(et_str, &eb, eb.len);
+            const elem_ty = if (en > 0) perfTypeFromSlice(eb[0 .. en - 1]) else null;
+            if (elem_ty == wty) refs.append(g_perf_alloc, elem) catch {};
+        }
     }
     if (refs.items.len == 0) return jsc.JSObjectMakeArray(ctx, 0, &empty0, null);
     return jsc.JSObjectMakeArray(ctx, refs.items.len, refs.items.ptr, null);
@@ -775,7 +808,7 @@ fn performanceGetEntriesByNameCallback(
         const tn = jsc.JSStringGetUTF8CString(type_str, &type_buf, type_buf.len);
         if (tn > 0) {
             const ts = type_buf[0 .. tn - 1];
-            if (std.mem.eql(u8, ts, "mark")) filter_type = .mark else if (std.mem.eql(u8, ts, "measure")) filter_type = .measure else if (std.mem.eql(u8, ts, "function")) filter_type = .function;
+            filter_type = perfTypeFromSlice(ts);
         }
     }
     var empty_arr2: [0]jsc.JSValueRef = .{};
@@ -810,13 +843,13 @@ fn performanceGetEntriesByTypeCallback(
     const nn = jsc.JSStringGetUTF8CString(type_str, &type_buf, type_buf.len);
     if (nn == 0) return jsc.JSObjectMakeArray(ctx, 0, &empty_arr, null);
     const type_slice = type_buf[0 .. nn - 1];
-    const want_mark = std.mem.eql(u8, type_slice, "mark");
-    const want_measure = std.mem.eql(u8, type_slice, "measure");
-    const want_function = std.mem.eql(u8, type_slice, "function");
+    const type_match = perfTypeFromSlice(type_slice);
     var list = std.ArrayList(PerfEntry).initCapacity(g_perf_alloc, 0) catch return jsc.JSObjectMakeArray(ctx, 0, &empty_arr, null);
     defer list.deinit(g_perf_alloc);
-    for (g_entries.items) |e| {
-        if (e.entry_type == .mark and want_mark) list.append(g_perf_alloc, e) catch {} else if (e.entry_type == .measure and want_measure) list.append(g_perf_alloc, e) catch {} else if (e.entry_type == .function and want_function) list.append(g_perf_alloc, e) catch {};
+    if (type_match) |ty| {
+        for (g_entries.items) |e| {
+            if (e.entry_type == ty) list.append(g_perf_alloc, e) catch {};
+        }
     }
     const list_refs = g_perf_alloc.alloc(jsc.JSValueRef, list.items.len) catch return jsc.JSObjectMakeArray(ctx, 0, &empty_arr, null);
     defer g_perf_alloc.free(list_refs);
