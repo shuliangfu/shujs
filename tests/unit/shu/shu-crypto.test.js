@@ -167,3 +167,52 @@ describe("shu:crypto boundary", () => {
     }
   });
 });
+
+// crypto.subtle（Web Crypto API）：digest 已实现，sign/verify/encrypt/decrypt 等占位
+describe("crypto.subtle (Web Crypto)", () => {
+  it("crypto.subtle exists", () => {
+    assert.ok(crypto.subtle != null && typeof crypto.subtle === "object");
+  });
+
+  it("subtle.digest is a function", () => {
+    assert.strictEqual(typeof crypto.subtle.digest, "function");
+  });
+
+  it("subtle.digest(algorithm, data) returns a Promise", () => {
+    const p = crypto.subtle.digest("SHA-256", new Uint8Array([1, 2, 3]));
+    assert.ok(p != null && typeof p.then === "function");
+  });
+
+  it("subtle.digest('SHA-256', data) resolves to ArrayBuffer", async () => {
+    const data = new Uint8Array([104, 101, 108, 108, 111]); // "hello"
+    const ab = await crypto.subtle.digest("SHA-256", data);
+    assert.ok(ab instanceof ArrayBuffer);
+    assert.strictEqual(ab.byteLength, 32);
+  });
+
+  it("subtle.digest('SHA-1', data) resolves to 20-byte ArrayBuffer", async () => {
+    const data = new Uint8Array([]);
+    const ab = await crypto.subtle.digest("SHA-1", data);
+    assert.ok(ab instanceof ArrayBuffer);
+    assert.strictEqual(ab.byteLength, 20);
+  });
+
+  it("subtle.digest with object algorithm { name: 'SHA-256' } works", async () => {
+    const data = new TextEncoder().encode("test");
+    const ab = await crypto.subtle.digest({ name: "SHA-256" }, data);
+    assert.ok(ab instanceof ArrayBuffer);
+    assert.strictEqual(ab.byteLength, 32);
+  });
+
+  it("subtle.sign (not implemented) rejects", async () => {
+    await assert.rejects(async () => {
+      await crypto.subtle.sign(null, null, new Uint8Array(0));
+    });
+  });
+
+  it("subtle.encrypt (not implemented) rejects", async () => {
+    await assert.rejects(async () => {
+      await crypto.subtle.encrypt(null, null, new Uint8Array(0));
+    });
+  });
+});
