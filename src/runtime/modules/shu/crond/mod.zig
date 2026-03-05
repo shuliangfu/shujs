@@ -54,7 +54,7 @@ fn parseField(allocator: std.mem.Allocator, slice: []const u8, max: u32) !FieldS
     _ = allocator;
     const trimmed = std.mem.trim(u8, slice, " \t");
     if (trimmed.len == 0) return error.InvalidCron;
-    if (std.mem.eql(u8, trimmed, "*")) {
+    if (trimmed.len == 1 and trimmed[0] == '*') {
         return .{ .any = true };
     }
     var buf: [64]u32 = undefined;
@@ -106,15 +106,37 @@ fn parseField(allocator: std.mem.Allocator, slice: []const u8, max: u32) !FieldS
 }
 
 /// 解析六段表达式 "sec min hour day month dow"，返回的 ParsedCron 需由调用方 deinit
+/// 用手动按空格切分替代 std.mem.splitScalar，避免 0.16 std 内 findScalarPos(slice[i..][0..block_len]) 在剩余长度 < block_len 时越界
 pub fn parse(allocator: std.mem.Allocator, expression: []const u8) !ParsedCron {
-    var it = std.mem.splitScalar(u8, expression, ' ');
+    if (expression.len == 0) return error.InvalidCron;
+    // 与 crondCallback 中 max_sz > 256 拒绝一致，避免损坏的 len 导致越界或死循环
+    if (expression.len > 256) return error.InvalidCron;
     var parts: [6][]const u8 = undefined;
     var n: usize = 0;
-    while (it.next()) |part| : (n += 1) {
-        if (n >= 6) return error.InvalidCron;
-        parts[n] = part;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i <= expression.len and n < 6) {
+        const at_end = (i >= expression.len);
+        const at_space = if (at_end) false else (expression[i] == ' ');
+        if (at_end or at_space) {
+            if (start < i) {
+                parts[n] = expression[start..i];
+                n += 1;
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if (start < expression.len and n < 6) {
+        parts[n] = expression[start..];
+        n += 1;
     }
     if (n != 6) return error.InvalidCron;
+    // 拒绝第七段：n==6 时若 start 后还有非空白内容则 InvalidCron
+    if (start < expression.len) {
+        const rest = std.mem.trim(u8, expression[start..], " \t");
+        if (rest.len > 0) return error.InvalidCron;
+    }
     return .{
         .sec = try parseField(allocator, parts[0], 59),
         .min = try parseField(allocator, parts[1], 59),
