@@ -20,7 +20,7 @@
 
 | 能力 | Node | Deno | Bun | shu test |
 |------|------|------|-----|----------|
-| **并发数** | 有并发，可配置 | **--parallel** 并行跑测试模块 | 单进程内 **--concurrent** + **--max-concurrency**（默认 20） | ✅ **--jobs=N**（多文件并行子进程数） |
+| **并发数** | 有并发，可配置 | **--parallel** 并行跑测试模块 | 单进程内 **--concurrent** + **--max-concurrency**（默认 20） | ✅ **--jobs=N**（默认 1 单文件顺序；N>1 多文件并行）；**package.json test.include / test.exclude** 已支持 |
 | **分片（CI）** | 无统一语法 | 无 | 无 | ✅ **--shard=index/total**（只跑第 index 份，共 total 份） |
 | **遇失败即停** | 可配置 | **--fail-fast** | **--bail** / **--bail=N** | ✅ **--bail** / **--fail-fast**（首失败即停；CLI 停后续文件，runtime 单文件内首失败即 reject） |
 | **单测超时** | 可配置 | 可配置 | **--timeout**（毫秒，默认 5000） | ✅ **--timeout=N**（经 SHU_TEST_TIMEOUT 设默认超时，与 run({ timeout }) 一致） |
