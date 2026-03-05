@@ -5,13 +5,16 @@ const std = @import("std");
 const jsc = @import("jsc");
 const common = @import("../common.zig");
 
-/// 占位：向全局注册 Buffer、require、WebSocket、Bun（Bun.serve / Bun.file / Bun.write）；allocator 统一传入（§1.1），本模块暂不使用
+/// 占位：向全局注册 Buffer、require、WebSocket、Bun、reportError、MessageChannel、BroadcastChannel；allocator 统一传入（§1.1），本模块暂不使用
 pub fn register(ctx: jsc.JSGlobalContextRef, allocator: ?std.mem.Allocator) void {
     _ = allocator;
     const global = jsc.JSContextGetGlobalObject(ctx);
     setGlobalFunction(ctx, global, "Buffer", bufferNotImplementedCallback);
     setGlobalFunction(ctx, global, "require", requireNotImplementedCallback);
     setGlobalFunction(ctx, global, "WebSocket", websocketNotImplementedCallback);
+    setGlobalFunction(ctx, global, "reportError", reportErrorCallback);
+    setGlobalFunction(ctx, global, "MessageChannel", messageChannelCallback);
+    setGlobalFunction(ctx, global, "BroadcastChannel", broadcastChannelNotImplementedCallback);
     registerBunStub(ctx, global);
 }
 
@@ -75,6 +78,85 @@ fn websocketNotImplementedCallback(
     _: [*]jsc.JSValueRef,
 ) callconv(.c) jsc.JSValueRef {
     throwNotImplemented(ctx, "WebSocket is not implemented");
+    return jsc.JSValueMakeUndefined(ctx);
+}
+
+/// reportError(err)：Web 标准；委托 console.error(err)，若 console 不存在则忽略
+fn reportErrorCallback(
+    ctx: jsc.JSContextRef,
+    _: jsc.JSObjectRef,
+    _: jsc.JSObjectRef,
+    argumentCount: usize,
+    arguments: [*]const jsc.JSValueRef,
+    _: [*]jsc.JSValueRef,
+) callconv(.c) jsc.JSValueRef {
+    if (argumentCount == 0) return jsc.JSValueMakeUndefined(ctx);
+    const global = jsc.JSContextGetGlobalObject(ctx);
+    const k_console = jsc.JSStringCreateWithUTF8CString("console");
+    defer jsc.JSStringRelease(k_console);
+    const console_val = jsc.JSObjectGetProperty(ctx, global, k_console, null);
+    if (jsc.JSValueIsUndefined(ctx, console_val) or jsc.JSValueIsNull(ctx, console_val)) return jsc.JSValueMakeUndefined(ctx);
+    const console_obj = jsc.JSValueToObject(ctx, console_val, null) orelse return jsc.JSValueMakeUndefined(ctx);
+    const k_error = jsc.JSStringCreateWithUTF8CString("error");
+    defer jsc.JSStringRelease(k_error);
+    const error_fn = jsc.JSObjectGetProperty(ctx, console_obj, k_error, null);
+    if (jsc.JSValueIsUndefined(ctx, error_fn) or jsc.JSValueIsNull(ctx, error_fn)) return jsc.JSValueMakeUndefined(ctx);
+    const error_obj = jsc.JSValueToObject(ctx, error_fn, null) orelse return jsc.JSValueMakeUndefined(ctx);
+    var exception: ?jsc.JSValueRef = null;
+    const args: [1]jsc.JSValueRef = .{arguments[0]};
+    _ = jsc.JSObjectCallAsFunction(ctx, error_obj, console_obj, 1, &args, @ptrCast(&exception));
+    return jsc.JSValueMakeUndefined(ctx);
+}
+
+/// MessageChannel 占位：返回 { port1, port2 }，各 port 有 postMessage（调用抛 not implemented）与 onmessage（初始为 undefined）
+fn messageChannelPortPostMessageCallback(
+    ctx: jsc.JSContextRef,
+    _: jsc.JSObjectRef,
+    _: jsc.JSObjectRef,
+    _: usize,
+    _: [*]const jsc.JSValueRef,
+    _: [*]jsc.JSValueRef,
+) callconv(.c) jsc.JSValueRef {
+    throwNotImplemented(ctx, "MessageChannel port.postMessage is not implemented");
+    return jsc.JSValueMakeUndefined(ctx);
+}
+
+fn makeMessagePort(ctx: jsc.JSContextRef) jsc.JSObjectRef {
+    const port = jsc.JSObjectMake(ctx, null, null);
+    setMethod(ctx, port, "postMessage", messageChannelPortPostMessageCallback);
+    const k_onmessage = jsc.JSStringCreateWithUTF8CString("onmessage");
+    defer jsc.JSStringRelease(k_onmessage);
+    _ = jsc.JSObjectSetProperty(ctx, port, k_onmessage, jsc.JSValueMakeUndefined(ctx), jsc.kJSPropertyAttributeNone, null);
+    return port;
+}
+
+fn messageChannelCallback(
+    ctx: jsc.JSContextRef,
+    _: jsc.JSObjectRef,
+    _: jsc.JSObjectRef,
+    _: usize,
+    _: [*]const jsc.JSValueRef,
+    _: [*]jsc.JSValueRef,
+) callconv(.c) jsc.JSValueRef {
+    const channel = jsc.JSObjectMake(ctx, null, null);
+    const k_port1 = jsc.JSStringCreateWithUTF8CString("port1");
+    defer jsc.JSStringRelease(k_port1);
+    const k_port2 = jsc.JSStringCreateWithUTF8CString("port2");
+    defer jsc.JSStringRelease(k_port2);
+    _ = jsc.JSObjectSetProperty(ctx, channel, k_port1, makeMessagePort(ctx), jsc.kJSPropertyAttributeNone, null);
+    _ = jsc.JSObjectSetProperty(ctx, channel, k_port2, makeMessagePort(ctx), jsc.kJSPropertyAttributeNone, null);
+    return channel;
+}
+
+fn broadcastChannelNotImplementedCallback(
+    ctx: jsc.JSContextRef,
+    _: jsc.JSObjectRef,
+    _: jsc.JSObjectRef,
+    _: usize,
+    _: [*]const jsc.JSValueRef,
+    _: [*]jsc.JSValueRef,
+) callconv(.c) jsc.JSValueRef {
+    throwNotImplemented(ctx, "BroadcastChannel is not implemented");
     return jsc.JSValueMakeUndefined(ctx);
 }
 
