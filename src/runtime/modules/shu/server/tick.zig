@@ -96,8 +96,9 @@ pub fn run(
     cbs: *const TickCallbacks,
     ws_registry_ptr: *?*std.AutoHashMapUnmanaged(u32, WsSendEntry),
 ) jsc.JSValueRef {
-    // 每轮 tick 先收割 AsyncFileIO 完成项，使 Shu.fs.read/write 的 Promise 在本轮 resolve/reject
+    // 每轮 tick 先收割 AsyncFileIO 完成项与 fs.watch 事件，使 Shu.fs.read/write 的 Promise 在本轮 resolve/reject
     if (globals.drain_async_file_io) |drain| drain(ctx);
+    if (globals.drain_fs_watch) |drain| drain(ctx);
     if (state.stop_requested) {
         cbs.cleanup(ctx, state);
         return jsc.JSValueMakeUndefined(ctx);
