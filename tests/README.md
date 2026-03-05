@@ -7,7 +7,7 @@
 | 目录 | 用途 | 说明 |
 |------|------|------|
 | **tests/unit/shu/** | 单元 · shu | 各 `shu:*` 模块 API 的逐项测试，单模块、单方法为主；部分用例含真实 I/O（如 fs 读写）。 |
-| **tests/unit/node/** | 单元 · Node 兼容 | 与 Node.js API 行为对齐的用例（待补）。 |
+| **tests/unit/node/** | 单元 · Node 兼容 | 与 Node.js API 行为对齐的用例（node-builtins、node-errors、node-fs-promises、node-globals）。 |
 | **tests/unit/deno/** | 单元 · Deno 兼容 | 与 Deno API 行为对齐的用例（待补）。 |
 | **tests/unit/bun/** | 单元 · Bun 兼容 | 与 Bun API 行为对齐的用例（待补）。 |
 | **tests/integration/** | 集成测试 | 多模块协作、真实 fs/网络/子进程等，不 mock 底层。 |
