@@ -48,6 +48,17 @@ pub fn getOptionalNumber(ctx: jsc.JSContextRef, obj: jsc.JSObjectRef, key: [*]co
     return @intFromFloat(n);
 }
 
+/// 从 options 中取可选数字；若 key 不存在或非数字则返回 null，用于表示「未设置」（如 linuxSqThreadCpu）
+pub fn getOptionalNumberOptional(ctx: jsc.JSContextRef, obj: jsc.JSObjectRef, key: [*]const u8) ?u32 {
+    const k = jsc.JSStringCreateWithUTF8CString(key);
+    defer jsc.JSStringRelease(k);
+    const v = jsc.JSObjectGetProperty(ctx, obj, k, null);
+    if (jsc.JSValueIsUndefined(ctx, v)) return null;
+    const n = jsc.JSValueToNumber(ctx, v, null);
+    if (n != n or n < 0) return null;
+    return @intFromFloat(n);
+}
+
 /// 从 options 中取可选布尔；若不存在或非布尔则返回 false
 pub fn getOptionalBool(ctx: jsc.JSContextRef, obj: jsc.JSObjectRef, key: [*]const u8) bool {
     const k = jsc.JSStringCreateWithUTF8CString(key);
@@ -67,10 +78,12 @@ pub fn getOptionalBoolDefault(ctx: jsc.JSContextRef, obj: jsc.JSObjectRef, key: 
 }
 
 /// 从 options 中取指定名的可选回调（若存在且为函数则返回其 JSValueRef）
+/// 必须先检查 undefined/null，再调 JSObjectIsFunction，否则 JSC 的 tagged 值被当指针会 segfault。
 pub fn getOptionalCallback(ctx: jsc.JSContextRef, options_obj: jsc.JSObjectRef, key: [*]const u8) ?jsc.JSValueRef {
     const k_ref = jsc.JSStringCreateWithUTF8CString(key);
     defer jsc.JSStringRelease(k_ref);
     const v = jsc.JSObjectGetProperty(ctx, options_obj, k_ref, null);
+    if (jsc.JSValueIsUndefined(ctx, v) or jsc.JSValueIsNull(ctx, v)) return null;
     if (jsc.JSObjectIsFunction(ctx, @ptrCast(v))) return v;
     return null;
 }
