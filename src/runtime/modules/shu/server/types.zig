@@ -36,6 +36,10 @@ pub const ServerConfig = struct {
     io_core_poll_idle_ms: i64 = 100,
     /// 可选 Server 头值（如 "Shu/1.0"）；为 null 时使用默认 "Shu"。预编码优化：响应中写 "Server: {value}\r\n"，可由 options.server 覆盖
     server_header: ?[]const u8 = null,
+    /// Linux SQPOLL 专用核：指定后 io_sqp 绑到该核，业务线程亲和性排除该核（仅 Linux、SQPOLL 生效时）；null=不绑
+    linux_sq_thread_cpu: ?u32 = null,
+    /// Linux 下是否用大页分配 buffer 池（需系统配置大页）；默认 false
+    use_huge_pages: bool = false,
 };
 
 /// chunked 增量解析状态：读 size 行 或 读 chunk 数据（剩余字节数）
