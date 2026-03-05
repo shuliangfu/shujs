@@ -20,6 +20,7 @@
 // Buffer 调度与解析路线：ChunkAllocator（api.zig）、SIMD 扫描示例（simd_scan.zig）、见 docs/IO_CORE_ROADMAP.md
 
 const builtin = @import("builtin");
+const std = @import("std");
 
 // Zig 0.16：进程级 Io 来自 libs_process（process.zig），main 启动时 setProcessIo(init.io)
 const libs_process = @import("libs_process");
@@ -100,3 +101,6 @@ pub const HighPerfIO = backend.HighPerfIO;
 
 /// 零拷贝：文件 → 网络（Linux sendfile / Darwin sendfile / Windows TransmitFile），符合 00-性能规范 §3.4、§4
 pub const sendFile = backend.sendFile;
+
+/// NUMA：Linux 下将内存区域绑定到当前 CPU 所在 NUMA 节点（00 §4.2）；Darwin/Windows 为 no-op，三端同签名由 backend 实现
+pub const mbindToCurrentNode = backend.mbindToCurrentNode;
