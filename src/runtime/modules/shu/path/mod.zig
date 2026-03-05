@@ -1,4 +1,5 @@
 //! Shu.path：路径字符串解析与组装，纯逻辑无 I/O，不访问文件系统。
+//! 所有权：各 callback 内部 [Allocates] 临时路径字符串并转为 JSC 字符串交给 JS，无 Zig 侧返回切片；join/resolve/normalize/relative 等对 JS 的返回值由 JSC 持有。
 //!
 //! ## 提供 API（同步，无权限要求）
 //! - **join(...parts)**：多段路径用平台分隔符拼接并规范化
