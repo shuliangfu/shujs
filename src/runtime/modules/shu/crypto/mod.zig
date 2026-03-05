@@ -7,6 +7,7 @@ const jsc = @import("jsc");
 const common = @import("../../../common.zig");
 const globals = @import("../../../globals.zig");
 const libs_io = @import("libs_io");
+const promise = @import("../promise.zig");
 
 const ChaCha = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
 const AesGcm = std.crypto.aead.aes_gcm.Aes256Gcm;
@@ -32,7 +33,146 @@ fn secureZeroBytes(s: []u8) void {
     std.crypto.secureZero(u8, @as([*]volatile u8, @ptrCast(s.ptr))[0..s.len]);
 }
 
-/// 创建并返回 crypto 对象（方法 + 算法常量），不挂到任何父对象
+/// JSC 回收 subtle.digest 返回的 ArrayBuffer 时调用的释放回调；context 为 *CryptoArrayBufferDeallocContext
+const CryptoArrayBufferDeallocContext = struct { allocator: std.mem.Allocator, slice: []u8 };
+fn cryptoArrayBufferDeallocator(bytes: *anyopaque, deallocator_context: ?*anyopaque) callconv(.c) void {
+    _ = bytes;
+    const ctx = @as(*CryptoArrayBufferDeallocContext, @ptrCast(@alignCast(deallocator_context orelse return)));
+    ctx.allocator.free(ctx.slice);
+    ctx.allocator.destroy(ctx);
+}
+
+/// Web Crypto subtle.digest(algorithm, data)：支持 SHA-1/SHA-256/SHA-384/SHA-512，返回 Promise<ArrayBuffer>；algorithm 可为字符串或 { name }，data 为 BufferSource
+fn subtleDigestCallback(
+    ctx: jsc.JSContextRef,
+    _: jsc.JSObjectRef,
+    _: jsc.JSObjectRef,
+    argumentCount: usize,
+    arguments: [*]const jsc.JSValueRef,
+    _: [*]jsc.JSValueRef,
+) callconv(.c) jsc.JSValueRef {
+    if (argumentCount < 2) return promise.reject(ctx, throwCryptoErrorToValue(ctx, "subtle.digest requires (algorithm, data)"));
+    const allocator = g_crypto_allocator orelse globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
+    var alg_buf: [32]u8 = undefined;
+    const alg_str = getAlgorithmNameFromJS(ctx, arguments[0], &alg_buf) orelse return promise.reject(ctx, throwCryptoErrorToValue(ctx, "subtle.digest: invalid algorithm"));
+    var data_ptr: [*]const u8 = undefined;
+    var data_len: usize = 0;
+    const typ = jsc.JSValueGetTypedArrayType(ctx, arguments[1], null);
+    if (typ != .None) {
+        const obj = jsc.JSValueToObject(ctx, arguments[1], null) orelse return promise.reject(ctx, throwCryptoErrorToValue(ctx, "subtle.digest: data must be BufferSource"));
+        data_len = jsc.JSObjectGetTypedArrayByteLength(ctx, obj);
+        const ptr = jsc.JSObjectGetTypedArrayBytesPtr(ctx, obj, null) orelse return promise.reject(ctx, throwCryptoErrorToValue(ctx, "subtle.digest: failed to get data"));
+        data_ptr = @as([*]const u8, @ptrCast(ptr));
+    } else {
+        const obj = jsc.JSValueToObject(ctx, arguments[1], null) orelse return promise.reject(ctx, throwCryptoErrorToValue(ctx, "subtle.digest: data must be BufferSource"));
+        data_len = jsc.JSObjectGetArrayBufferByteLength(ctx, obj);
+        const ptr = jsc.JSObjectGetArrayBufferBytesPtr(ctx, obj, null) orelse return promise.reject(ctx, throwCryptoErrorToValue(ctx, "subtle.digest: failed to get data"));
+        data_ptr = @as([*]const u8, @ptrCast(ptr));
+    }
+    const data_slice = data_ptr[0..data_len];
+    var alg_pad: [8]u8 = [_]u8{0} ** 8;
+    const alg_n = @min(8, alg_str.len);
+    @memcpy(alg_pad[0..alg_n], alg_str[0..alg_n]);
+    const alg_q = @as(u64, @bitCast(alg_pad));
+    var out_slice: []u8 = undefined;
+    if (alg_str.len == 5 and alg_q == @as(u64, @bitCast([8]u8{ 'S', 'H', 'A', '-', '1', 0, 0, 0 }))) {
+        out_slice = allocator.alloc(u8, Sha1.digest_length) catch return jsc.JSValueMakeUndefined(ctx);
+        Sha1.hash(data_slice, out_slice[0..Sha1.digest_length], .{});
+    } else if (alg_str.len == 7 and alg_q == @as(u64, @bitCast([8]u8{ 'S', 'H', 'A', '-', '2', '5', '6', 0 }))) {
+        out_slice = allocator.alloc(u8, Sha256.digest_length) catch return jsc.JSValueMakeUndefined(ctx);
+        Sha256.hash(data_slice, out_slice[0..Sha256.digest_length], .{});
+    } else if (alg_str.len == 7 and alg_q == @as(u64, @bitCast([8]u8{ 'S', 'H', 'A', '-', '3', '8', '4', 0 }))) {
+        out_slice = allocator.alloc(u8, Sha384.digest_length) catch return jsc.JSValueMakeUndefined(ctx);
+        Sha384.hash(data_slice, out_slice[0..Sha384.digest_length], .{});
+    } else if (alg_str.len == 7 and alg_q == @as(u64, @bitCast([8]u8{ 'S', 'H', 'A', '-', '5', '1', '2', 0 }))) {
+        out_slice = allocator.alloc(u8, Sha512.digest_length) catch return jsc.JSValueMakeUndefined(ctx);
+        Sha512.hash(data_slice, out_slice[0..Sha512.digest_length], .{});
+    } else {
+        return promise.reject(ctx, throwCryptoErrorToValue(ctx, "subtle.digest supports SHA-1, SHA-256, SHA-384, SHA-512 only"));
+    }
+    const dc = allocator.create(CryptoArrayBufferDeallocContext) catch {
+        allocator.free(out_slice);
+        return jsc.JSValueMakeUndefined(ctx);
+    };
+    dc.* = .{ .allocator = allocator, .slice = out_slice };
+    var exc: ?jsc.JSValueRef = null;
+    const ab = jsc.JSObjectMakeArrayBufferWithBytesNoCopy(ctx, out_slice.ptr, out_slice.len, cryptoArrayBufferDeallocator, dc, @ptrCast(&exc));
+    if (exc != null or ab == null) {
+        allocator.free(out_slice);
+        allocator.destroy(dc);
+        return if (exc != null) promise.reject(ctx, exc.?) else jsc.JSValueMakeUndefined(ctx);
+    }
+    return promise.resolve(ctx, ab.?);
+}
+
+/// 从 JS 值取算法名写入 buf，返回有效切片；字符串直接取，对象则取 .name；用于 Web Crypto algorithm 参数。[Borrows] 返回 buf 的切片，调用方勿 free。
+fn getAlgorithmNameFromJS(ctx: jsc.JSContextRef, value: jsc.JSValueRef, buf: []u8) ?[]const u8 {
+    if (buf.len == 0) return null;
+    var src: jsc.JSStringRef = undefined;
+    if (jsc.JSValueIsString(ctx, value)) {
+        src = jsc.JSValueToStringCopy(ctx, value, null);
+    } else {
+        const obj = jsc.JSValueToObject(ctx, value, null) orelse return null;
+        const k_name = jsc.JSStringCreateWithUTF8CString("name");
+        defer jsc.JSStringRelease(k_name);
+        const name_val = jsc.JSObjectGetProperty(ctx, obj, k_name, null);
+        if (jsc.JSValueIsUndefined(ctx, name_val) or !jsc.JSValueIsString(ctx, name_val)) return null;
+        src = jsc.JSValueToStringCopy(ctx, name_val, null);
+    }
+    defer jsc.JSStringRelease(src);
+    const n = jsc.JSStringGetUTF8CString(src, buf.ptr, buf.len);
+    if (n == 0) return null;
+    return buf[0 .. n - 1];
+}
+
+/// 构造 DOMException 并返回 JS 值（不抛），供 Promise.reject 等使用
+fn throwCryptoErrorToValue(ctx: jsc.JSContextRef, msg: []const u8) jsc.JSValueRef {
+    const global = jsc.JSContextGetGlobalObject(ctx);
+    const k_DOMException = jsc.JSStringCreateWithUTF8CString("DOMException");
+    defer jsc.JSStringRelease(k_DOMException);
+    const ctor = jsc.JSObjectGetProperty(ctx, global, k_DOMException, null);
+    const ctor_obj = jsc.JSValueToObject(ctx, ctor, null) orelse return jsc.JSValueMakeUndefined(ctx);
+    const msg_z = jsc.JSStringCreateWithUTF8CString(msg.ptr);
+    defer jsc.JSStringRelease(msg_z);
+    const name_z = jsc.JSStringCreateWithUTF8CString("OperationError");
+    defer jsc.JSStringRelease(name_z);
+    var args: [2]jsc.JSValueRef = .{ jsc.JSValueMakeString(ctx, msg_z), jsc.JSValueMakeString(ctx, name_z) };
+    var exception: ?jsc.JSValueRef = null;
+    return jsc.JSObjectCallAsConstructor(ctx, ctor_obj, 2, &args, @ptrCast(&exception));
+}
+
+/// Web Crypto subtle 未实现方法：返回 Promise.reject(DOMException("NotSupported"))
+fn subtleNotImplementedCallback(
+    ctx: jsc.JSContextRef,
+    _: jsc.JSObjectRef,
+    _: jsc.JSObjectRef,
+    argumentCount: usize,
+    arguments: [*]const jsc.JSValueRef,
+    _: [*]jsc.JSValueRef,
+) callconv(.c) jsc.JSValueRef {
+    _ = argumentCount;
+    _ = arguments;
+    return promise.reject(ctx, throwCryptoErrorToValue(ctx, "crypto.subtle: this method is not implemented"));
+}
+
+/// 创建 Web Crypto API 的 subtle 对象：digest 已实现，sign/verify/encrypt/decrypt/generateKey/importKey/exportKey/deriveKey/wrapKey/unwrapKey 占位返回 rejected Promise
+fn makeSubtleObject(ctx: jsc.JSGlobalContextRef) jsc.JSObjectRef {
+    const subtle_obj = jsc.JSObjectMake(ctx, null, null);
+    setMethod(ctx, subtle_obj, "digest", subtleDigestCallback);
+    setMethod(ctx, subtle_obj, "sign", subtleNotImplementedCallback);
+    setMethod(ctx, subtle_obj, "verify", subtleNotImplementedCallback);
+    setMethod(ctx, subtle_obj, "encrypt", subtleNotImplementedCallback);
+    setMethod(ctx, subtle_obj, "decrypt", subtleNotImplementedCallback);
+    setMethod(ctx, subtle_obj, "generateKey", subtleNotImplementedCallback);
+    setMethod(ctx, subtle_obj, "importKey", subtleNotImplementedCallback);
+    setMethod(ctx, subtle_obj, "exportKey", subtleNotImplementedCallback);
+    setMethod(ctx, subtle_obj, "deriveKey", subtleNotImplementedCallback);
+    setMethod(ctx, subtle_obj, "wrapKey", subtleNotImplementedCallback);
+    setMethod(ctx, subtle_obj, "unwrapKey", subtleNotImplementedCallback);
+    return subtle_obj;
+}
+
+/// 创建并返回 crypto 对象（方法 + 算法常量 + subtle），不挂到任何父对象
 fn makeCryptoObject(ctx: jsc.JSGlobalContextRef) jsc.JSObjectRef {
     const crypto_obj = jsc.JSObjectMake(ctx, null, null);
     setMethod(ctx, crypto_obj, "randomUUID", randomUUIDCallback);
@@ -43,6 +183,10 @@ fn makeCryptoObject(ctx: jsc.JSGlobalContextRef) jsc.JSObjectRef {
     setMethod(ctx, crypto_obj, "generateKeyPair", generateKeyPairCallback);
     setMethod(ctx, crypto_obj, "encryptWithPublicKey", encryptWithPublicKeyCallback);
     setMethod(ctx, crypto_obj, "decryptWithPrivateKey", decryptWithPrivateKeyCallback);
+    const subtle_obj = makeSubtleObject(ctx);
+    const k_subtle = jsc.JSStringCreateWithUTF8CString("subtle");
+    defer jsc.JSStringRelease(k_subtle);
+    _ = jsc.JSObjectSetProperty(ctx, crypto_obj, k_subtle, subtle_obj, jsc.kJSPropertyAttributeNone, null);
     setPropertyString(ctx, crypto_obj, "CHACHA20_POLY1305", "chacha20-poly1305");
     setPropertyString(ctx, crypto_obj, "AES_256_GCM", "aes-256-gcm");
     return crypto_obj;

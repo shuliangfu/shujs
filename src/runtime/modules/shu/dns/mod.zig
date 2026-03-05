@@ -78,8 +78,17 @@ var g_dns_pending: ?std.ArrayListUnmanaged(PendingDns) = null;
 var g_dns_servers: ?std.ArrayListUnmanaged([]const u8) = null;
 /// 待处理 DNS 回调数；按缓存行隔离，避免与其它全局原子 false sharing（00 §5.3）。
 var g_dns_pending_count: std.atomic.Value(usize) align(64) = std.atomic.Value(usize).init(0);
+/// 是否已调度过本批 setImmediate(dnsTick)，避免重复调度；dnsTickCallback 消费后置 false。主线程 drain 用。
+var g_dns_tick_scheduled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
-/// 调度下一轮 dnsTick（setImmediate）
+/// 主线程每轮 runMicrotasks 时调用：若有待处理 DNS 且尚未调度则 scheduleDnsTick(ctx)。工作线程不得使用 ctx，只能由主线程通过本 drain 调度。
+fn drainDnsPending(ctx: jsc.JSContextRef) void {
+    if (g_dns_pending_count.load(.monotonic) > 0 and !g_dns_tick_scheduled.swap(true, .monotonic)) {
+        scheduleDnsTick(ctx);
+    }
+}
+
+/// 调度下一轮 dnsTick（setImmediate）；仅允许在主线程调用（JSC ctx 非线程安全）。
 fn scheduleDnsTick(ctx: jsc.JSContextRef) void {
     const k_name = jsc.JSStringCreateWithUTF8CString("__shuDnsTick");
     defer jsc.JSStringRelease(k_name);
@@ -131,138 +140,135 @@ fn jsValueToUtf8(ctx: jsc.JSContextRef, value: jsc.JSValueRef, allocator: std.me
     return allocator.dupe(u8, buf[0 .. n - 1]) catch null;
 }
 
-/// 主线程 drain：取出所有 PendingDns，按 kind 调用 callback(err, ...)
-/// §4 持锁仅限「移入 taken」，回调与 JSC 操作在锁外执行
-fn drainPendingDns(ctx: jsc.JSContextRef) void {
-    const allocator = globals.current_allocator orelse return;
-    const io = libs_io.getProcessIo() orelse return;
-    var taken = std.ArrayListUnmanaged(PendingDns).initCapacity(allocator, 0) catch return;
-    defer taken.deinit(allocator);
-    {
-        g_dns_pending_mutex.lock(io) catch return;
-        defer g_dns_pending_mutex.unlock(io);
-        const list = g_dns_pending orelse return;
-        if (list.items.len == 0) return;
-        taken.ensureTotalCapacity(allocator, list.items.len) catch return;
-        const pending = &g_dns_pending.?;
-        while (pending.items.len > 0) {
-            taken.append(allocator, pending.swapRemove(pending.items.len - 1)) catch break;
-        }
-    }
+/// 处理单条 PendingDns：按 kind 调用 callback 并释放 item 内分配的内存；调用方负责 JSValueUnprotect(callback)。
+fn processOnePendingDns(ctx: jsc.JSContextRef, allocator: std.mem.Allocator, item: *PendingDns) void {
     var empty_arr: [0]jsc.JSValueRef = undefined;
-    for (taken.items) |*item| {
-        defer _ = g_dns_pending_count.fetchSub(1, .monotonic);
-        defer jsc.JSValueUnprotect(ctx, item.callback);
-        if (item.err_msg) |msg| {
-            defer allocator.free(msg);
-            const err_obj = makeJsError(ctx, msg);
-            switch (item.kind) {
-                .lookup, .lookup_service, .reverse, .resolve4, .resolve6 => {
-                    var args = [_]jsc.JSValueRef{ err_obj, jsc.JSValueMakeUndefined(ctx), jsc.JSValueMakeUndefined(ctx) };
-                    _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(item.callback), null, 2, &args, null);
-                },
-            }
-            continue;
-        }
+    if (item.err_msg) |msg| {
+        defer allocator.free(msg);
+        const err_obj = makeJsError(ctx, msg);
         switch (item.kind) {
-            .lookup => {
-                if (item.lookup_all) |all| {
-                    defer allocator.free(all);
-                    for (all) |e| {
-                        allocator.free(e.address);
-                    }
-                    const arr = jsc.JSObjectMakeArray(ctx, 0, &empty_arr, null);
-                    const k_address = jsc.JSStringCreateWithUTF8CString("address");
-                    defer jsc.JSStringRelease(k_address);
-                    const k_family = jsc.JSStringCreateWithUTF8CString("family");
-                    defer jsc.JSStringRelease(k_family);
-                    for (all) |e| {
-                        const obj = jsc.JSObjectMake(ctx, null, null);
-                        const addr_z = allocator.dupeZ(u8, e.address) catch continue;
-                        defer allocator.free(addr_z);
-                        const addr_ref = jsc.JSStringCreateWithUTF8CString(addr_z.ptr);
-                        defer jsc.JSStringRelease(addr_ref);
-                        _ = jsc.JSObjectSetProperty(ctx, obj, k_address, jsc.JSValueMakeString(ctx, addr_ref), jsc.kJSPropertyAttributeNone, null);
-                        _ = jsc.JSObjectSetProperty(ctx, obj, k_family, jsc.JSValueMakeNumber(ctx, @floatFromInt(e.family)), jsc.kJSPropertyAttributeNone, null);
-                        const k_push = jsc.JSStringCreateWithUTF8CString("push");
-                        defer jsc.JSStringRelease(k_push);
-                        const push_fn = jsc.JSObjectGetProperty(ctx, arr, k_push, null);
-                        var push_args = [_]jsc.JSValueRef{obj};
-                        _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(push_fn), arr, 1, &push_args, null);
-                    }
-                    var args = [_]jsc.JSValueRef{ getNullValue(ctx), arr };
-                    _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(item.callback), null, 2, &args, null);
-                } else if (item.lookup_address) |addr| {
-                    defer allocator.free(addr);
-                    const addr_z = allocator.dupeZ(u8, addr) catch continue;
+            .lookup, .lookup_service, .reverse, .resolve4, .resolve6 => {
+                var args = [_]jsc.JSValueRef{ err_obj, jsc.JSValueMakeUndefined(ctx), jsc.JSValueMakeUndefined(ctx) };
+                _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(item.callback), null, 2, &args, null);
+            },
+        }
+        return;
+    }
+    switch (item.kind) {
+        .lookup => {
+            if (item.lookup_all) |all| {
+                defer allocator.free(all);
+                for (all) |e| allocator.free(e.address);
+                const arr = jsc.JSObjectMakeArray(ctx, 0, &empty_arr, null);
+                const k_address = jsc.JSStringCreateWithUTF8CString("address");
+                defer jsc.JSStringRelease(k_address);
+                const k_family = jsc.JSStringCreateWithUTF8CString("family");
+                defer jsc.JSStringRelease(k_family);
+                for (all) |e| {
+                    const obj = jsc.JSObjectMake(ctx, null, null);
+                    const addr_z = allocator.dupeZ(u8, e.address) catch continue;
                     defer allocator.free(addr_z);
                     const addr_ref = jsc.JSStringCreateWithUTF8CString(addr_z.ptr);
                     defer jsc.JSStringRelease(addr_ref);
-                    var args = [_]jsc.JSValueRef{ getNullValue(ctx), jsc.JSValueMakeString(ctx, addr_ref), jsc.JSValueMakeNumber(ctx, @floatFromInt(item.lookup_family)) };
+                    _ = jsc.JSObjectSetProperty(ctx, obj, k_address, jsc.JSValueMakeString(ctx, addr_ref), jsc.kJSPropertyAttributeNone, null);
+                    _ = jsc.JSObjectSetProperty(ctx, obj, k_family, jsc.JSValueMakeNumber(ctx, @floatFromInt(e.family)), jsc.kJSPropertyAttributeNone, null);
+                    const k_push = jsc.JSStringCreateWithUTF8CString("push");
+                    defer jsc.JSStringRelease(k_push);
+                    const push_fn = jsc.JSObjectGetProperty(ctx, arr, k_push, null);
+                    var push_args = [_]jsc.JSValueRef{obj};
+                    _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(push_fn), arr, 1, &push_args, null);
+                }
+                var args = [_]jsc.JSValueRef{ getNullValue(ctx), arr };
+                _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(item.callback), null, 2, &args, null);
+            } else if (item.lookup_address) |addr| {
+                defer allocator.free(addr);
+                const addr_z = allocator.dupeZ(u8, addr) catch return;
+                defer allocator.free(addr_z);
+                const addr_ref = jsc.JSStringCreateWithUTF8CString(addr_z.ptr);
+                defer jsc.JSStringRelease(addr_ref);
+                var args = [_]jsc.JSValueRef{ getNullValue(ctx), jsc.JSValueMakeString(ctx, addr_ref), jsc.JSValueMakeNumber(ctx, @floatFromInt(item.lookup_family)) };
+                _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(item.callback), null, 3, &args, null);
+            }
+        },
+        .lookup_service => {
+            if (item.service_hostname) |h| {
+                defer allocator.free(h);
+                if (item.service_service) |s| {
+                    defer allocator.free(s);
+                    const hz = allocator.dupeZ(u8, h) catch return;
+                    defer allocator.free(hz);
+                    const sz = allocator.dupeZ(u8, s) catch return;
+                    defer allocator.free(sz);
+                    const href = jsc.JSStringCreateWithUTF8CString(hz.ptr);
+                    defer jsc.JSStringRelease(href);
+                    const sref = jsc.JSStringCreateWithUTF8CString(sz.ptr);
+                    defer jsc.JSStringRelease(sref);
+                    var args = [_]jsc.JSValueRef{ getNullValue(ctx), jsc.JSValueMakeString(ctx, href), jsc.JSValueMakeString(ctx, sref) };
                     _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(item.callback), null, 3, &args, null);
                 }
-            },
-            .lookup_service => {
-                if (item.service_hostname) |h| {
-                    defer allocator.free(h);
-                    if (item.service_service) |s| {
-                        defer allocator.free(s);
-                        const hz = allocator.dupeZ(u8, h) catch continue;
-                        defer allocator.free(hz);
-                        const sz = allocator.dupeZ(u8, s) catch continue;
-                        defer allocator.free(sz);
-                        const href = jsc.JSStringCreateWithUTF8CString(hz.ptr);
-                        defer jsc.JSStringRelease(href);
-                        const sref = jsc.JSStringCreateWithUTF8CString(sz.ptr);
-                        defer jsc.JSStringRelease(sref);
-                        var args = [_]jsc.JSValueRef{ getNullValue(ctx), jsc.JSValueMakeString(ctx, href), jsc.JSValueMakeString(ctx, sref) };
-                        _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(item.callback), null, 3, &args, null);
-                    }
+            }
+        },
+        .reverse => {
+            if (item.reverse_hostnames) |hosts| {
+                defer allocator.free(hosts);
+                for (hosts) |hh| allocator.free(hh);
+                const arr = jsc.JSObjectMakeArray(ctx, 0, &empty_arr, null);
+                const k_push = jsc.JSStringCreateWithUTF8CString("push");
+                defer jsc.JSStringRelease(k_push);
+                const push_fn = jsc.JSObjectGetProperty(ctx, arr, k_push, null);
+                for (hosts) |hh| {
+                    const z = allocator.dupeZ(u8, hh) catch continue;
+                    defer allocator.free(z);
+                    const ref = jsc.JSStringCreateWithUTF8CString(z.ptr);
+                    defer jsc.JSStringRelease(ref);
+                    var push_args = [_]jsc.JSValueRef{jsc.JSValueMakeString(ctx, ref)};
+                    _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(push_fn), arr, 1, &push_args, null);
                 }
-            },
-            .reverse => {
-                if (item.reverse_hostnames) |hosts| {
-                    defer allocator.free(hosts);
-                    for (hosts) |hh| allocator.free(hh);
-                    const arr = jsc.JSObjectMakeArray(ctx, 0, &empty_arr, null);
-                    const k_push = jsc.JSStringCreateWithUTF8CString("push");
-                    defer jsc.JSStringRelease(k_push);
-                    const push_fn = jsc.JSObjectGetProperty(ctx, arr, k_push, null);
-                    for (hosts) |hh| {
-                        const z = allocator.dupeZ(u8, hh) catch continue;
-                        defer allocator.free(z);
-                        const ref = jsc.JSStringCreateWithUTF8CString(z.ptr);
-                        defer jsc.JSStringRelease(ref);
-                        var push_args = [_]jsc.JSValueRef{jsc.JSValueMakeString(ctx, ref)};
-                        _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(push_fn), arr, 1, &push_args, null);
-                    }
-                    var args = [_]jsc.JSValueRef{ getNullValue(ctx), arr };
-                    _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(item.callback), null, 2, &args, null);
+                var args = [_]jsc.JSValueRef{ getNullValue(ctx), arr };
+                _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(item.callback), null, 2, &args, null);
+            }
+        },
+        .resolve4, .resolve6 => {
+            if (item.resolve_addresses) |addrs| {
+                defer allocator.free(addrs);
+                for (addrs) |a| allocator.free(a);
+                const arr = jsc.JSObjectMakeArray(ctx, 0, &empty_arr, null);
+                const k_push = jsc.JSStringCreateWithUTF8CString("push");
+                defer jsc.JSStringRelease(k_push);
+                const push_fn = jsc.JSObjectGetProperty(ctx, arr, k_push, null);
+                for (addrs) |a| {
+                    const z = allocator.dupeZ(u8, a) catch continue;
+                    defer allocator.free(z);
+                    const ref = jsc.JSStringCreateWithUTF8CString(z.ptr);
+                    defer jsc.JSStringRelease(ref);
+                    var push_args = [_]jsc.JSValueRef{jsc.JSValueMakeString(ctx, ref)};
+                    _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(push_fn), arr, 1, &push_args, null);
                 }
-            },
-            .resolve4, .resolve6 => {
-                if (item.resolve_addresses) |addrs| {
-                    defer allocator.free(addrs);
-                    for (addrs) |a| allocator.free(a);
-                    const arr = jsc.JSObjectMakeArray(ctx, 0, &empty_arr, null);
-                    const k_push = jsc.JSStringCreateWithUTF8CString("push");
-                    defer jsc.JSStringRelease(k_push);
-                    const push_fn = jsc.JSObjectGetProperty(ctx, arr, k_push, null);
-                    for (addrs) |a| {
-                        const z = allocator.dupeZ(u8, a) catch continue;
-                        defer allocator.free(z);
-                        const ref = jsc.JSStringCreateWithUTF8CString(z.ptr);
-                        defer jsc.JSStringRelease(ref);
-                        var push_args = [_]jsc.JSValueRef{jsc.JSValueMakeString(ctx, ref)};
-                        _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(push_fn), arr, 1, &push_args, null);
-                    }
-                    var args = [_]jsc.JSValueRef{ getNullValue(ctx), arr };
-                    _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(item.callback), null, 2, &args, null);
-                }
-            },
-        }
+                var args = [_]jsc.JSValueRef{ getNullValue(ctx), arr };
+                _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(item.callback), null, 2, &args, null);
+            }
+        },
     }
-    taken.deinit(allocator);
+}
+
+/// 主线程 drain：每次持锁取出一条 PendingDns，锁外调用 processOnePendingDns，避免 ArrayListUnmanaged deinit 的 alloc 边界问题。
+fn drainPendingDns(ctx: jsc.JSContextRef) void {
+    const allocator = globals.current_allocator orelse return;
+    const io = libs_io.getProcessIo() orelse return;
+    while (true) {
+        var item: PendingDns = undefined;
+        {
+            g_dns_pending_mutex.lock(io) catch return;
+            defer g_dns_pending_mutex.unlock(io);
+            if (g_dns_pending) |*list_ptr| {
+                if (list_ptr.items.len == 0) break;
+                item = list_ptr.swapRemove(list_ptr.items.len - 1);
+            } else break;
+        }
+        _ = g_dns_pending_count.fetchSub(1, .monotonic);
+        defer jsc.JSValueUnprotect(ctx, item.callback);
+        processOnePendingDns(ctx, allocator, &item);
+    }
 }
 
 fn dnsTickCallback(
@@ -274,7 +280,7 @@ fn dnsTickCallback(
     _: [*]jsc.JSValueRef,
 ) callconv(.c) jsc.JSValueRef {
     drainPendingDns(ctx);
-    if (g_dns_pending_count.load(.monotonic) > 0) scheduleDnsTick(ctx);
+    g_dns_tick_scheduled.store(false, .release);
     return jsc.JSValueMakeUndefined(ctx);
 }
 
@@ -324,7 +330,6 @@ fn lookupThreadMain(args: *LookupArgs) void {
         g_dns_pending_mutex.lock(io) catch return;
         defer g_dns_pending_mutex.unlock(io);
         if (g_dns_pending) |*list| list.append(allocator, result) catch {};
-        scheduleDnsTick(args.ctx);
         return;
     };
     defer allocator.free(host_z);
@@ -343,7 +348,6 @@ fn lookupThreadMain(args: *LookupArgs) void {
         g_dns_pending_mutex.lock(io) catch return;
         defer g_dns_pending_mutex.unlock(io);
         if (g_dns_pending) |*list| list.append(allocator, result) catch {};
-        scheduleDnsTick(args.ctx);
         return;
     }
     defer if (res) |r| std.c.freeaddrinfo(r);
@@ -352,7 +356,6 @@ fn lookupThreadMain(args: *LookupArgs) void {
         g_dns_pending_mutex.lock(io) catch return;
         defer g_dns_pending_mutex.unlock(io);
         if (g_dns_pending) |*list| list.append(allocator, result) catch {};
-        scheduleDnsTick(args.ctx);
         return;
     };
     defer addrs.deinit(allocator);
@@ -401,7 +404,6 @@ fn lookupThreadMain(args: *LookupArgs) void {
         }
         if (result.lookup_address) |a| allocator.free(a);
     };
-    scheduleDnsTick(args.ctx);
 }
 
 /// dns.lookup(hostname[, options], callback) — Node 兼容：options 可为 { family, all, hints }
@@ -491,7 +493,6 @@ fn lookupServiceThreadMain(args: *LookupServiceArgs) void {
         g_dns_pending_mutex.lock(io) catch return;
         defer g_dns_pending_mutex.unlock(io);
         if (g_dns_pending) |*list| list.append(allocator, result) catch {};
-        scheduleDnsTick(args.ctx);
         return;
     };
     var addr: std.c.sockaddr.in = undefined;
@@ -503,7 +504,6 @@ fn lookupServiceThreadMain(args: *LookupServiceArgs) void {
         g_dns_pending_mutex.lock(io) catch return;
         defer g_dns_pending_mutex.unlock(io);
         if (g_dns_pending) |*list| list.append(allocator, result) catch {};
-        scheduleDnsTick(args.ctx);
         return;
     };
     defer allocator.free(addr_z);
@@ -512,7 +512,6 @@ fn lookupServiceThreadMain(args: *LookupServiceArgs) void {
         g_dns_pending_mutex.lock(io) catch return;
         defer g_dns_pending_mutex.unlock(io);
         if (g_dns_pending) |*list| list.append(allocator, result) catch {};
-        scheduleDnsTick(args.ctx);
         return;
     }
     var host_buf: [256]u8 = undefined;
@@ -531,7 +530,6 @@ fn lookupServiceThreadMain(args: *LookupServiceArgs) void {
     defer g_dns_pending_mutex.unlock(io);
     if (g_dns_pending == null) g_dns_pending = std.ArrayListUnmanaged(PendingDns).initCapacity(allocator, 4) catch null;
     if (g_dns_pending) |*list| list.append(allocator, result) catch {};
-    scheduleDnsTick(args.ctx);
     _ = port_str;
 }
 
@@ -606,7 +604,6 @@ fn reverseThreadMain(args: *ReverseArgs) void {
         g_dns_pending_mutex.lock(io) catch return;
         defer g_dns_pending_mutex.unlock(io);
         if (g_dns_pending) |*list| list.append(allocator, result) catch {};
-        scheduleDnsTick(args.ctx);
         return;
     };
     defer allocator.free(ip_z);
@@ -615,7 +612,6 @@ fn reverseThreadMain(args: *ReverseArgs) void {
         g_dns_pending_mutex.lock(io) catch return;
         defer g_dns_pending_mutex.unlock(io);
         if (g_dns_pending) |*list| list.append(allocator, result) catch {};
-        scheduleDnsTick(args.ctx);
         return;
     }
     var host_buf: [512]u8 = undefined;
@@ -635,7 +631,6 @@ fn reverseThreadMain(args: *ReverseArgs) void {
                 defer g_dns_pending_mutex.unlock(io);
                 if (g_dns_pending == null) g_dns_pending = std.ArrayListUnmanaged(PendingDns).initCapacity(allocator, 4) catch null;
                 if (g_dns_pending) |*list| list.append(allocator, result) catch {};
-                scheduleDnsTick(args.ctx);
                 return;
             };
             result.reverse_hostnames = arr;
@@ -646,7 +641,6 @@ fn reverseThreadMain(args: *ReverseArgs) void {
     defer g_dns_pending_mutex.unlock(io);
     if (g_dns_pending == null) g_dns_pending = std.ArrayListUnmanaged(PendingDns).initCapacity(allocator, 4) catch null;
     if (g_dns_pending) |*list| list.append(allocator, result) catch {};
-    scheduleDnsTick(args.ctx);
 }
 
 fn reverseCallback(
@@ -716,7 +710,6 @@ fn resolveThreadMain(args: *ResolveArgs) void {
         g_dns_pending_mutex.lock(io) catch return;
         defer g_dns_pending_mutex.unlock(io);
         if (g_dns_pending) |*list| list.append(allocator, result) catch {};
-        scheduleDnsTick(args.ctx);
         return;
     };
     defer allocator.free(host_z);
@@ -732,7 +725,6 @@ fn resolveThreadMain(args: *ResolveArgs) void {
         g_dns_pending_mutex.lock(io) catch return;
         defer g_dns_pending_mutex.unlock(io);
         if (g_dns_pending) |*list| list.append(allocator, result) catch {};
-        scheduleDnsTick(args.ctx);
         return;
     }
     defer if (res) |r| std.c.freeaddrinfo(r);
@@ -741,7 +733,6 @@ fn resolveThreadMain(args: *ResolveArgs) void {
         g_dns_pending_mutex.lock(io) catch return;
         defer g_dns_pending_mutex.unlock(io);
         if (g_dns_pending) |*list| list.append(allocator, result) catch {};
-        scheduleDnsTick(args.ctx);
         return;
     };
     defer addrs.deinit(allocator);
@@ -767,7 +758,6 @@ fn resolveThreadMain(args: *ResolveArgs) void {
     defer g_dns_pending_mutex.unlock(io);
     if (g_dns_pending == null) g_dns_pending = std.ArrayListUnmanaged(PendingDns).initCapacity(allocator, 4) catch null;
     if (g_dns_pending) |*list| list.append(allocator, result) catch {};
-    scheduleDnsTick(args.ctx);
 }
 
 fn resolve4Callback(
@@ -990,9 +980,10 @@ fn setStringConst(ctx: jsc.JSContextRef, obj: jsc.JSObjectRef, name: []const u8,
     _ = jsc.JSObjectSetProperty(ctx, obj, k, jsc.JSValueMakeString(ctx, v), jsc.kJSPropertyAttributeNone, null);
 }
 
-/// 返回 shu:dns 的 exports（与 node:dns 对齐）
+/// 返回 shu:dns 的 exports（与 node:dns 对齐）。首次加载时注册 drain_dns_pending，供主线程 runMicrotasks 时调度待处理 DNS 回调（工作线程不得使用 ctx）。
 pub fn getExports(ctx: jsc.JSContextRef, allocator: std.mem.Allocator) jsc.JSValueRef {
     _ = allocator;
+    globals.drain_dns_pending = &drainDnsPending;
     const dns_obj = jsc.JSObjectMake(ctx, null, null);
     common.setMethod(ctx, dns_obj, "lookup", lookupCallback);
     common.setMethod(ctx, dns_obj, "lookupService", lookupServiceCallback);
