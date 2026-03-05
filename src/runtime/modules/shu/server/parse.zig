@@ -5,17 +5,35 @@ const std = @import("std");
 const types = @import("types.zig");
 const libs_io = @import("libs_io");
 
+/// 00 §1.6 Lane 填充：read_buf 末尾预留字节数，供 indexOfCrLfCrLf SIMD 无尾部分支盲读
+const lane_pad = 64;
+
 // ------------------------------------------------------------------------------
-// 热路径头值匹配用 comptime 常量（§2.1 固定串比较）
+// 热路径头值匹配：comptime 常量 + u64 前缀比较（00 §2.1 减少分支预测失败）
 // ------------------------------------------------------------------------------
+/// 取 name 前 8 字节按小端解释为 u64；不足 8 字节则零填充。用于与 comptime prefix8 比较，一次整型比较替代逐字节 eql。00 §5.2 热路径内联。
+inline fn readU64HeaderPrefix(name: []const u8) u64 {
+    if (name.len >= 8) return @as(u64, @bitCast(name[0..8].*));
+    var buf: [8]u8 = [_]u8{0} ** 8;
+    @memcpy(buf[0..name.len], name);
+    return @as(u64, @bitCast(buf));
+}
+/// comptime：将字符串前 8 字节（不足则零填充）转为 u64，供运行时一次整型比较。00 §5.2 内联。
+inline fn prefix8(comptime s: []const u8) u64 {
+    var buf: [8]u8 = [_]u8{0} ** 8;
+    const n = @min(8, s.len);
+    for (s[0..n], buf[0..n]) |a, *b| b.* = a;
+    return @as(u64, @bitCast(buf));
+}
+
 const CANDIDATE_CLOSE: []const u8 = "close";
 const CANDIDATE_BR: []const u8 = "br";
 const CANDIDATE_GZIP: []const u8 = "gzip";
 const CANDIDATE_DEFLATE: []const u8 = "deflate";
 const CANDIDATE_CHUNKED: []const u8 = "chunked";
 
-/// 已知头名单次扫描：在 head 中找 "\r\n" + name（不区分大小写） + ": "，返回冒号后的值切片；无 splitScalar（§2.1 快路径）
-fn getHeaderByKnownName(head: []const u8, name: []const u8) ?[]const u8 {
+/// 已知头名单次扫描：在 head 中找 "\r\n" + name（不区分大小写） + ": "，返回冒号后的值切片；无 splitScalar（§2.1 快路径）。00 §5.2 热路径内联。
+inline fn getHeaderByKnownName(head: []const u8, name: []const u8) ?[]const u8 {
     const prefix_len = 2 + name.len + 2; // "\r\n" + name + ": "
     var i: usize = 0;
     while (i + prefix_len <= head.len) {
@@ -29,17 +47,18 @@ fn getHeaderByKnownName(head: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// 在原始头部块 head 上按名查找头值（不区分大小写），返回指向 head 内的切片，零拷贝；首行可为请求行（无 ": " 则跳过）
-/// 热路径常用头名走单次扫描快路径（§2.1）
-pub fn getHeader(head: []const u8, name: []const u8) ?[]const u8 {
+/// [Borrows] 在原始头部块 head 上按名查找头值（不区分大小写），返回指向 head 内的切片，零拷贝；首行可为请求行（无 ": " 则跳过）。
+/// 热路径常用头名：comptime name 时按 name.len 分派 + u64 前缀一次整型比较（00 §2.1）；运行时 name 走通用分支。
+// Hot-path
+pub inline fn getHeader(head: []const u8, comptime name: []const u8) ?[]const u8 {
     switch (name.len) {
-        7 => if (std.mem.eql(u8, name, "upgrade")) return getHeaderByKnownName(head, "upgrade"),
-        10 => if (std.mem.eql(u8, name, "connection")) return getHeaderByKnownName(head, "connection"),
-        14 => if (std.mem.eql(u8, name, "content-length")) return getHeaderByKnownName(head, "content-length"),
-        16 => if (std.mem.eql(u8, name, "accept-encoding")) return getHeaderByKnownName(head, "accept-encoding"),
-        17 => if (std.mem.eql(u8, name, "transfer-encoding")) return getHeaderByKnownName(head, "transfer-encoding"),
-        18 => if (std.mem.eql(u8, name, "sec-websocket-key")) return getHeaderByKnownName(head, "sec-websocket-key"),
-        20 => if (std.mem.eql(u8, name, "sec-websocket-accept")) return getHeaderByKnownName(head, "sec-websocket-accept"),
+        7 => if (readU64HeaderPrefix(name) == prefix8("upgrade")) return getHeaderByKnownName(head, "upgrade"),
+        10 => if (readU64HeaderPrefix(name) == prefix8("connection")) return getHeaderByKnownName(head, "connection"),
+        14 => if (readU64HeaderPrefix(name) == prefix8("content-length")) return getHeaderByKnownName(head, "content-length"),
+        16 => if (readU64HeaderPrefix(name) == prefix8("accept-encoding")) return getHeaderByKnownName(head, "accept-encoding"),
+        17 => if (readU64HeaderPrefix(name) == prefix8("transfer-encoding")) return getHeaderByKnownName(head, "transfer-encoding"),
+        18 => if (readU64HeaderPrefix(name) == prefix8("sec-websocket-key")) return getHeaderByKnownName(head, "sec-websocket-key"),
+        20 => if (readU64HeaderPrefix(name) == prefix8("sec-websocket-accept")) return getHeaderByKnownName(head, "sec-websocket-accept"),
         else => {},
     }
     var line_it = std.mem.splitScalar(u8, head, '\n');
@@ -85,8 +104,8 @@ pub fn iterHeaderLines(head: []const u8) struct {
     return .{ .head = head };
 }
 
-/// 判断请求头是否要求关闭连接：Connection 值中包含 "close"（不区分大小写）即视为关闭；使用 comptime 常量长度
-pub fn clientWantsClose(parsed: *const types.ParsedRequest) bool {
+/// 判断请求头是否要求关闭连接：Connection 值中包含 "close"（不区分大小写）即视为关闭；使用 comptime 常量长度。00 §5.2 热路径内联。
+pub inline fn clientWantsClose(parsed: *const types.ParsedRequest) bool {
     const v = getHeader(parsed.headers_head, "connection") orelse return false;
     if (v.len < CANDIDATE_CLOSE.len) return false;
     var i: usize = 0;
@@ -97,8 +116,8 @@ pub fn clientWantsClose(parsed: *const types.ParsedRequest) bool {
     return false;
 }
 
-/// 按优先级选出的压缩方式：br > gzip > deflate，一次解析 Accept-Encoding；使用 comptime 常量匹配
-pub fn chooseAcceptEncoding(parsed: *const types.ParsedRequest) enum { br, gzip, deflate, none } {
+/// 按优先级选出的压缩方式：br > gzip > deflate，一次解析 Accept-Encoding；使用 comptime 常量匹配。00 §5.2 热路径内联。
+pub inline fn chooseAcceptEncoding(parsed: *const types.ParsedRequest) enum { br, gzip, deflate, none } {
     const v = getHeader(parsed.headers_head, "accept-encoding") orelse return .none;
     if (v.len < CANDIDATE_BR.len) return .none;
     var i: usize = 0;
@@ -116,8 +135,8 @@ pub fn chooseAcceptEncoding(parsed: *const types.ParsedRequest) enum { br, gzip,
     return .none;
 }
 
-/// Transfer-Encoding 头是否包含 chunked（不区分大小写；用于请求体解析）；使用 comptime 常量
-pub fn transferEncodingChunked(header_value: []const u8) bool {
+/// Transfer-Encoding 头是否包含 chunked（不区分大小写；用于请求体解析）；使用 comptime 常量。00 §5.2 热路径内联。
+pub inline fn transferEncodingChunked(header_value: []const u8) bool {
     if (header_value.len < CANDIDATE_CHUNKED.len) return false;
     var i: usize = 0;
     while (i <= header_value.len - CANDIDATE_CHUNKED.len) {
@@ -127,11 +146,11 @@ pub fn transferEncodingChunked(header_value: []const u8) bool {
     return false;
 }
 
-/// 从 buf 增量解析 chunked body，结果追加到 body_out；max_body 为 body 总长上限
+/// 从 buf 增量解析 chunked body，结果追加到 body_out；max_body 为 body 总长上限（01 §1.2 Unmanaged）
 /// 返回 null 表示需要更多数据；返回 .{ consumed, done } 表示本轮消费的字节数及是否解析完（含 trailer）
 pub fn parseChunkedIncremental(
     buf: []const u8,
-    body_out: *std.ArrayList(u8),
+    body_out: *std.ArrayListUnmanaged(u8),
     max_body: usize,
     allocator: std.mem.Allocator,
     state: *types.ChunkedParseState,
@@ -180,16 +199,21 @@ pub fn parseChunkedIncremental(
     return null;
 }
 
-/// 从流中按 Transfer-Encoding: chunked 格式读取 body，返回组装后的 body（上限 max_body，由 options.maxRequestBodySize 配置）
+/// 热路径 chunked body 解析的窄化错误集（01 §2.1）
+pub const ChunkedBodyError = error{ OutOfMemory, ConnectionClosed, InvalidRequest, RequestEntityTooLarge };
+/// 热路径 parseHttpRequest 的窄化错误集（01 §2.1），利于跳转表与分支预测
+pub const ParseRequestError = error{ ConnectionClosed, InvalidRequest, BadRequest, RequestEntityTooLarge, OutOfMemory };
+/// [Allocates] 调用方负责 free 返回的 body 切片。从流中按 Transfer-Encoding: chunked 格式读取 body，返回组装后的 body（上限 max_body，由 options.maxRequestBodySize 配置）。01 §1.2 使用 ArrayListUnmanaged 避免结构体内存存 allocator。
+/// read_buf 须 64 字节对齐（00 §1.6），内部调用 reader.read 时转为 []u8 以匹配 std.Io。
 pub fn readChunkedBody(
     allocator: std.mem.Allocator,
     reader: anytype,
-    read_buf: []u8,
+    read_buf: []align(64) u8,
     body_start: usize,
     total_read: usize,
     max_body: usize,
-) ![]const u8 {
-    var result = std.ArrayList(u8).initCapacity(allocator, 0) catch return error.OutOfMemory;
+) ChunkedBodyError![]const u8 {
+    var result = std.ArrayListUnmanaged(u8).initCapacity(allocator, 0) catch return error.OutOfMemory;
     errdefer result.deinit(allocator);
     var pos = body_start;
     var end = total_read;
@@ -199,7 +223,8 @@ pub fn readChunkedBody(
         var line_len: usize = 0;
         while (line_len < line_buf.len) {
             if (pos >= end) {
-                const n = reader.read(read_buf) catch return error.ConnectionClosed;
+                const as_u8 = @as([*]u8, @ptrCast(read_buf.ptr))[0..read_buf.len];
+                const n = reader.read(as_u8) catch return error.ConnectionClosed;
                 end = n;
                 pos = 0;
                 if (n == 0) return error.InvalidRequest;
@@ -221,7 +246,8 @@ pub fn readChunkedBody(
             var empty_line = true;
             while (true) {
                 if (pos >= end) {
-                    const n = reader.read(read_buf) catch return error.ConnectionClosed;
+                    const as_u8 = @as([*]u8, @ptrCast(read_buf.ptr))[0..read_buf.len];
+                    const n = reader.read(as_u8) catch return error.ConnectionClosed;
                     end = n;
                     pos = 0;
                     if (n == 0) break;
@@ -241,7 +267,8 @@ pub fn readChunkedBody(
         var to_read = chunk_size;
         while (to_read > 0) {
             if (pos >= end) {
-                const n = reader.read(read_buf) catch return error.ConnectionClosed;
+                const as_u8 = @as([*]u8, @ptrCast(read_buf.ptr))[0..read_buf.len];
+                const n = reader.read(as_u8) catch return error.ConnectionClosed;
                 end = n;
                 pos = 0;
                 if (n == 0) return error.InvalidRequest;
@@ -253,7 +280,8 @@ pub fn readChunkedBody(
             to_read -= take;
         }
         if (pos >= end) {
-            const n = reader.read(read_buf) catch return error.ConnectionClosed;
+            const as_u8 = @as([*]u8, @ptrCast(read_buf.ptr))[0..read_buf.len];
+            const n = reader.read(as_u8) catch return error.ConnectionClosed;
             end = n;
             pos = 0;
         }
@@ -264,12 +292,15 @@ pub fn readChunkedBody(
     return result.toOwnedSlice(allocator);
 }
 
-/// 在 buf 中查找 "\r\n\r\n" 的偏移；统一使用 libs_io.simd_scan 的向量化实现，与路线图「协议解析 SIMD 统一」一致
-pub fn indexOfCrLfCrLf(buf: []const u8) ?usize {
+/// 在 buf 中查找 "\r\n\r\n" 的偏移；统一使用 libs_io.simd_scan 的向量化实现。
+/// 调用方已做 Lane 填充（00 §1.6）：传 buf[0..filled+64] 且末尾 64 字节已清零，消除 SIMD 尾部分支。00 §5.2 热路径内联。
+// Hot-path
+pub inline fn indexOfCrLfCrLf(buf: []const u8) ?usize {
     return libs_io.simd_scan.indexOfCrLfCrLf(buf);
 }
 
-/// 仅从已有 buffer 解析请求头（不读 body）；用于 I/O 多路复用：若尚未出现 \r\n\r\n 则返回 NeedMore；会 dupe 头部到 request_allocator
+/// [Allocates] 仅从已有 buffer 解析请求头（不读 body）；parsed.headers_head 由 request_allocator 分配，由调用方或 Arena 统一释放。用于 I/O 多路复用：若尚未出现 \r\n\r\n 则返回 NeedMore。
+// Hot-path
 pub fn tryParseHeadersFromBuffer(
     request_allocator: std.mem.Allocator,
     read_buf: []const u8,
@@ -293,7 +324,8 @@ pub fn tryParseHeadersFromBuffer(
     };
 }
 
-/// 零拷贝版：从 read_buf 解析请求头，parsed.method / .path / .headers_head 均指向 read_buf 内切片，不做 dupe；调用方须保证 read_buf 在 parsed 使用期间有效（如至下一次 pollCompletions）
+/// [Borrows] 零拷贝版：从 read_buf 解析请求头，parsed.method / .path / .headers_head 均指向 read_buf 内切片；调用方须保证 read_buf 在 parsed 使用期间有效（如至下一次 pollCompletions）。
+// Hot-path
 pub fn tryParseHeadersFromBufferZeroCopy(
     read_buf: []const u8,
     config: *const types.ServerConfig,
@@ -315,25 +347,36 @@ pub fn tryParseHeadersFromBufferZeroCopy(
     };
 }
 
-/// 从流中读取并解析 HTTP 请求（请求行 + 头 + 可选 body）
-/// 使用 read_buf 复用连接内读缓冲；头部零拷贝（method/path/headers_head 指向 read_buf），body 用 request_allocator；调用方须在下次覆盖 read_buf 前完成对 parsed 的使用。
+/// [Allocates] 从流中读取并解析 HTTP 请求（请求行 + 头 + 可选 body）；body 若存在由 request_allocator 分配，调用方或 Arena 负责释放。头部零拷贝（method/path/headers_head 指向 read_buf）；调用方须在下次覆盖 read_buf 前完成对 parsed 的使用。
+/// read_buf 须 64 字节对齐（00 §1.6），内部调用 reader.read 时转为 []u8 以匹配 std.Io。
+// Hot-path
 pub fn parseHttpRequest(
     request_allocator: std.mem.Allocator,
     reader: anytype,
-    read_buf: []u8,
+    read_buf: []align(64) u8,
     config: *const types.ServerConfig,
-) !types.ParsedRequest {
+) ParseRequestError!types.ParsedRequest {
     var total_read: usize = 0;
-    const max = read_buf.len;
+    // 00 §1.6：预留末尾 lane_pad 字节不读入，用于 Lane 填充；解析时传 padded 切片消除 SIMD 尾部分支
+    const max = if (read_buf.len > lane_pad) read_buf.len - lane_pad else 0;
 
     while (total_read < max) {
-        const n = reader.read(read_buf[total_read..]) catch return error.ConnectionClosed;
+        const tail = read_buf[total_read..max];
+        const as_u8: []u8 = @as([*]u8, @ptrCast(tail.ptr))[0..tail.len];
+        const n = reader.read(as_u8) catch return error.ConnectionClosed;
         if (n == 0) break;
         total_read += n;
-        if (std.mem.indexOf(u8, read_buf[0..total_read], "\r\n\r\n")) |_| break;
+        if (indexOfCrLfCrLf(read_buf[0..total_read]) != null) break;
     }
-    const head_slice = read_buf[0..total_read];
-    const zero_copy_result = tryParseHeadersFromBufferZeroCopy(head_slice, config) catch |e| {
+    // Lane 填充：末尾 64 字节清零后传予 indexOfCrLfCrLf，使 SIMD 无 if (remaining < 64) 分支
+    const head_for_parse: []const u8 = blk: {
+        if (total_read + lane_pad <= read_buf.len) {
+            @memset(read_buf[total_read..][0..lane_pad], 0);
+            break :blk @as([*]const u8, @ptrCast(read_buf.ptr))[0..total_read + lane_pad];
+        }
+        break :blk @as([*]const u8, @ptrCast(read_buf.ptr))[0..total_read];
+    };
+    const zero_copy_result = tryParseHeadersFromBufferZeroCopy(head_for_parse, config) catch |e| {
         return switch (e) {
             error.NeedMore => error.InvalidRequest,
             error.BadRequest => error.BadRequest,
