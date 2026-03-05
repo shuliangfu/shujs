@@ -29,6 +29,22 @@ test "Shu.path.join: multiple parts" {
     try std.testing.expectEqualStrings(expected, out);
 }
 
+test "Shu.path.join: single part" {
+    const allocator = std.testing.allocator;
+    const out = try run(allocator, "console.log(Shu.path.join('a'))");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("a", out);
+}
+
+test "Shu.path.join: with empty segment" {
+    const allocator = std.testing.allocator;
+    const out = try run(allocator, "console.log(Shu.path.join('a','','c'))");
+    defer allocator.free(out);
+    const expected = try std.fmt.allocPrint(allocator, "a{s}{s}c", .{ sep, sep });
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, out);
+}
+
 test "Shu.path.dirname" {
     const allocator = std.testing.allocator;
     const out = try run(allocator, "console.log(Shu.path.dirname('/a/b/c'))");
@@ -55,6 +71,27 @@ test "Shu.path.extname" {
     const out = try run(allocator, "console.log(Shu.path.extname('file.zig'))");
     defer allocator.free(out);
     try std.testing.expectEqualStrings(".zig", out);
+}
+
+test "Shu.path.extname: no extension" {
+    const allocator = std.testing.allocator;
+    const out = try run(allocator, "console.log(Shu.path.extname('file'))");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("", out);
+}
+
+test "Shu.path.dirname: single segment" {
+    const allocator = std.testing.allocator;
+    const out = try run(allocator, "console.log(Shu.path.dirname('foo'))");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(".", out);
+}
+
+test "Shu.path.normalize: dot and dotdot" {
+    const allocator = std.testing.allocator;
+    const out = try run(allocator, "console.log(Shu.path.normalize('/a/./b/../c'))");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("/a/c", out);
 }
 
 test "Shu.path.isAbsolute: absolute" {
