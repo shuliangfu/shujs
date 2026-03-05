@@ -355,6 +355,58 @@ fn parseTestCoverageDir(allocator: std.mem.Allocator, positional: []const []cons
     return null;
 }
 
+/// 判断 positional[i] 是否为「带单独取值的选项」（下一项为值，需跳过）。
+fn optionTakesNextArg(arg: []const u8) bool {
+    if (arg.len == 0 or arg[0] != '-') return false;
+    if (std.mem.eql(u8, arg, "--filter")) return true;
+    if (std.mem.eql(u8, arg, "--jobs")) return true;
+    if (std.mem.eql(u8, arg, "--bail")) return true;
+    if (std.mem.eql(u8, arg, "--shard")) return true;
+    if (std.mem.eql(u8, arg, "--test-name-pattern") or std.mem.eql(u8, arg, "-t")) return true;
+    if (std.mem.eql(u8, arg, "--test-skip-pattern")) return true;
+    if (std.mem.eql(u8, arg, "--timeout")) return true;
+    if (std.mem.eql(u8, arg, "--retry")) return true;
+    if (std.mem.eql(u8, arg, "--reporter")) return true;
+    if (std.mem.eql(u8, arg, "--reporter-outfile")) return true;
+    if (std.mem.eql(u8, arg, "--preload")) return true;
+    if (std.mem.eql(u8, arg, "--seed")) return true;
+    if (std.mem.eql(u8, arg, "--coverage-dir")) return true;
+    return false;
+}
+
+/// [Allocates] 从 positional 解析「仅跑这些文件」：非选项且非选项值的参数视为文件路径。无则返回 null；有则返回列表，每项为 run_path 形式（如 tests/foo.test.js），调用方逐项 free 并 list.deinit。
+fn parsePositionalTestFiles(allocator: std.mem.Allocator, positional: []const []const u8) ?std.ArrayList([]const u8) {
+    var list = std.ArrayList([]const u8).initCapacity(allocator, 0) catch return null;
+    var i: usize = 0;
+    while (i < positional.len) : (i += 1) {
+        const arg = positional[i];
+        if (arg.len > 0 and arg[0] == '-') {
+            if (std.mem.eql(u8, arg, "--shard")) {
+                i += 2;
+                continue;
+            }
+            if (optionTakesNextArg(arg)) {
+                i += 1;
+                continue;
+            }
+            continue;
+        }
+        const run_path = if (std.mem.startsWith(u8, arg, "tests/"))
+            allocator.dupe(u8, arg) catch continue
+        else
+            libs_io.pathJoin(allocator, &.{ "tests", arg }) catch continue;
+        list.append(allocator, run_path) catch {
+            allocator.free(run_path);
+            continue;
+        };
+    }
+    if (list.items.len == 0) {
+        list.deinit(allocator);
+        return null;
+    }
+    return list;
+}
+
 /// [Allocates] 从 positional 汇总解析 TestOptions。调用方负责对返回结构体中的字符串字段 free。
 fn parseTestOptions(allocator: std.mem.Allocator, positional: []const []const u8) TestOptions {
     const shard = parseTestShard(allocator, positional);
@@ -381,7 +433,6 @@ fn parseTestOptions(allocator: std.mem.Allocator, positional: []const []const u8
 /// 执行 shu test：有 scripts.test 则用 shell 执行；否则默认扫描 tests/ 下 *.test.ts、*.test.js、*.spec.ts、*.spec.js（排除 default_exclude_dirs），对每个文件执行 shu run。
 /// 支持 positional 中的 --jobs=N 以并行执行多测试文件。
 pub fn runTest(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional: []const []const u8, io: std.Io) !void {
-    _ = parsed;
     const default_jobs = std.Thread.getCpuCount() catch 1;
     const jobs = @min(parseTestJobs(positional) orelse default_jobs, 64);
     try version.printCommandHeader(io, "test");
@@ -408,7 +459,12 @@ pub fn runTest(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional
 
     var loaded = manifest.Manifest.load(allocator, cwd_owned) catch |e| {
         if (e == error.ManifestNotFound) {
-            return runDefaultTests(allocator, cwd_owned, io, jobs, filter, &options);
+            var explicit = parsePositionalTestFiles(allocator, positional);
+            defer if (explicit) |*list| {
+                for (list.items) |p| allocator.free(p);
+                list.deinit(allocator);
+            };
+            return runDefaultTests(allocator, cwd_owned, io, jobs, filter, &options, &parsed, if (explicit) |*list_ptr| list_ptr else null);
         }
         return e;
     };
@@ -424,10 +480,70 @@ pub fn runTest(allocator: std.mem.Allocator, parsed: args.ParsedArgs, positional
         return;
     }
 
-    return runDefaultTests(allocator, cwd_owned, io, jobs, filter, &options);
+    var explicit = parsePositionalTestFiles(allocator, positional);
+    defer if (explicit) |*list| {
+        for (list.items) |p| allocator.free(p);
+        list.deinit(allocator);
+    };
+    return runDefaultTests(allocator, cwd_owned, io, jobs, filter, &options, &parsed, if (explicit) |*list_ptr| list_ptr else null);
 }
 
-/// 并行执行时的 worker 上下文；paths 与 cwd_owned、self_exe、options 在 join 前有效，由主线程保证不释放。
+/// 子进程 stderr 中 __SHU_TEST_CASES__ 行的解析结果；未找到时全为 0。
+const CaseSummary = struct { passed: u32, failed: u32, skipped: u32 };
+
+/// 从子进程写入的 SHU_TEST_CASES_FILE 路径读取一行并解析用例数；文件不存在或解析失败返回全 0。读后删除该文件。Deno 风格下子进程 stderr 已 inherit，用例数通过文件回传。经 libs_io 打开/读/删。
+fn readCasesFile(allocator: std.mem.Allocator, io: std.Io, cases_file_path: []const u8) CaseSummary {
+    var f = libs_io.openFileAbsolute(cases_file_path, .{ .mode = .read_only }) catch return .{ .passed = 0, .failed = 0, .skipped = 0 };
+    defer f.close(io);
+    var buf: [256]u8 = undefined;
+    var list = std.ArrayList(u8).initCapacity(allocator, 256) catch return .{ .passed = 0, .failed = 0, .skipped = 0 };
+    defer list.deinit(allocator);
+    var r = f.reader(io, &buf);
+    var dest: [1][]u8 = .{buf[0..]};
+    while (true) {
+        const n = std.Io.Reader.readVec(&r.interface, &dest) catch break;
+        if (n == 0) break;
+        list.appendSlice(allocator, buf[0..n]) catch break;
+    }
+    libs_io.deleteFileAbsolute(cases_file_path) catch {};
+    return parseShuTestCasesFromSlice(list.items);
+}
+
+/// 在 data 中查找 __SHU_TEST_CASES__ 行并解析 JSON 得到 passed/failed/skipped；未找到或解析失败返回全 0。
+fn parseShuTestCasesFromSlice(data: []const u8) CaseSummary {
+    const prefix = "__SHU_TEST_CASES__";
+    var iter = std.mem.splitScalar(u8, data, '\n');
+    while (iter.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \r");
+        if (!std.mem.startsWith(u8, trimmed, prefix)) continue;
+        const json_slice = std.mem.trim(u8, trimmed[prefix.len..], " \r");
+        if (json_slice.len == 0) return .{ .passed = 0, .failed = 0, .skipped = 0 };
+        var passed: u32 = 0;
+        var failed: u32 = 0;
+        var skipped: u32 = 0;
+        const keys = .{
+            .{ "\"passed\":", &passed },
+            .{ "\"failed\":", &failed },
+            .{ "\"skipped\":", &skipped },
+        };
+        inline for (keys) |kv| {
+            const pos = std.mem.indexOf(u8, json_slice, kv[0]);
+            if (pos) |p| {
+                const i = p + kv[0].len;
+                var end = i;
+                while (end < json_slice.len and std.ascii.isDigit(json_slice[end])) end += 1;
+                parse: {
+                    const val = std.fmt.parseInt(u32, json_slice[i..end], 10) catch break :parse;
+                    kv[1].* = val;
+                }
+            }
+        }
+        return .{ .passed = passed, .failed = failed, .skipped = skipped };
+    }
+    return .{ .passed = 0, .failed = 0, .skipped = 0 };
+}
+
+/// 并行执行时的 worker 上下文；paths 与 cwd_owned、self_exe、options、permissions 在 join 前有效，由主线程保证不释放。
 const TestWorkerCtx = struct {
     allocator: std.mem.Allocator,
     cwd_owned: []const u8,
@@ -436,21 +552,32 @@ const TestWorkerCtx = struct {
     total: usize,
     next_index: std.atomic.Value(usize),
     failed_count: std.atomic.Value(u32),
+    /// 用例级计数：各 worker 解析子进程 stderr 后累加。
+    case_passed: std.atomic.Value(u64),
+    case_failed: std.atomic.Value(u64),
+    case_skipped: std.atomic.Value(u64),
     print_guard: std.atomic.Value(u32),
     io: std.Io,
     /// 测试选项（用于构建子进程 env）；只读，主线程持有。
     options: *const TestOptions,
+    /// 全局解析的权限（--allow-net 等），用于构建子进程 shu run 的 argv。
+    permissions: *const args.ParsedArgs,
     /// 当 options.bail_after != null 时由主线程传入；首个失败时置 true，worker 取任务前检查并退出。
     bail_requested: ?*std.atomic.Value(bool) = null,
 };
 
-/// [Allocates] 由 run_path（如 "tests/example.test.js"）计算对应 snapshot 文件路径：dir/__snapshots__/basename.snap。调用方 free 返回值。
+/// [Allocates] 由 run_path（如 "tests/unit/shu/example.test.js"）计算对应 snapshot 文件路径：项目根下 snapshots/<dir>/<basename>.snap，与常见运行时约定一致。
 fn snapshotFilePathForRunPath(allocator: std.mem.Allocator, run_path: []const u8) ![]const u8 {
     const dir = libs_io.pathDirname(run_path) orelse ".";
     const base = libs_io.pathBasename(run_path);
-    const base_dot_snap = try std.fmt.allocPrint(allocator, "{s}.snap", .{base});
+    var last_dot: ?usize = null;
+    for (base, 0..) |c, i| {
+        if (c == '.') last_dot = i;
+    }
+    const base_no_ext = if (last_dot) |idx| base[0..idx] else base;
+    const base_dot_snap = try std.fmt.allocPrint(allocator, "{s}.snap", .{base_no_ext});
     defer allocator.free(base_dot_snap);
-    return libs_io.pathJoin(allocator, &.{ dir, "__snapshots__", base_dot_snap });
+    return libs_io.pathJoin(allocator, &.{ "snapshots", dir, base_dot_snap });
 }
 
 /// [Allocates] 根据 options 与可选 snapshot_file_path 构建子进程环境（继承当前进程 env 并追加 SHU_TEST_*）。
@@ -496,179 +623,238 @@ fn testFileWorker(ctx: *TestWorkerCtx) void {
         }
         const idx = ctx.next_index.fetchAdd(1, .monotonic);
         if (idx >= ctx.total) break;
-        const item = ctx.paths[idx];
-        const run_path = libs_io.pathJoin(ctx.allocator, &.{ "tests", item }) catch {
-            _ = ctx.failed_count.fetchAdd(1, .monotonic);
-            if (ctx.bail_requested) |bail| bail.store(true, .release);
-            continue;
-        };
-        defer ctx.allocator.free(run_path);
+        const run_path = ctx.paths[idx];
         const snap_path = snapshotFilePathForRunPath(ctx.allocator, run_path) catch {
             _ = ctx.failed_count.fetchAdd(1, .monotonic);
             continue;
         };
         defer ctx.allocator.free(snap_path);
-        while (ctx.print_guard.swap(1, .acquire) != 0) {
-            std.Thread.yield() catch {};
-        }
-        printToStdout(ctx.io, "Running {s} ...\n", .{run_path}) catch {};
-        ctx.print_guard.store(0, .release);
+        var passed: bool = true;
         var argv_buf: [8][]const u8 = undefined;
         argv_buf[0] = ctx.self_exe;
         argv_buf[1] = "run";
-        argv_buf[2] = "--allow-read";
-        argv_buf[3] = run_path;
-        var argv_len: usize = 4;
-        if (ctx.options.update_snapshots or ctx.options.coverage) {
-            argv_buf[4] = "--allow-write";
-            argv_len = 5;
+        var argv_len: usize = 2;
+        if (ctx.permissions.allow_net) {
+            argv_buf[argv_len] = "--allow-net";
+            argv_len += 1;
         }
+        argv_buf[argv_len] = "--allow-read";
+        argv_len += 1;
+        if (ctx.options.update_snapshots or ctx.options.coverage or ctx.permissions.allow_write) {
+            argv_buf[argv_len] = "--allow-write";
+            argv_len += 1;
+        }
+        argv_buf[argv_len] = run_path;
+        argv_len += 1;
         const argv = argv_buf[0..argv_len];
-        if (ctx.options.hasEnvOptions()) {
-            var env = buildTestEnvironMap(ctx.allocator, ctx.options, snap_path) catch {
-                _ = ctx.failed_count.fetchAdd(1, .monotonic);
-                continue;
-            };
-            defer env.deinit();
-            env.put("SHU_TEST_CWD", ctx.cwd_owned) catch {};
-            var child = std.process.spawn(ctx.io, .{
-                .argv = argv,
-                .cwd = .{ .path = ctx.cwd_owned },
-                .environ_map = &env,
-                .stdin = .inherit,
-                .stdout = .inherit,
-                .stderr = .inherit,
-            }) catch {
-                _ = ctx.failed_count.fetchAdd(1, .monotonic);
-                if (ctx.bail_requested) |bail| bail.store(true, .release);
-                continue;
-            };
-            const term = child.wait(ctx.io) catch {
-                _ = ctx.failed_count.fetchAdd(1, .monotonic);
-                if (ctx.bail_requested) |bail| bail.store(true, .release);
-                continue;
-            };
-            switch (term) {
-                .exited => |code| {
-                    if (code != 0) {
-                        _ = ctx.failed_count.fetchAdd(1, .monotonic);
-                        if (ctx.bail_requested) |bail| bail.store(true, .release);
-                    }
-                },
-                .signal, .stopped, .unknown => {
+        blk: {
+            if (ctx.options.hasEnvOptions()) {
+                var env = buildTestEnvironMap(ctx.allocator, ctx.options, snap_path) catch {
                     _ = ctx.failed_count.fetchAdd(1, .monotonic);
-                    if (ctx.bail_requested) |bail| bail.store(true, .release);
-                },
-            }
-        } else {
-            var child = std.process.spawn(ctx.io, .{
-                .argv = argv,
-                .cwd = .{ .path = ctx.cwd_owned },
-                .stdin = .inherit,
-                .stdout = .inherit,
-                .stderr = .inherit,
-            }) catch {
-                _ = ctx.failed_count.fetchAdd(1, .monotonic);
-                if (ctx.bail_requested) |bail| bail.store(true, .release);
-                continue;
-            };
-            const term = child.wait(ctx.io) catch {
-                _ = ctx.failed_count.fetchAdd(1, .monotonic);
-                if (ctx.bail_requested) |bail| bail.store(true, .release);
-                continue;
-            };
-            switch (term) {
-                .exited => |code| {
-                    if (code != 0) {
-                        _ = ctx.failed_count.fetchAdd(1, .monotonic);
-                        if (ctx.bail_requested) |bail| bail.store(true, .release);
-                    }
-                },
-                .signal, .stopped, .unknown => {
+                    passed = false;
+                    break :blk;
+                };
+                defer env.deinit();
+                env.put("SHU_TEST_CWD", ctx.cwd_owned) catch {};
+                var path_buf: [512]u8 = undefined;
+                var cases_buf: [32]u8 = undefined;
+                const file_path_display = std.fmt.bufPrint(&path_buf, "./{s}", .{run_path}) catch run_path;
+                env.put("SHU_TEST_FILE_PATH", file_path_display) catch {};
+                const cases_name = std.fmt.bufPrint(&cases_buf, ".shu-test-cases{d}", .{idx}) catch ".shu-test-cases";
+                const cases_path = libs_io.pathJoin(ctx.allocator, &.{ ctx.cwd_owned, cases_name }) catch break :blk;
+                defer ctx.allocator.free(cases_path);
+                env.put("SHU_TEST_CASES_FILE", cases_path) catch {};
+                var child = std.process.spawn(ctx.io, .{
+                    .argv = argv,
+                    .cwd = .{ .path = ctx.cwd_owned },
+                    .environ_map = &env,
+                    .stdin = .inherit,
+                    .stdout = .inherit,
+                    .stderr = .inherit,
+                }) catch {
                     _ = ctx.failed_count.fetchAdd(1, .monotonic);
+                    passed = false;
                     if (ctx.bail_requested) |bail| bail.store(true, .release);
-                },
+                    break :blk;
+                };
+                const term = child.wait(ctx.io) catch {
+                    _ = ctx.failed_count.fetchAdd(1, .monotonic);
+                    passed = false;
+                    if (ctx.bail_requested) |bail| bail.store(true, .release);
+                    break :blk;
+                };
+                const cases = readCasesFile(ctx.allocator, ctx.io, cases_path);
+                _ = ctx.case_passed.fetchAdd(cases.passed, .monotonic);
+                _ = ctx.case_failed.fetchAdd(cases.failed, .monotonic);
+                _ = ctx.case_skipped.fetchAdd(cases.skipped, .monotonic);
+                switch (term) {
+                    .exited => |code| {
+                        if (code != 0) {
+                            _ = ctx.failed_count.fetchAdd(1, .monotonic);
+                            passed = false;
+                            if (ctx.bail_requested) |bail| bail.store(true, .release);
+                        }
+                    },
+                    .signal, .stopped, .unknown => {
+                        _ = ctx.failed_count.fetchAdd(1, .monotonic);
+                        passed = false;
+                        if (ctx.bail_requested) |bail| bail.store(true, .release);
+                    },
+                }
+            } else {
+                var env = buildTestEnvironMap(ctx.allocator, ctx.options, snap_path) catch {
+                    _ = ctx.failed_count.fetchAdd(1, .monotonic);
+                    passed = false;
+                    break :blk;
+                };
+                defer env.deinit();
+                env.put("SHU_TEST_CWD", ctx.cwd_owned) catch {};
+                var path_buf: [512]u8 = undefined;
+                var cases_buf: [32]u8 = undefined;
+                const file_path_display = std.fmt.bufPrint(&path_buf, "./{s}", .{run_path}) catch run_path;
+                env.put("SHU_TEST_FILE_PATH", file_path_display) catch {};
+                const cases_name = std.fmt.bufPrint(&cases_buf, ".shu-test-cases{d}", .{idx}) catch ".shu-test-cases";
+                const cases_path = libs_io.pathJoin(ctx.allocator, &.{ ctx.cwd_owned, cases_name }) catch break :blk;
+                defer ctx.allocator.free(cases_path);
+                env.put("SHU_TEST_CASES_FILE", cases_path) catch {};
+                var child = std.process.spawn(ctx.io, .{
+                    .argv = argv,
+                    .cwd = .{ .path = ctx.cwd_owned },
+                    .environ_map = &env,
+                    .stdin = .inherit,
+                    .stdout = .inherit,
+                    .stderr = .inherit,
+                }) catch {
+                    _ = ctx.failed_count.fetchAdd(1, .monotonic);
+                    passed = false;
+                    if (ctx.bail_requested) |bail| bail.store(true, .release);
+                    break :blk;
+                };
+                const term = child.wait(ctx.io) catch {
+                    _ = ctx.failed_count.fetchAdd(1, .monotonic);
+                    passed = false;
+                    if (ctx.bail_requested) |bail| bail.store(true, .release);
+                    break :blk;
+                };
+                const cases = readCasesFile(ctx.allocator, ctx.io, cases_path);
+                _ = ctx.case_passed.fetchAdd(cases.passed, .monotonic);
+                _ = ctx.case_failed.fetchAdd(cases.failed, .monotonic);
+                _ = ctx.case_skipped.fetchAdd(cases.skipped, .monotonic);
+                switch (term) {
+                    .exited => |code| {
+                        if (code != 0) {
+                            _ = ctx.failed_count.fetchAdd(1, .monotonic);
+                            passed = false;
+                            if (ctx.bail_requested) |bail| bail.store(true, .release);
+                        }
+                    },
+                    .signal, .stopped, .unknown => {
+                        _ = ctx.failed_count.fetchAdd(1, .monotonic);
+                        passed = false;
+                        if (ctx.bail_requested) |bail| bail.store(true, .release);
+                    },
+                }
             }
         }
+        // Deno 风格：不打印每文件 path (Nms)，子进程 stderr 已 inherit，用例行直接到终端；仅最后汇总 Test cases。
     }
 }
 
-/// 默认行为：扫描 tests/ 下 test/spec 文件并执行 shu run；排除 scan.default_exclude_dirs。jobs > 1 且多文件时并行执行。
-/// filter 非 null 时仅运行路径包含该子串的文件；options 控制 --bail、--shard、--test-name-pattern 等并传给子进程。
-fn runDefaultTests(allocator: std.mem.Allocator, cwd_owned: []const u8, io: std.Io, jobs: u32, filter: ?[]const u8, options: *const TestOptions) !void {
-    const tests_dir_abs = try libs_io.pathJoin(allocator, &.{ cwd_owned, "tests" });
-    defer allocator.free(tests_dir_abs);
-
-    var tests_dir = libs_io.openDirAbsolute(tests_dir_abs, .{}) catch {
-        try printStderr(io, "shu test: no tests/ directory. Create tests/ with *.test.ts, *.test.js, *.spec.ts, or *.spec.js files.\n", .{});
-        return error.NoTestsDir;
+/// 默认行为：若 explicit_run_paths 非 null 则只跑这些文件；否则扫描 tests/ 下 test/spec 并执行。jobs > 1 且多文件时并行。
+/// filter 仅在「未指定 explicit_run_paths」时生效；options 控制 --bail、--shard 等。permissions 为全局解析的 allow_net 等，会传给子进程 shu run。
+fn runDefaultTests(allocator: std.mem.Allocator, cwd_owned: []const u8, io: std.Io, jobs: u32, filter: ?[]const u8, options: *const TestOptions, permissions: *const args.ParsedArgs, explicit_run_paths: ?*std.ArrayList([]const u8)) !void {
+    var run_paths = if (explicit_run_paths) |ex|
+        ex.*
+    else blk: {
+        const tests_dir_abs = try libs_io.pathJoin(allocator, &.{ cwd_owned, "tests" });
+        defer allocator.free(tests_dir_abs);
+        var tests_dir = libs_io.openDirAbsolute(tests_dir_abs, .{}) catch {
+            try printStderr(io, "shu test: no tests/ directory. Create tests/ with *.test.ts, *.test.js, *.spec.ts, or *.spec.js files.\n", .{});
+            return error.NoTestsDir;
+        };
+        tests_dir.close(io);
+        var list = try scan.collectFilesRecursive(allocator, tests_dir_abs, &scan.test_extensions, io);
+        defer {
+            for (list.items) |p| allocator.free(p);
+            list.deinit(allocator);
+        }
+        if (list.items.len == 0) {
+            try printStderr(io, "shu test: no test files found under tests/\n", .{});
+            try printToStdout(io, "\n", .{});
+            return;
+        }
+        std.mem.sort([]const u8, list.items, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.lessThan);
+        var paths = std.ArrayList([]const u8).initCapacity(allocator, 0) catch return error.OutOfMemory;
+        for (list.items) |item| {
+            const rp = try libs_io.pathJoin(allocator, &.{ "tests", item });
+            paths.append(allocator, rp) catch {
+                allocator.free(rp);
+                for (paths.items) |p| allocator.free(p);
+                paths.deinit(allocator);
+                return error.OutOfMemory;
+            };
+        }
+        // list 由上方 defer 在离开 blk 时统一释放，此处不再重复 free
+        if (filter) |pat| {
+            var write: usize = 0;
+            for (paths.items) |rp| {
+                if (std.mem.indexOf(u8, rp, pat) != null) {
+                    paths.items[write] = rp;
+                    write += 1;
+                } else {
+                    allocator.free(rp);
+                }
+            }
+            paths.shrinkRetainingCapacity(write);
+            if (paths.items.len == 0) {
+                try printStderr(io, "shu test: no test files matching filter \"{s}\".\n", .{pat});
+                for (paths.items) |p| allocator.free(p);
+                paths.deinit(allocator);
+                try printToStdout(io, "\n", .{});
+                return;
+            }
+        }
+        if (options.shard_total != null and options.shard_index != null) {
+            const n = options.shard_total.?;
+            const i = options.shard_index.?;
+            var write: usize = 0;
+            for (paths.items, 0..) |rp, index| {
+                if (@as(u32, @intCast(index)) % n == i) {
+                    paths.items[write] = rp;
+                    write += 1;
+                } else {
+                    allocator.free(rp);
+                }
+            }
+            paths.shrinkRetainingCapacity(write);
+            if (paths.items.len == 0) {
+                try printStderr(io, "shu test: no test files in shard {d}/{d}.\n", .{ i, n });
+                for (paths.items) |p| allocator.free(p);
+                paths.deinit(allocator);
+                try printToStdout(io, "\n", .{});
+                return;
+            }
+        }
+        if (options.randomize and paths.items.len > 1) {
+            const seed: u64 = options.seed orelse 0;
+            var prng = std.Random.DefaultPrng.init(seed);
+            prng.random().shuffle([]const u8, paths.items);
+        }
+        break :blk paths;
     };
-    tests_dir.close(io);
+    defer if (explicit_run_paths == null) {
+        for (run_paths.items) |p| allocator.free(p);
+        run_paths.deinit(allocator);
+    };
 
-    var list = try scan.collectFilesRecursive(allocator, tests_dir_abs, &scan.test_extensions, io);
-    defer {
-        for (list.items) |p| allocator.free(p);
-        list.deinit(allocator);
-    }
-    if (list.items.len == 0) {
-        try printStderr(io, "shu test: no test files found under tests/\n", .{});
+    if (run_paths.items.len == 0) {
+        try printStderr(io, "shu test: no test files to run.\n", .{});
         try printToStdout(io, "\n", .{});
         return;
-    }
-
-    // 按测试文件路径字母序排序，保证执行顺序与文件管理器中的顺序一致且可复现（先 example-mock.test.js，再 example.test.js 等）。
-    std.mem.sort([]const u8, list.items, {}, struct {
-        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.order(u8, a, b) == .lt;
-        }
-    }.lessThan);
-
-    // 若指定了 --filter，只保留路径中包含 filter 子串的文件（子路径匹配，便于只跑某类用例）。
-    if (filter) |pat| {
-        var write: usize = 0;
-        for (list.items) |item| {
-            if (std.mem.indexOf(u8, item, pat) != null) {
-                list.items[write] = item;
-                write += 1;
-            } else {
-                allocator.free(item);
-            }
-        }
-        list.shrinkRetainingCapacity(write);
-        if (list.items.len == 0) {
-            try printStderr(io, "shu test: no test files matching filter \"{s}\".\n", .{pat});
-            try printToStdout(io, "\n", .{});
-            return;
-        }
-    }
-
-    // --shard=i/n：只保留第 i 份文件（index % n == i），用于 CI 分片并行。
-    if (options.shard_total != null and options.shard_index != null) {
-        const n = options.shard_total.?;
-        const i = options.shard_index.?;
-        var write: usize = 0;
-        for (list.items, 0..) |item, index| {
-            if (@as(u32, @intCast(index)) % n == i) {
-                list.items[write] = item;
-                write += 1;
-            } else {
-                allocator.free(item);
-            }
-        }
-        list.shrinkRetainingCapacity(write);
-        if (list.items.len == 0) {
-            try printStderr(io, "shu test: no test files in shard {d}/{d}.\n", .{ i, n });
-            try printToStdout(io, "\n", .{});
-            return;
-        }
-    }
-
-    // --randomize：按 --seed 打乱测试文件顺序，便于发现顺序依赖；未指定 seed 时用当前时间。
-    if (options.randomize and list.items.len > 1) {
-        // 未指定 --seed 时用固定种子 0，打乱顺序仍可复现；需每次不同顺序时传 --seed=N（如时间戳）
-        const seed: u64 = options.seed orelse 0;
-        var prng = std.Random.DefaultPrng.init(seed);
-        prng.random().shuffle([]const u8, list.items);
     }
 
     const self_exe = std.process.executablePathAlloc(io, allocator) catch {
@@ -677,32 +863,46 @@ fn runDefaultTests(allocator: std.mem.Allocator, cwd_owned: []const u8, io: std.
     };
     defer allocator.free(self_exe);
 
-    const total = list.items.len;
+    const total = run_paths.items.len;
     const use_parallel = jobs > 1 and total > 1;
+    const start_ms = nowMs(io);
     if (!use_parallel) {
         var failed_count: u32 = 0;
-        for (list.items) |item| {
+        var case_passed: u64 = 0;
+        var case_failed: u64 = 0;
+        var case_skipped: u64 = 0;
+        for (run_paths.items) |run_path| {
             if (options.bail_after != null and failed_count > 0) break;
-            const run_path = try libs_io.pathJoin(allocator, &.{ "tests", item });
-            defer allocator.free(run_path);
             const snap_path = try snapshotFilePathForRunPath(allocator, run_path);
             defer allocator.free(snap_path);
-            try printToStdout(io, "Running {s} ...\n", .{run_path});
             var argv_buf: [8][]const u8 = undefined;
             argv_buf[0] = self_exe;
             argv_buf[1] = "run";
-            argv_buf[2] = "--allow-read";
-            argv_buf[3] = run_path;
-            var argv_len: usize = 4;
-            if (options.update_snapshots or options.coverage) {
-                argv_buf[4] = "--allow-write";
-                argv_len = 5;
+            var argv_len: usize = 2;
+            if (permissions.allow_net) {
+                argv_buf[argv_len] = "--allow-net";
+                argv_len += 1;
             }
+            argv_buf[argv_len] = "--allow-read";
+            argv_len += 1;
+            if (options.update_snapshots or options.coverage or permissions.allow_write) {
+                argv_buf[argv_len] = "--allow-write";
+                argv_len += 1;
+            }
+            argv_buf[argv_len] = run_path;
+            argv_len += 1;
             const argv = argv_buf[0..argv_len];
+            var passed_this: bool = true;
             if (options.hasEnvOptions()) {
                 var env = try buildTestEnvironMap(allocator, options, snap_path);
                 defer env.deinit();
                 env.put("SHU_TEST_CWD", cwd_owned) catch {};
+                var path_buf: [512]u8 = undefined;
+                const file_path_display = std.fmt.bufPrint(&path_buf, "./{s}", .{run_path}) catch run_path;
+                env.put("SHU_TEST_FILE_PATH", file_path_display) catch {};
+                const cases_path = try libs_io.pathJoin(allocator, &.{ cwd_owned, ".shu-test-cases" });
+                defer allocator.free(cases_path);
+                env.put("SHU_TEST_CASES_FILE", cases_path) catch {};
                 var child = try std.process.spawn(io, .{
                     .argv = argv,
                     .cwd = .{ .path = cwd_owned },
@@ -712,46 +912,66 @@ fn runDefaultTests(allocator: std.mem.Allocator, cwd_owned: []const u8, io: std.
                     .stderr = .inherit,
                 });
                 const term = try child.wait(io);
+                const cases = readCasesFile(allocator, io, cases_path);
+                case_passed += cases.passed;
+                case_failed += cases.failed;
+                case_skipped += cases.skipped;
                 switch (term) {
                     .exited => |code| {
                         if (code != 0) {
                             failed_count += 1;
+                            passed_this = false;
                             if (options.bail_after != null) break;
                         }
                     },
                     .signal, .stopped, .unknown => {
                         failed_count += 1;
+                        passed_this = false;
                         if (options.bail_after != null) break;
                     },
                 }
             } else {
+                var env = try buildTestEnvironMap(allocator, options, snap_path);
+                defer env.deinit();
+                env.put("SHU_TEST_CWD", cwd_owned) catch {};
+                var path_buf: [512]u8 = undefined;
+                const file_path_display = std.fmt.bufPrint(&path_buf, "./{s}", .{run_path}) catch run_path;
+                env.put("SHU_TEST_FILE_PATH", file_path_display) catch {};
+                const cases_path = try libs_io.pathJoin(allocator, &.{ cwd_owned, ".shu-test-cases" });
+                defer allocator.free(cases_path);
+                env.put("SHU_TEST_CASES_FILE", cases_path) catch {};
                 var child = try std.process.spawn(io, .{
                     .argv = argv,
                     .cwd = .{ .path = cwd_owned },
+                    .environ_map = &env,
                     .stdin = .inherit,
                     .stdout = .inherit,
                     .stderr = .inherit,
                 });
                 const term = try child.wait(io);
+                const cases = readCasesFile(allocator, io, cases_path);
+                case_passed += cases.passed;
+                case_failed += cases.failed;
+                case_skipped += cases.skipped;
                 switch (term) {
                     .exited => |code| {
                         if (code != 0) {
                             failed_count += 1;
+                            passed_this = false;
                             if (options.bail_after != null) break;
                         }
                     },
                     .signal, .stopped, .unknown => {
                         failed_count += 1;
+                        passed_this = false;
                         if (options.bail_after != null) break;
                     },
                 }
             }
         }
-        if (failed_count > 0) {
-            try printStderr(io, "shu test: {d} of {d} file(s) failed.\n", .{ failed_count, total });
-            return error.ScriptExitedNonZero;
-        }
-        try printToStdout(io, "All {d} test file(s) passed.\n", .{total});
+        const elapsed_ms = @as(u64, @intCast(@max(0, nowMs(io) - start_ms)));
+        try printTestSummaryCases(io, case_passed, case_failed, case_skipped, total, elapsed_ms);
+        if (failed_count > 0) return error.ScriptExitedNonZero;
         return;
     }
 
@@ -760,17 +980,24 @@ fn runDefaultTests(allocator: std.mem.Allocator, cwd_owned: []const u8, io: std.
     const print_guard = std.atomic.Value(u32).init(0);
     var bail_atomic = std.atomic.Value(bool).init(false);
     const n_workers = @min(jobs, total);
+    const case_passed_atomic = std.atomic.Value(u64).init(0);
+    const case_failed_atomic = std.atomic.Value(u64).init(0);
+    const case_skipped_atomic = std.atomic.Value(u64).init(0);
     var ctx = TestWorkerCtx{
         .allocator = allocator,
         .cwd_owned = cwd_owned,
         .self_exe = self_exe,
-        .paths = list.items,
+        .paths = run_paths.items,
         .total = total,
         .next_index = next_index,
         .failed_count = failed_atomic,
+        .case_passed = case_passed_atomic,
+        .case_failed = case_failed_atomic,
+        .case_skipped = case_skipped_atomic,
         .print_guard = print_guard,
         .io = io,
         .options = options,
+        .permissions = permissions,
         .bail_requested = if (options.bail_after != null) &bail_atomic else null,
     };
     var threads = try std.ArrayList(std.Thread).initCapacity(allocator, n_workers);
@@ -780,11 +1007,12 @@ fn runDefaultTests(allocator: std.mem.Allocator, cwd_owned: []const u8, io: std.
     }
     for (threads.items) |t| t.join();
     const failed_count = failed_atomic.load(.monotonic);
-    if (failed_count > 0) {
-        try printStderr(io, "shu test: {d} of {d} file(s) failed.\n", .{ failed_count, total });
-        return error.ScriptExitedNonZero;
-    }
-    try printToStdout(io, "All {d} test file(s) passed.\n", .{total});
+    const case_passed = ctx.case_passed.load(.monotonic);
+    const case_failed = ctx.case_failed.load(.monotonic);
+    const case_skipped = ctx.case_skipped.load(.monotonic);
+    const elapsed_ms = @as(u64, @intCast(@max(0, nowMs(io) - start_ms)));
+    try printTestSummaryCases(io, case_passed, case_failed, case_skipped, total, elapsed_ms);
+    if (failed_count > 0) return error.ScriptExitedNonZero;
 }
 
 /// 在 cwd 下用 shell 执行 cmd（/bin/sh -c cmd 或 cmd.exe /c cmd）；stdio 继承。Zig 0.16：spawn(io, options)、wait(io)。
@@ -828,4 +1056,44 @@ fn printStderr(io: std.Io, comptime fmt_str: []const u8, fargs: anytype) !void {
     var w = std.Io.File.Writer.init(std.Io.File.stderr(), io, &buf);
     try w.interface.print(fmt_str, fargs);
     try w.interface.flush();
+}
+
+/// 返回当前时间（毫秒），用于测试文件执行耗时。Zig 0.16 使用 std.Io.Clock。
+fn nowMs(io: std.Io) i64 {
+    const ns = std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds;
+    return @as(i64, @intCast(@divTrunc(ns, std.time.ns_per_ms)));
+}
+
+/// ANSI 颜色（与 version.zig 一致）；仅 TTY 时使用，否则无转义。绿/红：结果；青：时间；黄：跳过。
+const c_green = "\x1b[32m";
+const c_red = "\x1b[31m";
+const c_cyan = "\x1b[36m";
+const c_yellow = "\x1b[33m";
+const c_reset = "\x1b[0m";
+
+/// 打印单条测试文件结果：路径 + 执行时间（毫秒）；与 Deno 对齐，暂不打印 ✓/✗。末尾多一空行，与下一文件输出分隔。
+fn printTestFileResult(io: std.Io, run_path: []const u8, passed: bool, elapsed_ms: u64) void {
+    _ = passed;
+    var buf: [320]u8 = undefined;
+    var w = std.Io.File.Writer.init(std.Io.File.stdout(), io, &buf);
+    w.interface.print("{s} ({d}ms)\n\n", .{ run_path, elapsed_ms }) catch return;
+    w.interface.flush() catch {};
+}
+
+/// 打印测试用例汇总：passed/failed/skipped、测试文件数、总耗时。TTY 下用绿/红/黄；输出为英文。
+fn printTestSummaryCases(io: std.Io, passed: u64, failed: u64, skipped: u64, total_files: usize, total_ms: u64) !void {
+    if (std.c.isatty(1) != 0) {
+        try printToStdout(io, "\nTest cases: {s}{d}{s} passed, {s}{d}{s} failed, {s}{d}{s} skipped.\n", .{
+            c_green, passed, c_reset,
+            c_red, failed, c_reset,
+            c_yellow, skipped, c_reset,
+        });
+        try printToStdout(io, "{s}{d}{s} test files, {s}{d}{s}ms total.\n\n", .{
+            c_cyan, total_files, c_reset,
+            c_cyan, total_ms, c_reset,
+        });
+    } else {
+        try printToStdout(io, "\nTest cases: {d} passed, {d} failed, {d} skipped.\n", .{ passed, failed, skipped });
+        try printToStdout(io, "{d} test files, {d}ms total.\n\n", .{ total_files, total_ms });
+    }
 }
