@@ -6,6 +6,7 @@ const std = @import("std");
 const jsc = @import("jsc");
 const common = @import("../../../common.zig");
 const globals = @import("../../../globals.zig");
+const promise = @import("../promise.zig");
 
 /// 用于“无异常”的哨兵（Zig 不允许指针为 0，用非零地址表示未设置）
 var vm_no_exception_sentinel: u8 = 0;
@@ -443,11 +444,6 @@ fn measureMemoryCallback(
 ) callconv(.c) jsc.JSValueRef {
     _ = argumentCount;
     _ = arguments;
-    const global = jsc.JSContextGetGlobalObject(ctx);
-    const promise_name = jsc.JSStringCreateWithUTF8CString("Promise");
-    defer jsc.JSStringRelease(promise_name);
-    const promise_ctor = jsc.JSObjectGetProperty(ctx, global, promise_name, null);
-    const promise_obj = jsc.JSValueToObject(ctx, promise_ctor, null) orelse return jsc.JSValueMakeUndefined(ctx);
     const result_obj = jsc.JSObjectMake(ctx, null, null);
     const total_name = jsc.JSStringCreateWithUTF8CString("total");
     defer jsc.JSStringRelease(total_name);
@@ -460,13 +456,7 @@ fn measureMemoryCallback(
     const range_arr = jsc.JSObjectMakeArray(ctx, 2, &[_]jsc.JSValueRef{ jsc.JSValueMakeNumber(ctx, 0), jsc.JSValueMakeNumber(ctx, 0) }, null);
     _ = jsc.JSObjectSetProperty(ctx, total_obj, jsr_name, range_arr, jsc.kJSPropertyAttributeNone, null);
     _ = jsc.JSObjectSetProperty(ctx, result_obj, total_name, total_obj, jsc.kJSPropertyAttributeNone, null);
-    var resolve_args = [_]jsc.JSValueRef{result_obj};
-    const resolve_name = jsc.JSStringCreateWithUTF8CString("resolve");
-    defer jsc.JSStringRelease(resolve_name);
-    const resolve_val = jsc.JSObjectGetProperty(ctx, promise_obj, resolve_name, null);
-    const resolve_fn = jsc.JSValueToObject(ctx, resolve_val, null) orelse return jsc.JSValueMakeUndefined(ctx);
-    const promise_instance = jsc.JSObjectCallAsFunction(ctx, resolve_fn, promise_obj, 1, &resolve_args, null);
-    return promise_instance;
+    return promise.resolve(ctx, result_obj);
 }
 
 /// 返回 shu:vm 的 exports：createContext、runInContext、runInNewContext、runInThisContext、isContext、disposeContext、measureMemory、Script、constants
