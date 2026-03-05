@@ -10,20 +10,21 @@ const libs_io = @import("libs_io");
 /// 单个订阅者：保存 JS 回调的 ctx 与 ref，订阅时 Protect、取消时 Unprotect
 const Subscriber = struct { ctx: jsc.JSContextRef, ref: jsc.JSValueRef };
 
-/// 某命名通道的订阅者列表（Zig 0.16.0-dev：ArrayList 用 initCapacity/append(allocator, x)）
+/// 某命名通道的订阅者列表（01 §1.2：结构体内持久化用 ArrayListUnmanaged，显式传 allocator 以利 Cache）
 const ChannelState = struct {
-    subscribers: std.ArrayList(Subscriber),
+    subscribers: std.ArrayListUnmanaged(Subscriber) = .{},
     fn init(allocator: std.mem.Allocator) ChannelState {
-        return .{ .subscribers = std.ArrayList(Subscriber).initCapacity(allocator, 0) catch return .{ .subscribers = std.ArrayList(Subscriber).empty } };
+        return .{ .subscribers = std.ArrayListUnmanaged(Subscriber).initCapacity(allocator, 0) catch .{} };
     }
-    fn deinit(self: *ChannelState) void {
-        self.subscribers.deinit();
+    /// 释放订阅者列表；调用方传入与 init 时一致的 allocator（通常为 g_allocator）
+    fn deinit(self: *ChannelState, allocator: std.mem.Allocator) void {
+        self.subscribers.deinit(allocator);
     }
 };
 
-/// 全局：通道名 -> ChannelState；首次使用时用 globals.current_allocator 初始化
+/// 全局：通道名 -> ChannelState（01 §1.2 Unmanaged，显式传 allocator）；首次使用时用 globals.current_allocator 初始化
 var g_allocator: ?std.mem.Allocator = null;
-var g_channels: ?std.StringHashMap(ChannelState) = null;
+var g_channels: ?*std.StringHashMapUnmanaged(ChannelState) = null;
 var g_lock: std.Io.Mutex = .{ .state = std.atomic.Value(std.Io.Mutex.State).init(.unlocked) };
 
 fn ensureChannels() ?std.mem.Allocator {
@@ -33,12 +34,17 @@ fn ensureChannels() ?std.mem.Allocator {
     defer g_lock.unlock(io);
     if (g_channels == null) {
         g_allocator = allocator;
-        g_channels = std.StringHashMap(ChannelState).init(allocator);
+        const p = allocator.create(std.StringHashMapUnmanaged(ChannelState)) catch {
+            g_lock.unlock(io);
+            return null;
+        };
+        p.* = .{};
+        g_channels = p;
     }
     return g_allocator;
 }
 
-/// 从 JS 值取 UTF-8 名称，调用方负责 free 返回值（若返回非 null）
+/// [Allocates] 从 JS 值取 UTF-8 名称；调用方负责 free 返回值（若返回非 null）。
 fn getNameFromArg(allocator: std.mem.Allocator, ctx: jsc.JSContextRef, val: jsc.JSValueRef) ?[]const u8 {
     const str_ref = jsc.JSValueToStringCopy(ctx, val, null);
     defer jsc.JSStringRelease(str_ref);
@@ -56,7 +62,7 @@ fn getNameFromArg(allocator: std.mem.Allocator, ctx: jsc.JSContextRef, val: jsc.
     };
 }
 
-/// 从 channel 对象上读取 __name 属性并转为 []const u8，调用方 free
+/// [Allocates] 从 channel 对象上读取 __name 属性并转为 []const u8；调用方负责 free。
 fn getChannelNameFromThis(allocator: std.mem.Allocator, ctx: jsc.JSContextRef, this_obj: jsc.JSObjectRef) ?[]const u8 {
     const k_name = jsc.JSStringCreateWithUTF8CString("__name");
     defer jsc.JSStringRelease(k_name);
@@ -81,8 +87,8 @@ fn channelCallback(
     defer allocator.free(name);
     const key = allocator.dupe(u8, name) catch return jsc.JSValueMakeUndefined(ctx);
     g_lock.lock(io) catch return jsc.JSValueMakeUndefined(ctx);
-    var channels = g_channels.?;
-    const gop = channels.getOrPut(key) catch {
+    const channels = g_channels.?;
+    const gop = channels.getOrPut(allocator, key) catch {
         allocator.free(key);
         g_lock.unlock(io);
         return jsc.JSValueMakeUndefined(ctx);
@@ -123,8 +129,8 @@ fn subscribeCallback(
     if (!jsc.JSObjectIsFunction(ctx, on_obj)) return jsc.JSValueMakeUndefined(ctx);
     const key = allocator.dupe(u8, name) catch return jsc.JSValueMakeUndefined(ctx);
     g_lock.lock(io) catch return jsc.JSValueMakeUndefined(ctx);
-    var channels = g_channels.?;
-    const gop = channels.getOrPut(key) catch {
+    const channels = g_channels.?;
+    const gop = channels.getOrPut(allocator, key) catch {
         allocator.free(key);
         g_lock.unlock(io);
         return jsc.JSValueMakeUndefined(ctx);
@@ -159,7 +165,7 @@ fn unsubscribeCallback(
     defer allocator.free(name);
     const on_message = arguments[1];
     g_lock.lock(io) catch return jsc.JSValueMakeUndefined(ctx);
-    if (g_channels) |*channels| {
+    if (g_channels) |channels| {
         if (channels.getPtr(name)) |state| {
             var i: usize = 0;
             while (i < state.subscribers.items.len) {
@@ -191,7 +197,7 @@ fn hasSubscribersCallback(
     const name = getNameFromArg(allocator, ctx, arguments[0]) orelse return jsc.JSValueMakeBoolean(ctx, false);
     defer allocator.free(name);
     g_lock.lock(io) catch return jsc.JSValueMakeBoolean(ctx, false);
-    const has = if (g_channels) |*channels| blk: {
+    const has = if (g_channels) |channels| blk: {
         break :blk if (channels.get(name)) |state| state.subscribers.items.len > 0 else false;
     } else false;
     g_lock.unlock(io);
@@ -216,7 +222,7 @@ fn channelSubscribeCallback(
     const on_obj = jsc.JSValueToObject(ctx, on_message, null) orelse return jsc.JSValueMakeUndefined(ctx);
     if (!jsc.JSObjectIsFunction(ctx, on_obj)) return jsc.JSValueMakeUndefined(ctx);
     g_lock.lock(io) catch return jsc.JSValueMakeUndefined(ctx);
-    if (g_channels) |*channels| {
+    if (g_channels) |channels| {
         if (channels.getPtr(name)) |state| {
             state.subscribers.append(allocator, .{ .ctx = ctx, .ref = on_message }) catch {
                 g_lock.unlock(io);
@@ -245,7 +251,7 @@ fn channelUnsubscribeCallback(
     defer allocator.free(name);
     const on_message = arguments[0];
     g_lock.lock(io) catch return jsc.JSValueMakeUndefined(ctx);
-    if (g_channels) |*channels| {
+    if (g_channels) |channels| {
         if (channels.getPtr(name)) |state| {
             var i: usize = 0;
             while (i < state.subscribers.items.len) {
@@ -280,7 +286,7 @@ fn channelPublishCallback(
     defer jsc.JSStringRelease(name_js);
     const name_val = jsc.JSValueMakeString(ctx, name_js);
     g_lock.lock(io) catch return jsc.JSValueMakeUndefined(ctx);
-    const list = if (g_channels) |*channels| blk: {
+    const list = if (g_channels) |channels| blk: {
         const state = channels.getPtr(name) orelse {
             g_lock.unlock(io);
             return jsc.JSValueMakeUndefined(ctx);
@@ -317,7 +323,7 @@ fn channelHasSubscribersCallback(
     const name = getChannelNameFromThis(allocator, ctx, this_obj) orelse return jsc.JSValueMakeBoolean(ctx, false);
     defer allocator.free(name);
     g_lock.lock(io) catch return jsc.JSValueMakeBoolean(ctx, false);
-    const has = if (g_channels) |*channels| blk: {
+    const has = if (g_channels) |channels| blk: {
         break :blk if (channels.get(name)) |state| state.subscribers.items.len > 0 else false;
     } else false;
     g_lock.unlock(io);
