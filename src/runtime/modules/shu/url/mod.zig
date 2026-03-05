@@ -232,28 +232,20 @@ fn searchParamsToStringCallback(
     return jsc.JSValueMakeString(ctx, ref);
 }
 
+/// 纯 Zig：new TypeError(msg) 后 setThrowAndThrow
 fn throwURLException(ctx: jsc.JSContextRef, msg: []const u8) jsc.JSValueRef {
-    var buf: [384]u8 = undefined;
-    const prefix = "throw new TypeError(\"";
-    @memcpy(buf[0..prefix.len], prefix);
-    var i: usize = prefix.len;
-    for (msg) |c| {
-        if (i >= buf.len - 4) break;
-        if (c == '"' or c == '\\') {
-            buf[i] = '\\';
-            i += 1;
-        }
-        buf[i] = c;
-        i += 1;
-    }
-    const suffix = "\");";
-    @memcpy(buf[i..][0..suffix.len], suffix);
-    i += suffix.len;
-    buf[i] = 0;
-    const script_ref = jsc.JSStringCreateWithUTF8CString(buf[0..].ptr);
-    defer jsc.JSStringRelease(script_ref);
-    _ = jsc.JSEvaluateScript(ctx, script_ref, null, null, 1, null);
-    return jsc.JSValueMakeUndefined(ctx);
+    const global = jsc.JSContextGetGlobalObject(ctx);
+    const k_TypeError = jsc.JSStringCreateWithUTF8CString("TypeError");
+    defer jsc.JSStringRelease(k_TypeError);
+    const ctor = jsc.JSObjectGetProperty(ctx, global, k_TypeError, null);
+    const ctor_obj = jsc.JSValueToObject(ctx, ctor, null) orelse return jsc.JSValueMakeUndefined(ctx);
+    const msg_z = jsc.JSStringCreateWithUTF8CString(msg.ptr);
+    defer jsc.JSStringRelease(msg_z);
+    var args: [1]jsc.JSValueRef = .{jsc.JSValueMakeString(ctx, msg_z)};
+    var exception: ?jsc.JSValueRef = null;
+    const err_instance = jsc.JSObjectCallAsConstructor(ctx, ctor_obj, 1, &args, @ptrCast(&exception));
+    if (exception != null) return jsc.JSValueMakeUndefined(ctx);
+    return common.setThrowAndThrow(ctx, err_instance);
 }
 
 /// new URL(input [, base])：解析 URL，返回带 href、origin、pathname、search、hash、searchParams 的对象
