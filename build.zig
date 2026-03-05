@@ -241,8 +241,11 @@ pub fn build(b: *std.Build) void {
     // Windows：libs_os 的 getProcessRssKb 需要 psapi（GetProcessMemoryInfo）
     if (target.result.os.tag == .windows) exe.root_module.linkSystemLibrary("psapi", .{});
 
-    // macOS：链接系统 JavaScriptCore 框架
-    if (is_macos) exe.root_module.linkFramework("JavaScriptCore", .{});
+    // macOS：链接系统 JavaScriptCore 与 CoreFoundation（runLoop 单次迭代以驱动 JSC Promise 微任务）
+    if (is_macos) {
+        exe.root_module.linkFramework("JavaScriptCore", .{});
+        exe.root_module.linkFramework("CoreFoundation", .{});
+    }
 
     // Linux/Windows：若 have_webkit_jsc 则链接 jsc_prefix_used（即 -Djsc_prefix 或默认 deps/webkit/install）
     if (have_webkit_jsc) {
