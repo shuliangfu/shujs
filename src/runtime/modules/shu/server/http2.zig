@@ -13,6 +13,25 @@ pub const MAX_H2_HEADERS = 64;
 /// 客户端连接 preface 魔串（24 字节），h2/h2c 连接建立后客户端必须先发
 pub const CLIENT_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
+/// 24 字节与 CLIENT_PREFACE 按 3×u64 比较，避免 std.mem.eql 分支（00 §2.1）。buf.len >= 24 时调用；调用方保证 buf.ptr 至少 8 字节对齐（如 read_buf 为 align(64)）。
+pub inline fn eqlClientPreface(buf: []const u8) bool {
+    if (buf.len < 24) return false;
+    const p = @as([*]align(8) const u8, @alignCast(buf.ptr));
+    const a = @as(*const [3]u64, @ptrCast(p)).*;
+    const q = @as([*]align(8) const u8, @alignCast(CLIENT_PREFACE[0..24].ptr));
+    const b = @as(*const [3]u64, @ptrCast(q)).*;
+    return a[0] == b[0] and a[1] == b[1] and a[2] == b[2];
+}
+
+/// 伪头 ":method" 用 u64 前缀比较（00 §2.1）
+pub inline fn h2PseudoMethod(name: []const u8) bool {
+    return name.len == 7 and h2NamePrefix(name) == h2Prefix8(":method");
+}
+/// 伪头 ":path" 用 u64 前缀比较（00 §2.1）
+pub inline fn h2PseudoPath(name: []const u8) bool {
+    return name.len == 5 and h2NamePrefix(name) == h2Prefix8(":path");
+}
+
 /// 帧类型（RFC 7540 6）
 pub const FrameType = enum(u8) {
     data = 0,
@@ -112,8 +131,8 @@ pub fn parseOneFrameFromBuffer(buf: []const u8, max_payload_len: usize) !?struct
     return .{ .header = header, .payload = payload, .consumed = 9 + header.length };
 }
 
-/// 将一帧（9 字节头 + payload）追加到 out，供非阻塞写时复用 write_buf
-pub fn appendFrameTo(out: *std.ArrayList(u8), allocator: std.mem.Allocator, frame_type: FrameType, flags: u8, stream_id: u31, payload: []const u8) !void {
+/// 将一帧（9 字节头 + payload）追加到 out，供非阻塞写时复用 write_buf（01 §1.2 使用 Unmanaged 以省 allocator 存储）
+pub fn appendFrameTo(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, frame_type: FrameType, flags: u8, stream_id: u31, payload: []const u8) !void {
     var hdr: [9]u8 = undefined;
     const len: u24 = @intCast(payload.len);
     hdr[0] = @as(u8, @truncate(len >> 16));
@@ -130,24 +149,24 @@ pub fn appendFrameTo(out: *std.ArrayList(u8), allocator: std.mem.Allocator, fram
 }
 
 /// 将服务端 SETTINGS（空 payload）追加到 out
-pub fn appendServerPrefaceTo(out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+pub fn appendServerPrefaceTo(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator) !void {
     try appendFrameTo(out, allocator, .settings, 0, 0, &[_]u8{});
 }
 
 /// 将 SETTINGS ACK 追加到 out
-pub fn appendSettingsAckTo(out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+pub fn appendSettingsAckTo(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator) !void {
     try appendFrameTo(out, allocator, .settings, FLAG_ACK, 0, &[_]u8{});
 }
 
 /// 将 PING ACK（payload 前 8 字节）追加到 out
-pub fn appendPingAckTo(out: *std.ArrayList(u8), allocator: std.mem.Allocator, payload: []const u8) !void {
+pub fn appendPingAckTo(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, payload: []const u8) !void {
     var reply: [8]u8 = [_]u8{0} ** 8;
     if (payload.len >= 8) @memcpy(reply[0..], payload[0..8]);
     try appendFrameTo(out, allocator, .ping, FLAG_ACK, 0, &reply);
 }
 
 /// 将 RST_STREAM 帧追加到 out
-pub fn appendRstStreamTo(out: *std.ArrayList(u8), allocator: std.mem.Allocator, stream_id: u31, error_code: u32) !void {
+pub fn appendRstStreamTo(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, stream_id: u31, error_code: u32) !void {
     var payload: [4]u8 = undefined;
     payload[0] = @as(u8, @truncate(error_code >> 24));
     payload[1] = @as(u8, @truncate(error_code >> 16));
@@ -183,8 +202,8 @@ pub fn sendRstStream(stream: anytype, stream_id: u31, error_code: u32) !void {
 }
 
 /// HPACK：最小解码，仅支持静态表 + 字面量（无 Huffman）的头部块，供请求头构建
-/// 输出到 allocator 的 ArrayList([2][]const u8){ name, value }；块数据为 payload
-pub fn decodeHpackBlock(allocator: std.mem.Allocator, block: []const u8, out_headers: *std.ArrayList(HeaderEntry)) !void {
+/// 输出到 allocator 的 ArrayListUnmanaged(HeaderEntry)；块数据为 payload（01 §1.2）
+pub fn decodeHpackBlock(allocator: std.mem.Allocator, block: []const u8, out_headers: *std.ArrayListUnmanaged(HeaderEntry)) !void {
     // RFC 7541 Appendix A 静态表完整 61 条：索引 1..61 → (name, value)。规范中 :status 仅 8–14（200/204/206/304/400/404/500），
     // 无 201/302/503 等；这些由客户端以字面量发送，走下方 Literal 分支即可解码。
     const static_entries = [_][]const u8{
@@ -366,9 +385,9 @@ pub fn decodeHpackBlock(allocator: std.mem.Allocator, block: []const u8, out_hea
     }
 }
 
-/// HPACK 解码写入 out_headers，且不超过 max_headers 条（超过返回 error.TooManyHeaders）；调用方 initCapacity(allocator, max_headers) 可避免扩容（§1.3 热路径压榨）
+/// HPACK 解码写入 out_headers，且不超过 max_headers 条（超过返回 error.TooManyHeaders）；调用方 initCapacity(allocator, max_headers) 可避免扩容（01 §1.2）
 /// 静态表与 decodeHpackBlock 一致（RFC 7541 Appendix A 完整 61 条）
-pub fn decodeHpackBlockCapped(allocator: std.mem.Allocator, block: []const u8, out_headers: *std.ArrayList(HeaderEntry), max_headers: usize) !void {
+pub fn decodeHpackBlockCapped(allocator: std.mem.Allocator, block: []const u8, out_headers: *std.ArrayListUnmanaged(HeaderEntry), max_headers: usize) !void {
     const static_entries = [_][]const u8{
         "",    "GET", "POST",          "/",   "/index.html", "http", "https",
         "200", "204", "206",           "304", "400",         "404",  "500",
@@ -627,7 +646,22 @@ pub fn encodeResponseHeaders(out: []u8, status: u16, content_type: ?[]const u8, 
     return pos;
 }
 
-/// 从 HPACK 解码得到的头部列表中取 :method、:path、:scheme、:authority 及普通头，填到 ParsedRequest 兼容的 headers 表（小写 key）；接受 slice 以兼容 ArrayList 与 BoundedArray（§1.3）
+/// 取 name 前 8 字节转 u64（不足零填充），用于与 comptime 常量一次整型比较（00 §2.1）
+inline fn h2NamePrefix(name: []const u8) u64 {
+    var buf: [8]u8 = [_]u8{0} ** 8;
+    const n = @min(8, name.len);
+    @memcpy(buf[0..n], name[0..n]);
+    return @as(u64, @bitCast(buf));
+}
+/// comptime 字符串前 8 字节转 u64
+inline fn h2Prefix8(comptime s: []const u8) u64 {
+    var buf: [8]u8 = [_]u8{0} ** 8;
+    const n = @min(8, s.len);
+    for (s[0..n], buf[0..n]) |a, *b| b.* = a;
+    return @as(u64, @bitCast(buf));
+}
+
+/// 从 HPACK 解码得到的头部列表中取 :method、:path、:scheme、:authority 及普通头，填到 ParsedRequest 兼容的 headers 表（小写 key）；接受 slice 以兼容 ArrayList 与 BoundedArray（§1.3）。伪头名用 u64 前缀比较（00 §2.1）。
 pub fn h2HeadersToParsed(
     allocator: std.mem.Allocator,
     headers_slice: []const HeaderEntry,
@@ -636,11 +670,13 @@ pub fn h2HeadersToParsed(
     out_headers: *std.StringHashMap([]const u8),
 ) !void {
     for (headers_slice) |h| {
-        if (std.mem.eql(u8, h.name, ":method")) {
+        if (h2PseudoMethod(h.name)) {
             method.* = try allocator.dupe(u8, h.value);
-        } else if (std.mem.eql(u8, h.name, ":path")) {
+        } else if (h2PseudoPath(h.name)) {
             path.* = try allocator.dupe(u8, h.value);
-        } else if (std.mem.eql(u8, h.name, ":scheme") or std.mem.eql(u8, h.name, ":authority")) {
+        } else if ((h.name.len == 7 and h2NamePrefix(h.name) == h2Prefix8(":scheme")) or
+            (h.name.len == 9 and h2NamePrefix(h.name) == h2Prefix8(":authori") and h.name[8] == 't'))
+        {
             const k = try allocator.dupe(u8, h.name);
             const v = try allocator.dupe(u8, h.value);
             try out_headers.put(k, v);
