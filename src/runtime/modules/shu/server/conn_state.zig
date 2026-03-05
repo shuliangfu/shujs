@@ -43,13 +43,13 @@ pub const MuxConnPhase = enum {
     reading_chunked_body,
 };
 
-/// HTTP/2 单流状态（多路复用内非阻塞用），与 handleH2Connection 内 streams 表项一致；headers 用 ArrayList 预分配 MAX_H2_HEADERS 容量，decode 时封顶不扩容（§1.3）
+/// HTTP/2 单流状态（多路复用内非阻塞用），与 handleH2Connection 内 streams 表项一致；headers 用 ArrayListUnmanaged 预分配 MAX_H2_HEADERS 容量，decode 时封顶不扩容（01 §1.2）
 pub const H2StreamEntry = struct {
     arena: std.heap.ArenaAllocator,
-    headers_list: std.ArrayList(http2.HeaderEntry),
+    headers_list: std.ArrayListUnmanaged(http2.HeaderEntry),
     method: []const u8,
     path: []const u8,
-    body: std.ArrayList(u8),
+    body: std.ArrayListUnmanaged(u8),
     end_stream: bool,
     /// 释放本流占用的 arena、headers_list、body；由调用方在 remove 流时调用
     pub fn deinitEntry(self: *H2StreamEntry, allocator: std.mem.Allocator) void {
@@ -63,10 +63,11 @@ pub const H2StreamEntry = struct {
 // 明文连接状态
 // ------------------------------------------------------------------------------
 
-/// 单条明文连接的状态与缓冲；phase 驱动 stepPlainConn 的状态机
+/// 单条明文连接的状态与缓冲；phase 驱动 stepPlainConn 的状态机（01 §1.2 持久化容器用 ArrayListUnmanaged）
+/// read_buf 64 字节对齐，供 libs_io.simd_scan.indexOfCrLfCrLf 与协议解析 @Vector 使用（00 §1.6）
 pub const PlainConnState = struct {
     stream: std.Io.net.Stream,
-    read_buf: []u8,
+    read_buf: []align(64) u8,
     read_len: usize,
     phase: MuxConnPhase,
     arena: ?std.heap.ArenaAllocator,
@@ -75,22 +76,26 @@ pub const PlainConnState = struct {
     body_buf: ?[]u8,
     body_len_want: usize,
     body_start: usize,
-    write_buf: std.ArrayList(u8),
+    write_buf: std.ArrayListUnmanaged(u8),
     write_off: usize,
-    header_list: std.ArrayList(u8),
+    header_list: std.ArrayListUnmanaged(u8),
     use_keep_alive: bool,
     consumed: usize,
     ws_id: u32,
-    ws_read_buf: ?[]u8 = null,
+    /// io_threads > 1 时表示本连接所属 I/O 线程索引，用于 tick 向对应 ring_from_js 投递 submitRecv/submitSend
+    io_thread_id: u32 = 0,
+    /// 00 §1.6：WebSocket 帧解析/掩码用 64 字节对齐，利于 @Vector 与 SIMD
+    ws_read_buf: ?[]align(64) u8 = null,
     ws_read_len: usize = 0,
-    h2_streams: ?std.AutoHashMap(u31, H2StreamEntry),
-    chunked_body_buf: ?std.ArrayList(u8),
+    h2_streams: ?std.AutoHashMapUnmanaged(u31, H2StreamEntry),
+    chunked_body_buf: ?std.ArrayListUnmanaged(u8),
     chunked_parse_state: ChunkedParseState,
     chunked_consumed: usize,
     read_op_ctx: if (use_iocp_full) IocpOpCtx else void,
     write_op_ctx: if (use_iocp_full) IocpOpCtx else void,
 
     /// 释放连接资源；close_stream 为 true 时关闭底层 stream。0.16：stream.close(io)
+    // Hot-path
     pub fn deinit(self: *PlainConnState, allocator: std.mem.Allocator, close_stream: bool) void {
         if (close_stream) if (libs_process.getProcessIo()) |io| self.stream.close(io);
         allocator.free(self.read_buf);
@@ -100,7 +105,7 @@ pub const PlainConnState = struct {
         if (self.h2_streams) |*map| {
             var it = map.iterator();
             while (it.next()) |e| e.value_ptr.deinitEntry(allocator);
-            map.deinit();
+            map.deinit(allocator);
         }
         if (self.chunked_body_buf) |*list| list.deinit(allocator);
         self.write_buf.deinit(allocator);
@@ -109,10 +114,11 @@ pub const PlainConnState = struct {
 
     /// 初始化连接状态；config 提供 read_buffer_size、write_buf/header_list 初始容量；initial_data 非 null 时为首包（如 io_core 首包），会拷贝进 read_buf
     pub fn init(allocator: std.mem.Allocator, stream: std.Io.net.Stream, config: *const ServerConfig, initial_data: ?[]const u8) !PlainConnState {
-        const read_buf = allocator.alloc(u8, config.read_buffer_size) catch return error.OutOfMemory;
+        // 00 §1.6 Lane 填充：多分配 64 字节，解析时末尾清零供 indexOfCrLfCrLf SIMD 无尾部分支
+        const read_buf = allocator.alignedAlloc(u8, .@"64", config.read_buffer_size + 64) catch return error.OutOfMemory;
         var read_len: usize = 0;
         if (initial_data) |d| {
-            const copy_len = @min(d.len, read_buf.len);
+            const copy_len = @min(d.len, read_buf.len - 64);
             @memcpy(read_buf[0..copy_len], d[0..copy_len]);
             read_len = copy_len;
         }
@@ -127,12 +133,12 @@ pub const PlainConnState = struct {
             .body_buf = null,
             .body_len_want = 0,
             .body_start = 0,
-            .write_buf = std.ArrayList(u8).initCapacity(allocator, config.write_buf_initial_capacity) catch {
+            .write_buf = std.ArrayListUnmanaged(u8).initCapacity(allocator, config.write_buf_initial_capacity) catch {
                 allocator.free(read_buf);
                 return error.OutOfMemory;
             },
             .write_off = 0,
-            .header_list = std.ArrayList(u8).initCapacity(allocator, config.header_list_initial_capacity) catch {
+            .header_list = std.ArrayListUnmanaged(u8).initCapacity(allocator, config.header_list_initial_capacity) catch {
                 allocator.free(read_buf);
                 return error.OutOfMemory;
             },
@@ -161,14 +167,16 @@ pub const PlainConnState = struct {
 // TLS 握手中条目与已握手连接状态
 // ------------------------------------------------------------------------------
 
-/// TLS 非阻塞握手中单条：C 层 pending 与底层 stream；Windows TLS 全 IOCP 时使用 BIO 模式；raw 缓冲堆分配（§1.2）
+/// TLS 非阻塞握手中单条：C 层 pending 与底层 stream；Windows TLS 全 IOCP 时使用 BIO 模式；raw 缓冲 64 字节对齐堆分配（00 §1.6、§1.2）
 pub const TlsPendingEntry = if (build_options.have_tls) struct {
     pending: tls.TlsPending,
     stream: std.Io.net.Stream,
+    /// io_threads > 1 时表示本连接所属 I/O 线程索引
+    io_thread_id: u32 = 0,
     read_op_ctx: if (use_iocp_full_tls) IocpOpCtx else void,
     write_op_ctx: if (use_iocp_full_tls) IocpOpCtx else void,
-    raw_recv_buf: if (use_iocp_full_tls) []u8 else void,
-    raw_send_buf: if (use_iocp_full_tls) []u8 else void,
+    raw_recv_buf: if (use_iocp_full_tls) []align(64) u8 else void,
+    raw_send_buf: if (use_iocp_full_tls) []align(64) u8 else void,
 
     /// 释放 raw 缓冲；在 remove 前或 shutdown 时调用（不修改 self，仅 free 持有的 slice）
     pub fn deinit(self: *const @This(), allocator: std.mem.Allocator) void {
@@ -180,9 +188,10 @@ pub const TlsPendingEntry = if (build_options.have_tls) struct {
 } else void;
 
 /// TLS 已握手连接的状态机：与 PlainConnState 同构，用 readNonblock/writeNonblock 驱动；WSS 同 WS 非阻塞多路复用
+/// read_buf 64 字节对齐（00 §1.6），raw 缓冲同
 pub const TlsConnState = if (build_options.have_tls) struct {
     stream: tls.TlsStream,
-    read_buf: []u8,
+    read_buf: []align(64) u8,
     read_len: usize,
     phase: MuxConnPhase,
     arena: ?std.heap.ArenaAllocator,
@@ -191,22 +200,25 @@ pub const TlsConnState = if (build_options.have_tls) struct {
     body_buf: ?[]u8,
     body_len_want: usize,
     body_start: usize,
-    write_buf: std.ArrayList(u8),
+    write_buf: std.ArrayListUnmanaged(u8),
     write_off: usize,
-    header_list: std.ArrayList(u8),
+    header_list: std.ArrayListUnmanaged(u8),
     use_keep_alive: bool,
     consumed: usize,
     ws_id: u32,
-    ws_read_buf: ?[]u8 = null,
+    /// io_threads > 1 时表示本连接所属 I/O 线程索引
+    io_thread_id: u32 = 0,
+    /// 00 §1.6：WebSocket 帧解析/掩码用 64 字节对齐
+    ws_read_buf: ?[]align(64) u8 = null,
     ws_read_len: usize = 0,
-    h2_streams: ?std.AutoHashMap(u31, H2StreamEntry),
-    chunked_body_buf: ?std.ArrayList(u8),
+    h2_streams: ?std.AutoHashMapUnmanaged(u31, H2StreamEntry),
+    chunked_body_buf: ?std.ArrayListUnmanaged(u8),
     chunked_parse_state: ChunkedParseState,
     chunked_consumed: usize,
     read_op_ctx: if (use_iocp_full_tls) IocpOpCtx else void,
     write_op_ctx: if (use_iocp_full_tls) IocpOpCtx else void,
-    raw_recv_buf: if (use_iocp_full_tls) []u8 else void,
-    raw_send_buf: if (use_iocp_full_tls) []u8 else void,
+    raw_recv_buf: if (use_iocp_full_tls) []align(64) u8 else void,
+    raw_send_buf: if (use_iocp_full_tls) []align(64) u8 else void,
 
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator, close_stream: bool) void {
         if (close_stream) if (libs_process.getProcessIo()) |io| self.stream.close(io);
@@ -217,7 +229,7 @@ pub const TlsConnState = if (build_options.have_tls) struct {
         if (self.h2_streams) |*map| {
             var it = map.iterator();
             while (it.next()) |e| e.value_ptr.deinitEntry(allocator);
-            map.deinit();
+            map.deinit(allocator);
         }
         if (self.chunked_body_buf) |*list| list.deinit(allocator);
         self.write_buf.deinit(allocator);
@@ -229,18 +241,19 @@ pub const TlsConnState = if (build_options.have_tls) struct {
     }
 
     pub fn init(allocator: std.mem.Allocator, stream: tls.TlsStream, config: *const ServerConfig) !@This() {
-        const read_buf = allocator.alloc(u8, config.read_buffer_size) catch return error.OutOfMemory;
+        // 00 §1.6 Lane 填充：多分配 64 字节
+        const read_buf = allocator.alignedAlloc(u8, .@"64", config.read_buffer_size + 64) catch return error.OutOfMemory;
         errdefer allocator.free(read_buf);
-        var raw_recv_buf: if (use_iocp_full_tls) []u8 else void = if (use_iocp_full_tls) undefined else {};
-        var raw_send_buf: if (use_iocp_full_tls) []u8 else void = if (use_iocp_full_tls) undefined else {};
+        var raw_recv_buf: if (use_iocp_full_tls) []align(64) u8 else void = if (use_iocp_full_tls) undefined else {};
+        var raw_send_buf: if (use_iocp_full_tls) []align(64) u8 else void = if (use_iocp_full_tls) undefined else {};
         if (use_iocp_full_tls) {
-            raw_recv_buf = allocator.alloc(u8, TLS_RAW_BUF_SIZE) catch return error.OutOfMemory;
-            raw_send_buf = allocator.alloc(u8, TLS_RAW_BUF_SIZE) catch {
+            raw_recv_buf = allocator.alignedAlloc(u8, .@"64", TLS_RAW_BUF_SIZE) catch return error.OutOfMemory;
+            raw_send_buf = allocator.alignedAlloc(u8, .@"64", TLS_RAW_BUF_SIZE) catch {
                 allocator.free(raw_recv_buf);
                 return error.OutOfMemory;
             };
         }
-        var write_buf = std.ArrayList(u8).initCapacity(allocator, config.write_buf_initial_capacity) catch {
+        var write_buf = std.ArrayListUnmanaged(u8).initCapacity(allocator, config.write_buf_initial_capacity) catch {
             if (use_iocp_full_tls) {
                 allocator.free(raw_recv_buf);
                 allocator.free(raw_send_buf);
@@ -248,7 +261,7 @@ pub const TlsConnState = if (build_options.have_tls) struct {
             allocator.free(read_buf);
             return error.OutOfMemory;
         };
-        const header_list = std.ArrayList(u8).initCapacity(allocator, config.header_list_initial_capacity) catch {
+        const header_list = std.ArrayListUnmanaged(u8).initCapacity(allocator, config.header_list_initial_capacity) catch {
             if (use_iocp_full_tls) {
                 allocator.free(raw_recv_buf);
                 allocator.free(raw_send_buf);
