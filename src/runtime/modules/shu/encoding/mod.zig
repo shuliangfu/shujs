@@ -2,6 +2,7 @@
 // atob(str)：将 Base64 字符串解码为「二进制字符串」（每字符码点 0–255）
 // btoa(str)：将「二进制字符串」编码为 Base64
 // 由 engine/encoding.zig 移入，bindings 调用 register
+// 所有权：atob/btoa 返回值 JSC 持有；回调内 [Allocates] 在返回前交 JSC 或 free，无向 Zig 调用方返回切片。
 
 const std = @import("std");
 const jsc = @import("jsc");
