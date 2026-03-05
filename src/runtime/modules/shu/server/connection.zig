@@ -101,7 +101,7 @@ pub const PreReadTlsStream = if (build_options.have_tls) struct {
 // h2c 检测
 // ------------------------------------------------------------------------------
 
-/// 是否 Upgrade: h2c（Connection 含 upgrade，Upgrade 含 h2c，不区分大小写）
+/// 是否 Upgrade: h2c（Connection 含 upgrade，Upgrade 含 h2c，不区分大小写）。作为回调存入 StepPlainCallbacks，不可用 inline。
 pub fn isH2cUpgrade(connection_header: ?[]const u8, upgrade_header: ?[]const u8) bool {
     const conn = connection_header orelse return false;
     const up = upgrade_header orelse return false;
@@ -125,6 +125,7 @@ pub fn sendH2Error(s: anytype, stream_id: u31, status: u16) !void {
 // ------------------------------------------------------------------------------
 
 /// 对单个 H2 请求调 handler 并写回 HEADERS + DATA；stream 需具备 writeAll
+// Hot-path
 pub fn sendH2Response(
     allocator: std.mem.Allocator,
     ctx: jsc.JSContextRef,
@@ -201,9 +202,10 @@ pub fn sendH2Response(
 // HTTP/2 响应写入 buffer（多路复用内非阻塞用）
 // ------------------------------------------------------------------------------
 
-/// 与 sendH2Response 逻辑一致，但将 HEADERS + DATA 帧追加到 write_buf，供多路复用内非阻塞写出
+/// 与 sendH2Response 逻辑一致，但将 HEADERS + DATA 帧追加到 write_buf，供多路复用内非阻塞写出（01 §1.2 Unmanaged）
+// Hot-path
 pub fn sendH2ResponseToBuffer(
-    write_buf: *std.ArrayList(u8),
+    write_buf: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,
     ctx: jsc.JSContextRef,
     stream_id: u31,
@@ -305,14 +307,15 @@ pub fn handleH2Connection(
     }
     try http2.sendServerPreface(stream);
     var frame_buf: [9 + 16384]u8 = undefined;
-    var streams = std.AutoHashMap(u31, struct {
+    // 01 §1.2：结构体内持久化用 Unmanaged，显式传 allocator，利于 Cache 与 Arena 组合
+    var streams = std.AutoHashMapUnmanaged(u31, struct {
         arena: std.heap.ArenaAllocator,
-        headers_list: std.ArrayList(http2.HeaderEntry),
+        headers_list: std.ArrayListUnmanaged(http2.HeaderEntry),
         method: []const u8,
         path: []const u8,
-        body: std.ArrayList(u8),
+        body: std.ArrayListUnmanaged(u8),
         end_stream: bool,
-    }).init(allocator);
+    }){};
     defer {
         var it = streams.iterator();
         while (it.next()) |e| {
@@ -320,12 +323,12 @@ pub fn handleH2Connection(
             e.value_ptr.headers_list.deinit(allocator);
             e.value_ptr.body.deinit(allocator);
         }
-        streams.deinit();
+        streams.deinit(allocator);
     }
     var count: u32 = 0;
     var response_ct_buf: [1024]u8 = undefined;
-    // 大 buffer 堆分配，避免栈上 256KB（规范 §1.2）
-    const response_body_buf = allocator.alloc(u8, RESPONSE_BODY_BUF_SIZE) catch return count;
+    // 00 §1.6：响应体缓冲 64 字节对齐，供压缩（br/gzip/deflate）与写出
+    const response_body_buf = allocator.alignedAlloc(u8, .@"64", RESPONSE_BODY_BUF_SIZE) catch return count;
     defer allocator.free(response_body_buf);
     while (true) {
         const frame = http2.readOneFrame(stream, &frame_buf) catch return count;
@@ -346,26 +349,26 @@ pub fn handleH2Connection(
                 var arena_state = std.heap.ArenaAllocator.init(allocator);
                 errdefer arena_state.deinit();
                 const arena = arena_state.allocator();
-                var headers_list = try std.ArrayList(http2.HeaderEntry).initCapacity(allocator, http2.MAX_H2_HEADERS);
+                var headers_list = try std.ArrayListUnmanaged(http2.HeaderEntry).initCapacity(allocator, http2.MAX_H2_HEADERS);
                 http2.decodeHpackBlockCapped(arena, block, &headers_list, http2.MAX_H2_HEADERS) catch continue;
                 var method: []const u8 = "";
                 var path: []const u8 = "";
                 for (headers_list.items) |h| {
-                    if (std.mem.eql(u8, h.name, ":method")) method = h.value else if (std.mem.eql(u8, h.name, ":path")) path = h.value;
+                    if (http2.h2PseudoMethod(h.name)) method = h.value else if (http2.h2PseudoPath(h.name)) path = h.value;
                 }
                 if (method.len == 0) method = "GET";
                 if (path.len == 0) path = "/";
-                try streams.put(stream_id, .{
+                try streams.put(allocator, stream_id, .{
                     .arena = arena_state,
                     .headers_list = headers_list,
                     .method = method,
                     .path = path,
-                    .body = try std.ArrayList(u8).initCapacity(allocator, 0),
+                    .body = try std.ArrayListUnmanaged(u8).initCapacity(allocator, 0),
                     .end_stream = (f.header.flags & http2.FLAG_END_STREAM) != 0,
                 });
                 if (f.header.flags & http2.FLAG_END_STREAM != 0) {
                     const entry = streams.getPtr(stream_id).?;
-                    var head_list = std.ArrayList(u8).initCapacity(entry.arena.allocator(), 512) catch return count;
+                    var head_list = std.ArrayListUnmanaged(u8).initCapacity(entry.arena.allocator(), 512) catch return count;
                     const arena_al = entry.arena.allocator();
                     for (entry.headers_list.items) |h| {
                         head_list.appendSlice(arena_al, h.name) catch return count;
@@ -400,7 +403,7 @@ pub fn handleH2Connection(
                 }
                 entry.body.appendSlice(allocator, f.payload) catch continue;
                 if (f.header.flags & http2.FLAG_END_STREAM != 0) {
-                    var head_list = std.ArrayList(u8).initCapacity(entry.arena.allocator(), 512) catch return count;
+                    var head_list = std.ArrayListUnmanaged(u8).initCapacity(entry.arena.allocator(), 512) catch return count;
                     const arena_al = entry.arena.allocator();
                     for (entry.headers_list.items) |h| {
                         head_list.appendSlice(arena_al, h.name) catch return count;
