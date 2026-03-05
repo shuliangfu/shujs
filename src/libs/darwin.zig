@@ -472,3 +472,13 @@ pub fn sendFile(stream: std.Io.net.Stream, file: std.fs.File, offset: u64, count
 }
 
 // 异步文件 I/O（AsyncFileIO）已迁至 io_core/file.zig，Darwin 实现为 file.zig 内 AsyncFileIODarwin，由 mod 统一导出 file.AsyncFileIO。
+
+// ------------------------------------------------------------------------------
+// NUMA：Darwin 无内核 mbind API（统一内存或单节点），no-op 以保持与 libs_io 接口一致
+// ------------------------------------------------------------------------------
+
+/// [Darwin] 本平台无 NUMA mbind；Apple 芯片为统一内存，Intel 单节点；no-op，调用无害，与 linux.zig/windows.zig 同签名
+pub fn mbindToCurrentNode(ptr: [*]align(std.heap.page_size_min) const u8, len: usize) void {
+    _ = ptr;
+    _ = len;
+}
