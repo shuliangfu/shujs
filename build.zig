@@ -2,10 +2,15 @@
 // 参考：SHU_RUNTIME_ANALYSIS.md 6.1 顶层目录与模块
 // Zig 0.16.0-dev：使用 root_module，需先 addModule 再 addExecutable
 // 跨平台 JSC：macOS 用系统框架；Linux/Windows 可选 -Djsc_prefix=<dir> 链接 WebKit JSC
+//
+// 版本号：发布时只改 build() 内 shu_version 一处；会注入 build_options.zig，供 cli/version.zig 使用。建议与 package.json "version" 保持一致。
 
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
+    // CLI 版本号：发布新版本时只改此处；可选通过 -Dversion=x.y.z 覆盖（如 CI 打 tag 时传入）。
+    const shu_version = b.option([]const u8, "version", "Shu CLI version (default: 0.1.0)") orelse "0.1.0";
+
     const target = b.standardTargetOptions(.{});
     // 优化模式：Debug（默认）| ReleaseSafe | ReleaseFast | ReleaseSmall
     // 减小体积：zig build -Doptimize=ReleaseSmall；再配合 strip 可进一步缩小
@@ -51,10 +56,10 @@ pub fn build(b: *std.Build) void {
         b.getInstallStep().dependOn(&fail_step.step);
     }
 
-    // 生成 build_options.zig，供 runtime/engine.zig 判断是否初始化 JSC；have_tls 供 server/tls.zig；use_io_uring/use_iocp 供 server/mod.zig
+    // 生成 build_options.zig，供 runtime/engine.zig 判断是否初始化 JSC；have_tls 供 server/tls.zig；use_io_uring/use_iocp 供 server/mod.zig；version 供 cli/version.zig
     const build_options_content = b.fmt(
-        "// 由 build.zig 生成，勿手改\npub const have_webkit_jsc = {};\npub const have_tls = {};\npub const use_io_uring = {};\npub const use_iocp = {};\n",
-        .{ have_webkit_jsc, have_tls, use_io_uring, use_iocp },
+        "// 由 build.zig 生成，勿手改\npub const have_webkit_jsc = {};\npub const have_tls = {};\npub const use_io_uring = {};\npub const use_iocp = {};\npub const version = \"{s}\";\n",
+        .{ have_webkit_jsc, have_tls, use_io_uring, use_iocp, shu_version },
     );
     const write_files = b.addWriteFiles();
     const build_options_zig = write_files.add("build_options.zig", build_options_content);
