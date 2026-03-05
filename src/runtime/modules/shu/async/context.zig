@@ -66,8 +66,10 @@ fn callHookMethod(ctx: jsc.JSContextRef, hook_obj: jsc.JSObjectRef, method_name:
     const k = jsc.JSStringCreateWithUTF8CString(method_name.ptr);
     defer jsc.JSStringRelease(k);
     const fn_val = jsc.JSObjectGetProperty(ctx, hook_obj, k, null);
-    if (jsc.JSValueIsUndefined(ctx, fn_val) or !jsc.JSObjectIsFunction(ctx, @ptrCast(fn_val))) return;
-    _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(fn_val), null, @intCast(args.len), args.ptr, null);
+    if (jsc.JSValueIsUndefined(ctx, fn_val) or jsc.JSValueIsNull(ctx, fn_val)) return;
+    const fn_obj = jsc.JSValueToObject(ctx, fn_val, null) orelse return;
+    if (!jsc.JSObjectIsFunction(ctx, fn_obj)) return;
+    _ = jsc.JSObjectCallAsFunction(ctx, fn_obj, null, @intCast(args.len), args.ptr, null);
 }
 
 /// 入栈并在所有已启用钩子上调用 before(asyncId)
