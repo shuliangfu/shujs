@@ -29,9 +29,9 @@ const use_kqueue = constants.use_kqueue;
 // ------------------------------------------------------------------------------
 
 /// 单进程内明文连接多路复用：accept 后 non-blocking，epoll(Linux)/kqueue(macOS·BSD)/poll 等待 I/O，按状态机分步执行
-/// max_conns 由 options.maxConnections 配置（1～5120），事件数组堆分配以支持高并发
+/// max_conns 由 options.maxConnections 配置（1～5120），事件数组堆分配以支持高并发。conns 为 Unmanaged，put/fetchRemove/deinit 显式传 allocator（01 §1.2）
 pub const PlainMuxState = struct {
-    conns: std.AutoHashMap(usize, PlainConnState),
+    conns: std.AutoHashMapUnmanaged(usize, PlainConnState),
     allocator: std.mem.Allocator,
     poller_fd: i32 = -1,
     max_conns: usize,
@@ -63,7 +63,7 @@ pub const PlainMuxState = struct {
                 return error.SystemResources;
             };
             return .{
-                .conns = std.AutoHashMap(usize, PlainConnState).init(allocator),
+                .conns = .{},
                 .allocator = allocator,
                 .poller_fd = -1,
                 .max_conns = max_conns,
@@ -102,7 +102,7 @@ pub const PlainMuxState = struct {
                 return error.OutOfMemory;
             };
             return .{
-                .conns = std.AutoHashMap(usize, PlainConnState).init(allocator),
+                .conns = .{},
                 .allocator = allocator,
                 .poller_fd = -1,
                 .max_conns = max_conns,
@@ -116,7 +116,7 @@ pub const PlainMuxState = struct {
             };
         }
         return .{
-            .conns = std.AutoHashMap(usize, PlainConnState).init(allocator),
+            .conns = .{},
             .allocator = allocator,
             .poller_fd = -1,
             .max_conns = max_conns,
@@ -138,7 +138,7 @@ pub const PlainMuxState = struct {
         }
         var it = self.conns.iterator();
         while (it.next()) |e| e.value_ptr.deinit(self.allocator, true);
-        self.conns.deinit();
+        self.conns.deinit(self.allocator);
         self.allocator.free(self.ready_fds);
         if (self.epoll_events) |e| self.allocator.free(e);
         if (self.kqueue_evs) |e| self.allocator.free(e);
@@ -180,7 +180,8 @@ pub const ServerState = struct {
     compression_enabled: bool,
     error_callback: ?jsc.JSValueRef,
     ws_options: ?WsOptions,
-    ws_registry: std.AutoHashMap(u32, WsSendEntry),
+    /// Unmanaged，put/fetchRemove/deinit 显式传 allocator（01 §1.2）
+    ws_registry: std.AutoHashMapUnmanaged(u32, WsSendEntry),
     next_ws_id: u32,
     tls_ctx: ?tls.TlsContext,
     run_loop_every: u32,
@@ -189,10 +190,12 @@ pub const ServerState = struct {
     last_run_loop_ms: i64,
     signal_ref: ?jsc.JSValueRef,
     plain_mux: PlainMuxState,
-    tls_pending: if (build_options.have_tls) ?std.AutoHashMap(usize, TlsPendingEntry) else void = if (build_options.have_tls) null else {},
+    /// Unmanaged，put/fetchRemove/deinit 显式传 allocator（01 §1.2）
+    tls_pending: if (build_options.have_tls) ?std.AutoHashMapUnmanaged(usize, TlsPendingEntry) else void = if (build_options.have_tls) null else {},
     tls_poll_fds: if (build_options.have_tls) ?[]std.posix.pollfd else void = if (build_options.have_tls) null else {},
     tls_poll_client_fds: if (build_options.have_tls) ?[]usize else void = if (build_options.have_tls) null else {},
-    tls_conns: if (build_options.have_tls) ?std.AutoHashMap(usize, TlsConnState) else void = if (build_options.have_tls) null else {},
+    /// Unmanaged，put/fetchRemove/deinit 显式传 allocator（01 §1.2）
+    tls_conns: if (build_options.have_tls) ?std.AutoHashMapUnmanaged(usize, TlsConnState) else void = if (build_options.have_tls) null else {},
     iocp: if (build_options.use_iocp) ?iocp.IocpState else void = if (build_options.use_iocp) null else {},
     high_perf_io: ?*libs_io.HighPerfIO = null,
     buffer_pool: ?libs_io.api.BufferPool = null,
@@ -202,4 +205,8 @@ pub const ServerState = struct {
     consecutive_high_load_ticks: u32 = 0,
     /// 连续无事件的 tick 数；用于空闲时逐步增加 effective 直至 config 上限
     consecutive_idle_ticks: u32 = 0,
+    /// Thread-per-Core：>1 时使用 N 个 I/O 线程 + 无锁 Ring 投递；1=当前单线程 tick（默认）
+    io_threads: u32 = 1,
+    /// 当 io_threads > 1 时非 null，持有 N 个 I/O 线程的上下文、RingBuffer 与池；由 io_threads.zig 管理
+    io_threads_ctx: ?*anyopaque = null,
 };
