@@ -26,15 +26,15 @@ const std = @import("std");
 /// RFC 6455 握手用魔串
 const WS_ACCEPT_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
-/// 判断是否为 WebSocket Upgrade 请求：Connection 含 upgrade 且 Upgrade 含 websocket（不区分大小写）
-pub fn isWebSocketUpgrade(connection_header: ?[]const u8, upgrade_header: ?[]const u8) bool {
+/// 判断是否为 WebSocket Upgrade 请求：Connection 含 upgrade 且 Upgrade 含 websocket（不区分大小写）。00 §5.2 热路径内联。
+pub inline fn isWebSocketUpgrade(connection_header: ?[]const u8, upgrade_header: ?[]const u8) bool {
     const conn = connection_header orelse return false;
     const up = upgrade_header orelse return false;
     return headerValueContains(conn, "upgrade") and headerValueContains(up, "websocket");
 }
 
-/// 判断 value 中是否包含 token（不区分大小写），供 Upgrade 等头判断
-pub fn headerValueContains(value: []const u8, token: []const u8) bool {
+/// 判断 value 中是否包含 token（不区分大小写），供 Upgrade 等头判断。00 §5.2 热路径内联。
+pub inline fn headerValueContains(value: []const u8, token: []const u8) bool {
     if (value.len < token.len) return false;
     var i: usize = 0;
     while (i <= value.len - token.len) {
@@ -206,9 +206,10 @@ pub fn buildFrameMasked(out_buf: []u8, opcode: Opcode, payload: []const u8, mask
 }
 
 /// 读接口：read_ctx + read_fn 抽象流读取（返回读到的字节数，0 表示关闭）
+/// 00 §1.6：buf 为 64 字节对齐，利于 WebSocket 掩码 @Vector 与 SIMD
 pub const Reader = struct {
     ctx: *anyopaque,
-    read_fn: *const fn (*anyopaque, []u8) usize,
+    read_fn: *const fn (*anyopaque, []align(64) u8) usize,
 };
 /// 写接口：send_ctx + send_fn 抽象帧发送
 pub const Writer = struct {
@@ -216,13 +217,14 @@ pub const Writer = struct {
     send_fn: *const fn (*anyopaque, []const u8) void,
 };
 
-/// 步进式帧处理（非阻塞）：从 buf 解析所有完整帧，回调 on_message，pong/close 追加到 out_frames
+/// 步进式帧处理（非阻塞）：从 buf 解析所有完整帧，回调 on_message(opcode, payload)，pong/close 追加到 out_frames
 /// 返回消费字节数、是否收到 close、是否解析错误（解析错误时已调 on_error_cb）
+/// 回调时 payload 指向 buf，仅在本次调用内有效；上层可对 binary 做 NoCopy 交给 JS。
 pub fn stepFrames(
     buf: []const u8,
     out_frames: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
-    on_message_cb: *const fn (*anyopaque, []const u8) void,
+    on_message_cb: *const fn (*anyopaque, Opcode, []const u8) void,
     on_message_ctx: *anyopaque,
     on_error_cb: ?*const fn (*anyopaque, []const u8) void,
     on_error_ctx: ?*anyopaque,
@@ -240,7 +242,7 @@ pub fn stepFrames(
         consumed += parsed.consumed;
         mutable_buf = mutable_buf[parsed.consumed..];
         switch (parsed.opcode) {
-            .text, .binary => on_message_cb(on_message_ctx, parsed.payload),
+            .text, .binary => on_message_cb(on_message_ctx, parsed.opcode, parsed.payload),
             .ping => {
                 var pong_buf: [128]u8 = undefined;
                 const len = buildFrame(&pong_buf, .pong, parsed.payload) catch continue;
@@ -258,13 +260,15 @@ pub fn stepFrames(
     return .{ .consumed = consumed, .close_requested = false, .parse_error = false };
 }
 
-/// 帧循环：读帧，text/binary 调 on_message(ws_obj, payload)，ping 回 pong，close 回 close 并退出
+/// 帧循环：读帧，text/binary 调 on_message(ctx, opcode, payload)，ping 回 pong，close 回 close 并退出
 /// 可选 on_error_cb(ctx, message)：帧解析失败或异常断开时调用，然后退出
+/// frame_buf 须 64 字节对齐（00 §1.6），利于掩码与 SIMD
+/// 零拷贝约定：先执行 on_message，再 compact，故回调内 payload 指向 frame_buf 有效，可 NoCopy 交给 JS（binary）。
 pub fn runFrameLoop(
     reader: Reader,
     writer: Writer,
-    frame_buf: []u8,
-    on_message_cb: *const fn (*anyopaque, []const u8) void,
+    frame_buf: []align(64) u8,
+    on_message_cb: *const fn (*anyopaque, Opcode, []const u8) void,
     on_message_ctx: *anyopaque,
     on_error_cb: ?*const fn (*anyopaque, []const u8) void,
     on_error_ctx: ?*anyopaque,
@@ -272,7 +276,8 @@ pub fn runFrameLoop(
     var buf_len: usize = 0;
     while (true) {
         if (buf_len < frame_buf.len) {
-            const n = reader.read_fn(reader.ctx, frame_buf[buf_len..]);
+            const rest: []align(64) u8 = @alignCast(frame_buf[buf_len..]);
+            const n = reader.read_fn(reader.ctx, rest);
             if (n == 0) break;
             buf_len += n;
         }
@@ -293,11 +298,9 @@ pub fn runFrameLoop(
             }
             break;
         };
-        buf_len -= parsed.consumed;
-        if (buf_len > 0) @memcpy(frame_buf[0..buf_len], frame_buf[parsed.consumed..][0..buf_len]);
-
+        // 先处理帧（回调 / pong / close），再 compact，保证 on_message 内 payload 有效，可 NoCopy 交给 JS
         switch (parsed.opcode) {
-            .text, .binary => on_message_cb(on_message_ctx, parsed.payload),
+            .text, .binary => on_message_cb(on_message_ctx, parsed.opcode, parsed.payload),
             .ping => {
                 var pong_buf: [128]u8 = undefined;
                 const len = buildFrame(&pong_buf, .pong, parsed.payload) catch continue;
@@ -307,10 +310,14 @@ pub fn runFrameLoop(
                 var close_buf: [8]u8 = undefined;
                 const len = buildFrame(&close_buf, .close, &[_]u8{}) catch 2;
                 writer.send_fn(writer.ctx, close_buf[0..len]);
+                buf_len -= parsed.consumed;
+                if (buf_len > 0) @memcpy(frame_buf[0..buf_len], frame_buf[parsed.consumed..][0..buf_len]);
                 break;
             },
             .pong, .continuation => {},
         }
+        buf_len -= parsed.consumed;
+        if (buf_len > 0) @memcpy(frame_buf[0..buf_len], frame_buf[parsed.consumed..][0..buf_len]);
     }
 }
 
