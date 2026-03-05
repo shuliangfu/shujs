@@ -152,6 +152,22 @@ pub const HighPerfIO = struct {
     /// 已注册的 buffer 组（PROVIDE_BUFFERS）；group_id 0 为默认 64KB，可 registerBufferGroup 注册多组
     groups: [MAX_BUFFER_GROUPS]BufferGroupInfo = .{.{}} ** MAX_BUFFER_GROUPS,
 
+    /// SQPOLL 核预留（00 §3.1）：将当前线程 CPU 亲和性设为除 sq_cpu 外的所有核，避免与 io_sqp 争抢；best-effort，失败静默返回
+    fn applySqpollCoreReservation(sq_cpu: u32) void {
+        const sched_c = @cImport({
+            @cDefine("_GNU_SOURCE", "1");
+            @cInclude("sched.h");
+        });
+        const cpu_count = std.Thread.getCpuCount() catch return;
+        if (cpu_count == 0 or sq_cpu >= cpu_count) return;
+        var mask: sched_c.cpu_set_t = undefined;
+        sched_c.CPU_ZERO(&mask);
+        for (0..cpu_count) |i| {
+            if (i != sq_cpu) sched_c.CPU_SET(@as(sched_c.c_int, @intCast(i)), &mask);
+        }
+        _ = sched_c.sched_setaffinity(0, @sizeOf(sched_c.cpu_set_t), &mask);
+    }
+
     /// 初始化 Linux I/O 子系统：优先尝试 SQPOLL（0 syscall），无权限时优雅降级为标准轮询并打 performance-hint
     pub fn init(allocator: std.mem.Allocator, options: api.InitOptions) !HighPerfIO {
         const entries: u16 = @intCast(std.math.min(options.max_connections * 2, 4096));
@@ -160,9 +176,11 @@ pub const HighPerfIO = struct {
             .sq_thread_idle = 1000,
             .sq_thread_cpu = options.linux_sq_thread_cpu orelse 0,
         });
+        var used_sqpoll = true;
         var ring = linux.IoUring.init_params(entries, &params) catch |err| switch (err) {
             error.SystemOutdated => return error.Unsupported,
             error.PermissionDenied => blk: {
+                used_sqpoll = false;
                 std.debug.print("[io_core] performance-hint: IORING_SETUP_SQPOLL failed (EPERM), falling back to standard io_uring; run with sufficient privileges for 0-syscall submit.\n", .{});
                 break :blk linux.IoUring.init(entries, 0) catch |e| switch (e) {
                     error.SystemOutdated, error.PermissionDenied => return error.Unsupported,
@@ -190,6 +208,11 @@ pub const HighPerfIO = struct {
         if (options.max_connections % 64 != 0) {
             const last_word = options.max_connections / 64;
             free_bitmap[last_word] &= (1 << @as(u6, @intCast(options.max_connections % 64))) - 1;
+        }
+
+        // SQPOLL 核预留（00 §3.1）：若 SQPOLL 生效且指定了 sq_thread_cpu，将当前线程亲和性设为「排除该核」，避免与 io_sqp 争抢 L1/L2
+        if (used_sqpoll and options.linux_sq_thread_cpu != null) {
+            applySqpollCoreReservation(options.linux_sq_thread_cpu.?);
         }
 
         return .{
@@ -605,3 +628,33 @@ pub fn sendFile(stream: std.Io.net.Stream, file: std.fs.File, offset: u64, count
 }
 
 // 异步文件 I/O（AsyncFileIO）已迁至 io_core/file.zig；Linux 实现为本模块外 file.zig 内 AsyncFileIOLinux，由 mod 统一导出 file.AsyncFileIO。
+
+// ------------------------------------------------------------------------------
+// NUMA：00 §3.1、§4.2 将 buffer 池绑定到当前线程所在 NUMA 节点，多路服务器可降约 30% 内存延迟
+// ------------------------------------------------------------------------------
+
+/// 将 [ptr..ptr+len] 绑定到当前 CPU 所在 NUMA 节点（best-effort）；页对齐时调用 getcpu + mbind(MPOL_BIND)，失败则静默返回
+/// 调用方保证 ptr 页对齐、len 为页大小整数倍。单节点或 getcpu/mbind 失败时无副作用；多路服务器上可降约 30% 内存延迟
+pub fn mbindToCurrentNode(ptr: [*]align(std.heap.page_size_min) const u8, len: usize) void {
+    var node: u32 = 0;
+    const ret_getcpu = linux.syscall3(
+        linux.SYS.getcpu,
+        0,
+        @intFromPtr(&node),
+        0,
+    );
+    if (ret_getcpu != 0) return;
+    if (node >= 64) return;
+    const nodemask: u64 = @as(u64, 1) << node;
+    const MPOL_BIND: u64 = 2;
+    const ret_mbind = linux.syscall6(
+        linux.SYS.mbind,
+        @intFromPtr(ptr),
+        len,
+        MPOL_BIND,
+        @intFromPtr(&nodemask),
+        node + 1,
+        0,
+    );
+    _ = ret_mbind;
+}
