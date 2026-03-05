@@ -8,9 +8,10 @@ const common = @import("../../../common.zig");
 const libs_io = @import("libs_io");
 
 /// 主线程与工作线程之间的双向消息队列（主 -> 工作：to_worker；工作 -> 主：to_main）
+/// Unmanaged 不存 allocator，append/orderedRemove/deinit 显式传 allocator（01 §1.2、00 §1.5）
 pub const ThreadChannel = struct {
-    to_worker: std.ArrayList([]u8),
-    to_main: std.ArrayList([]u8),
+    to_worker: std.ArrayListUnmanaged([]u8),
+    to_main: std.ArrayListUnmanaged([]u8),
     mutex: std.Io.Mutex,
     allocator: std.mem.Allocator,
 
