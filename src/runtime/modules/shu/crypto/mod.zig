@@ -1,5 +1,6 @@
 // shu:crypto：哈希、对称加密、非对称加密（X25519），供全局 crypto 与 Shu.crypto / require("shu:crypto") 共用
 // 提供 randomUUID、digest、encrypt/decrypt、算法常量、generateKeyPair、encryptWithPublicKey、decryptWithPrivateKey
+// 所有权：公开 API 均为 JS 侧调用，返回值均为 JSC 持有；Zig 侧临时分配在回调内使用后即 free 或交给 JSC，无向调用方返回 [Allocates] 切片。
 
 const std = @import("std");
 const jsc = @import("jsc");
@@ -16,6 +17,14 @@ const X25519 = std.crypto.dh.X25519;
 
 const alg_chacha: u8 = 0;
 const alg_aes_gcm: u8 = 1;
+
+/// 取算法字符串前 8 字节转 u64（不足零填充），用于与固定常量整型比较（00 §2.1）
+fn algPrefix(s: []const u8) u64 {
+    var buf: [8]u8 = [_]u8{0} ** 8;
+    const n = @min(8, s.len);
+    @memcpy(buf[0..n], s[0..n]);
+    return @as(u64, @bitCast(buf));
+}
 
 /// 安全擦除敏感内存，防止编译器优化掉；密钥、明文等用完后调用，符合行业准则
 fn secureZeroBytes(s: []u8) void {
@@ -179,7 +188,11 @@ fn digestCallback(
     const n = jsc.JSStringGetUTF8CString(alg_js, &alg_buf, alg_buf.len);
     if (n == 0) return jsc.JSValueMakeUndefined(ctx);
     const alg = alg_buf[0 .. n - 1];
-    if (std.mem.eql(u8, alg, "SHA-1")) {
+    var alg_pad: [8]u8 = [_]u8{0} ** 8;
+    const alg_n = @min(8, alg.len);
+    @memcpy(alg_pad[0..alg_n], alg[0..alg_n]);
+    const alg_q = @as(u64, @bitCast(alg_pad));
+    if (alg.len == 5 and alg_q == @as(u64, @bitCast([8]u8{ 'S', 'H', 'A', '-', '1', 0, 0, 0 }))) {
         var out: [Sha1.digest_length]u8 = undefined;
         Sha1.hash(data_bytes, &out, .{});
         var hex_buf: [Sha1.digest_length * 2 + 1]u8 = undefined;
@@ -188,32 +201,34 @@ fn digestCallback(
         defer jsc.JSStringRelease(ref);
         return jsc.JSValueMakeString(ctx, ref);
     }
-    if (std.mem.eql(u8, alg, "SHA-256")) {
-        var out: [Sha256.digest_length]u8 = undefined;
-        Sha256.hash(data_bytes, &out, .{});
-        var hex_buf: [Sha256.digest_length * 2 + 1]u8 = undefined;
-        digestToHexBuf(Sha256.digest_length, &out, &hex_buf);
-        const ref = jsc.JSStringCreateWithUTF8CString(&hex_buf);
-        defer jsc.JSStringRelease(ref);
-        return jsc.JSValueMakeString(ctx, ref);
-    }
-    if (std.mem.eql(u8, alg, "SHA-384")) {
-        var out: [Sha384.digest_length]u8 = undefined;
-        Sha384.hash(data_bytes, &out, .{});
-        var hex_buf: [Sha384.digest_length * 2 + 1]u8 = undefined;
-        digestToHexBuf(Sha384.digest_length, &out, &hex_buf);
-        const ref = jsc.JSStringCreateWithUTF8CString(&hex_buf);
-        defer jsc.JSStringRelease(ref);
-        return jsc.JSValueMakeString(ctx, ref);
-    }
-    if (std.mem.eql(u8, alg, "SHA-512")) {
-        var out: [Sha512.digest_length]u8 = undefined;
-        Sha512.hash(data_bytes, &out, .{});
-        var hex_buf: [Sha512.digest_length * 2 + 1]u8 = undefined;
-        digestToHexBuf(Sha512.digest_length, &out, &hex_buf);
-        const ref = jsc.JSStringCreateWithUTF8CString(&hex_buf);
-        defer jsc.JSStringRelease(ref);
-        return jsc.JSValueMakeString(ctx, ref);
+    if (alg.len == 7) {
+        if (alg_q == @as(u64, @bitCast([8]u8{ 'S', 'H', 'A', '-', '2', '5', '6', 0 }))) {
+            var out: [Sha256.digest_length]u8 = undefined;
+            Sha256.hash(data_bytes, &out, .{});
+            var hex_buf: [Sha256.digest_length * 2 + 1]u8 = undefined;
+            digestToHexBuf(Sha256.digest_length, &out, &hex_buf);
+            const ref = jsc.JSStringCreateWithUTF8CString(&hex_buf);
+            defer jsc.JSStringRelease(ref);
+            return jsc.JSValueMakeString(ctx, ref);
+        }
+        if (alg_q == @as(u64, @bitCast([8]u8{ 'S', 'H', 'A', '-', '3', '8', '4', 0 }))) {
+            var out: [Sha384.digest_length]u8 = undefined;
+            Sha384.hash(data_bytes, &out, .{});
+            var hex_buf: [Sha384.digest_length * 2 + 1]u8 = undefined;
+            digestToHexBuf(Sha384.digest_length, &out, &hex_buf);
+            const ref = jsc.JSStringCreateWithUTF8CString(&hex_buf);
+            defer jsc.JSStringRelease(ref);
+            return jsc.JSValueMakeString(ctx, ref);
+        }
+        if (alg_q == @as(u64, @bitCast([8]u8{ 'S', 'H', 'A', '-', '5', '1', '2', 0 }))) {
+            var out: [Sha512.digest_length]u8 = undefined;
+            Sha512.hash(data_bytes, &out, .{});
+            var hex_buf: [Sha512.digest_length * 2 + 1]u8 = undefined;
+            digestToHexBuf(Sha512.digest_length, &out, &hex_buf);
+            const ref = jsc.JSStringCreateWithUTF8CString(&hex_buf);
+            defer jsc.JSStringRelease(ref);
+            return jsc.JSValueMakeString(ctx, ref);
+        }
     }
     return throwCryptoError(ctx, "crypto.digest supports SHA-1, SHA-256, SHA-384, SHA-512 only");
 }
@@ -240,7 +255,7 @@ fn encryptCallback(
     if (argumentCount >= 3) {
         const alg_str_opt = jsValueToUtf8Bytes(ctx, arguments[2], allocator);
         if (alg_str_opt) |alg_str| {
-            if (std.mem.eql(u8, alg_str, "aes-256-gcm")) alg_byte = alg_aes_gcm else if (!std.mem.eql(u8, alg_str, "chacha20-poly1305")) return throwCryptoError(ctx, "crypto.encrypt algorithm must be chacha20-poly1305 or aes-256-gcm");
+            if (alg_str.len == 12 and algPrefix(alg_str) == @as(u64, @bitCast([8]u8{ 'a', 'e', 's', '-', '2', '5', '6', '-' }))) alg_byte = alg_aes_gcm else if (alg_str.len == 18 and algPrefix(alg_str) == @as(u64, @bitCast([8]u8{ 'c', 'h', 'a', 'c', 'h', 'a', '2', '0' }))) {} else if (alg_str.len != 0) return throwCryptoError(ctx, "crypto.encrypt algorithm must be chacha20-poly1305 or aes-256-gcm");
         }
     }
     var nonce: [12]u8 = undefined;
@@ -370,7 +385,7 @@ fn generateKeyPairCallback(
     const allocator = arena.allocator();
     const alg_opt = jsValueToUtf8Bytes(ctx, arguments[0], allocator);
     const alg = alg_opt orelse return throwCryptoError(ctx, "crypto.generateKeyPair: algorithm must be a string");
-    if (!std.mem.eql(u8, alg, "X25519")) return throwCryptoError(ctx, "crypto.generateKeyPair: only X25519 is supported");
+    if (alg.len != 5 or algPrefix(alg) != @as(u64, @bitCast([8]u8{ 'X', '2', '5', '5', '1', '9', 0, 0 }))) return throwCryptoError(ctx, "crypto.generateKeyPair: only X25519 is supported");
     const io = libs_io.getProcessIo() orelse return jsc.JSValueMakeUndefined(ctx);
     var kp = X25519.KeyPair.generate(io);
     const pub_b64 = base64EncodeAlloc(allocator, &kp.public_key) catch return jsc.JSValueMakeUndefined(ctx);
