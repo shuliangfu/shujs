@@ -137,8 +137,10 @@ fn bunServeCallback(
     var host_buf: [256]u8 = undefined;
     const host_slice = getOptionalStringFromObj(ctx, options_obj, "hostname", &host_buf) orelse
         getOptionalStringFromObj(ctx, options_obj, "host", &host_buf) orelse "0.0.0.0";
+    // host_slice 可能即 host_buf 内的一段（getOptionalStringFromObj 写入后返回），此时不可 @memcpy 自拷贝，仅补 \0
     const host_for_js: [*]const u8 = if (host_slice.len < host_buf.len) blk: {
-        @memcpy(host_buf[0..host_slice.len], host_slice);
+        const dst = host_buf[0..host_slice.len];
+        if (host_slice.ptr != host_buf[0..].ptr) @memcpy(dst, host_slice);
         host_buf[host_slice.len] = 0;
         break :blk host_buf[0..].ptr;
     } else "0.0.0.0";
