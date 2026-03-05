@@ -1,5 +1,6 @@
 //! ZIP 解析与打包：手动解析 EOCD → Central Directory → Local File Header，解压用 std.compress.flate(.raw)，打包用 compressDeflate（raw deflate）。
 //! 供 shu:zlib 与 package 等使用；路径须为绝对路径，pack 返回的 slice 调用方 free。
+//! TODO: migrate to libs_io (rule §3.0) when libs_io exposes dir iteration + file write for extract; current I/O via std.fs.
 
 const std = @import("std");
 const gzip_mod = @import("../zlib/gzip.zig");
@@ -163,7 +164,7 @@ fn decompressDeflateToFile(file: std.fs.File, payload: []const u8) !void {
 // 打包：目录 → ZIP 字节（Stored 或 Deflate）
 // -----------------------------------------------------------------------------
 
-/// 将指定目录递归打包为 ZIP 格式字节。dir_path 须为绝对路径；返回的切片由调用方 free。
+/// [Allocates] 将指定目录递归打包为 ZIP 格式字节；dir_path 须为绝对路径，调用方须用同一 allocator free 返回值。
 pub fn packZipFromDir(allocator: std.mem.Allocator, dir_path: []const u8) ![]const u8 {
     var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return error.ZipPackOpenDirFailed;
     defer dir.close();
