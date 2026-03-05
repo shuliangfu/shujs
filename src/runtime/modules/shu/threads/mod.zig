@@ -2,6 +2,7 @@
 
 // Shu.thread / shu:threads：多线程 API，spawn(scriptPath [, options]) 在新线程中运行脚本，通过 channel 收发消息
 // 路径相对于 modules/shu/threads/
+// 所有权：WorkerArgs 由主线程分配，工作线程 entry 内 free entry_path/cwd；to_worker/to_main 队列由 ThreadChannel 管理；JS 侧返回值 JSC 持有。
 
 const std = @import("std");
 const jsc = @import("jsc");
@@ -177,8 +178,8 @@ fn spawnCallback(
 
     var channel = allocator.create(thread_worker.ThreadChannel) catch return jsc.JSValueMakeUndefined(ctx);
     channel.* = .{
-        .to_worker = std.ArrayList([]u8).empty,
-        .to_main = std.ArrayList([]u8).empty,
+        .to_worker = .{},
+        .to_main = .{},
         .mutex = .{ .state = std.atomic.Value(std.Io.Mutex.State).init(.unlocked) },
         .allocator = allocator,
     };
