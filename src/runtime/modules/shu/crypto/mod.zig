@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const jsc = @import("jsc");
+const common = @import("../../../common.zig");
 const globals = @import("../../../globals.zig");
 const libs_io = @import("libs_io");
 
@@ -508,26 +509,20 @@ fn decryptWithPrivateKeyCallback(
     return jsc.JSValueMakeString(ctx, ref);
 }
 
+/// 纯 Zig：new DOMException(msg, "OperationError") 后 setThrowAndThrow
 fn throwCryptoError(ctx: jsc.JSContextRef, msg: []const u8) jsc.JSValueRef {
-    var buf: [384]u8 = undefined;
-    const prefix = "throw new DOMException(\"";
-    @memcpy(buf[0..prefix.len], prefix);
-    var i: usize = prefix.len;
-    for (msg) |c| {
-        if (i >= buf.len - 20) break;
-        if (c == '"' or c == '\\') {
-            buf[i] = '\\';
-            i += 1;
-        }
-        buf[i] = c;
-        i += 1;
-    }
-    const suffix = "\", \"OperationError\");";
-    @memcpy(buf[i..][0..suffix.len], suffix);
-    i += suffix.len;
-    buf[i] = 0;
-    const script_ref = jsc.JSStringCreateWithUTF8CString(buf[0..].ptr);
-    defer jsc.JSStringRelease(script_ref);
-    _ = jsc.JSEvaluateScript(ctx, script_ref, null, null, 1, null);
-    return jsc.JSValueMakeUndefined(ctx);
+    const global = jsc.JSContextGetGlobalObject(ctx);
+    const k_DOMException = jsc.JSStringCreateWithUTF8CString("DOMException");
+    defer jsc.JSStringRelease(k_DOMException);
+    const ctor = jsc.JSObjectGetProperty(ctx, global, k_DOMException, null);
+    const ctor_obj = jsc.JSValueToObject(ctx, ctor, null) orelse return jsc.JSValueMakeUndefined(ctx);
+    const msg_z = jsc.JSStringCreateWithUTF8CString(msg.ptr);
+    defer jsc.JSStringRelease(msg_z);
+    const name_z = jsc.JSStringCreateWithUTF8CString("OperationError");
+    defer jsc.JSStringRelease(name_z);
+    var args: [2]jsc.JSValueRef = .{ jsc.JSValueMakeString(ctx, msg_z), jsc.JSValueMakeString(ctx, name_z) };
+    var exception: ?jsc.JSValueRef = null;
+    const err_instance = jsc.JSObjectCallAsConstructor(ctx, ctor_obj, 2, &args, @ptrCast(&exception));
+    if (exception != null) return jsc.JSValueMakeUndefined(ctx);
+    return common.setThrowAndThrow(ctx, err_instance);
 }
