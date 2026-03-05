@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const jsc = @import("jsc");
+const common = @import("../../../common.zig");
 const globals = @import("../../../globals.zig");
 
 /// §1.1 显式 allocator 收敛：register(ctx, allocator) 时注入，TextEncoder.encode 等回调优先使用
@@ -18,13 +19,44 @@ pub fn register(ctx: jsc.JSGlobalContextRef, allocator: ?std.mem.Allocator) void
     setGlobalConstructor(ctx, global, "TextDecoder", textDecoderConstructorCallback);
 }
 
-/// 注入全局 __shuDecodeUtf8(buffer)，供 TextDecoder.decode 回调调用以在 JS 侧解码 UTF-8
+/// __shuDecodeUtf8(buffer) 的 C 回调：从 TypedArray/ArrayBuffer 取字节，以 UTF-8 构造 JS 字符串，纯 Zig
+fn shuDecodeUtf8Callback(
+    ctx: jsc.JSContextRef,
+    _: jsc.JSObjectRef,
+    _: jsc.JSObjectRef,
+    argumentCount: usize,
+    arguments: [*]const jsc.JSValueRef,
+    _: [*]jsc.JSValueRef,
+) callconv(.c) jsc.JSValueRef {
+    if (argumentCount < 1) return jsc.JSValueMakeUndefined(ctx);
+    const allocator = globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
+    const buffer_val = arguments[0];
+    var byte_len: usize = 0;
+    const ptr = blk: {
+        const typ = jsc.JSValueGetTypedArrayType(ctx, buffer_val, null);
+        if (typ != .None) {
+            const obj = jsc.JSValueToObject(ctx, buffer_val, null) orelse break :blk null;
+            byte_len = jsc.JSObjectGetTypedArrayByteLength(ctx, obj);
+            break :blk jsc.JSObjectGetTypedArrayBytesPtr(ctx, obj, null);
+        }
+        const obj = jsc.JSValueToObject(ctx, buffer_val, null) orelse break :blk null;
+        byte_len = jsc.JSObjectGetArrayBufferByteLength(ctx, obj);
+        break :blk jsc.JSObjectGetArrayBufferBytesPtr(ctx, obj, null);
+    };
+    if (ptr == null or byte_len == 0) return jsc.JSValueMakeString(ctx, jsc.JSStringCreateWithUTF8CString(""));
+    const slice = @as([*]const u8, @ptrCast(ptr))[0..byte_len];
+    const z = allocator.dupeZ(u8, slice) catch return jsc.JSValueMakeUndefined(ctx);
+    defer allocator.free(z);
+    const str_ref = jsc.JSStringCreateWithUTF8CString(z.ptr);
+    return jsc.JSValueMakeString(ctx, str_ref);
+}
+
+/// 注入全局 __shuDecodeUtf8 为 C 回调（仅执行一次），纯 Zig 无内联脚本
 fn injectTextDecoderHelper(ctx: jsc.JSContextRef, global: jsc.JSObjectRef) void {
-    const script =
-        "(function(){ function utf8Decode(bytes){ var s='',i=0; while(i<bytes.length){ var c=bytes[i++]; if(c<0x80)s+=String.fromCharCode(c); else if(c>=0xC2&&c<=0xDF&&i<bytes.length){ s+=String.fromCharCode(((c&0x1F)<<6)|(bytes[i++]&0x3F)); } else if(c>=0xE0&&c<=0xEF&&i+1<bytes.length){ s+=String.fromCharCode(((c&0x0F)<<12)|((bytes[i++]&0x3F)<<6)|(bytes[i++]&0x3F)); } else if(c>=0xF0&&c<=0xF4&&i+2<bytes.length){ var n=((c&7)<<18)|((bytes[i++]&0x3F)<<12)|((bytes[i++]&0x3F)<<6)|(bytes[i++]&0x3F); s+=n<=0xFFFF?String.fromCharCode(n):String.fromCharCode(0xD800+((n-0x10000)>>10),0xDC00+((n-0x10000)&0x3FF)); } else s+='\\uFFFD'; } return s; } globalThis.__shuDecodeUtf8=function(buffer){ var bytes=new Uint8Array(buffer); return utf8Decode(bytes); }; })();";
-    const ref = jsc.JSStringCreateWithUTF8CString(script.ptr);
-    defer jsc.JSStringRelease(ref);
-    _ = jsc.JSEvaluateScript(ctx, ref, global, null, 0, null);
+    const k = jsc.JSStringCreateWithUTF8CString("__shuDecodeUtf8");
+    defer jsc.JSStringRelease(k);
+    if (!jsc.JSValueIsUndefined(ctx, jsc.JSObjectGetProperty(ctx, global, k, null))) return;
+    common.setMethod(ctx, global, "__shuDecodeUtf8", shuDecodeUtf8Callback);
 }
 
 fn setGlobalConstructor(ctx: jsc.JSGlobalContextRef, global: jsc.JSObjectRef, name: [*]const u8, callback: jsc.JSObjectCallAsFunctionCallback) void {
@@ -57,7 +89,19 @@ fn setMethod(ctx: jsc.JSGlobalContextRef, obj: jsc.JSObjectRef, name: [*]const u
     _ = jsc.JSObjectSetProperty(ctx, obj, name_ref, fn_ref, jsc.kJSPropertyAttributeNone, null);
 }
 
-/// TextEncoder.prototype.encode(str)：将字符串转为 UTF-8 的 Uint8Array（通过 JS 侧 atob + Uint8Array 构造）
+/// JSC 回收 Uint8Array 时释放 Zig 复制的 UTF-8 缓冲；context 为 *TextEncodingBytesContext
+fn textEncodingBytesDeallocator(bytes: *anyopaque, deallocator_context: ?*anyopaque) callconv(.c) void {
+    _ = bytes;
+    const ctx = @as(*TextEncodingBytesContext, @ptrCast(@alignCast(deallocator_context orelse return)));
+    ctx.allocator.free(ctx.slice);
+    ctx.allocator.destroy(ctx);
+}
+const TextEncodingBytesContext = struct {
+    allocator: std.mem.Allocator,
+    slice: []u8,
+};
+
+/// TextEncoder.prototype.encode(str)：将字符串转为 UTF-8 的 Uint8Array，纯 Zig（NoCopy + deallocator）
 fn textEncoderEncodeCallback(
     ctx: jsc.JSContextRef,
     _: jsc.JSObjectRef,
@@ -77,24 +121,20 @@ fn textEncoderEncodeCallback(
     const n = jsc.JSStringGetUTF8CString(input_js, buf.ptr, max_sz);
     if (n == 0) return jsc.JSValueMakeUndefined(ctx);
     const utf8 = buf[0 .. n - 1];
-    var encoder = std.base64.standard.Encoder;
-    const enc_len = encoder.calcSize(utf8.len);
-    const b64_buf = allocator.alloc(u8, enc_len + 1) catch return jsc.JSValueMakeUndefined(ctx);
-    defer allocator.free(b64_buf);
-    const written = encoder.encode(b64_buf[0..enc_len], utf8);
-    b64_buf[written.len] = 0;
-    var escaped = std.ArrayList(u8).initCapacity(allocator, written.len * 2 + 4) catch return jsc.JSValueMakeUndefined(ctx);
-    defer escaped.deinit(allocator);
-    escaped.appendSlice(allocator, "(function(b64){var s=atob(b64);var a=new Uint8Array(s.length);for(var i=0;i<s.length;i++)a[i]=s.charCodeAt(i);return a;})('") catch return jsc.JSValueMakeUndefined(ctx);
-    for (b64_buf[0..written.len]) |c| {
-        if (c == '\\') escaped.appendSlice(allocator, "\\\\") catch return jsc.JSValueMakeUndefined(ctx) else if (c == '\'') escaped.appendSlice(allocator, "\\'") catch return jsc.JSValueMakeUndefined(ctx) else escaped.append(allocator, c) catch return jsc.JSValueMakeUndefined(ctx);
+    const copy = allocator.dupe(u8, utf8) catch return jsc.JSValueMakeUndefined(ctx);
+    const dc = allocator.create(TextEncodingBytesContext) catch {
+        allocator.free(copy);
+        return jsc.JSValueMakeUndefined(ctx);
+    };
+    dc.* = .{ .allocator = allocator, .slice = copy };
+    var exception: ?jsc.JSValueRef = null;
+    const out = jsc.JSObjectMakeTypedArrayWithBytesNoCopy(ctx, .Uint8Array, copy.ptr, copy.len, textEncodingBytesDeallocator, dc, @ptrCast(&exception));
+    if (out == null) {
+        allocator.free(copy);
+        allocator.destroy(dc);
+        return jsc.JSValueMakeUndefined(ctx);
     }
-    escaped.appendSlice(allocator, "')") catch return jsc.JSValueMakeUndefined(ctx);
-    const script_z = allocator.dupeZ(u8, escaped.items) catch return jsc.JSValueMakeUndefined(ctx);
-    defer allocator.free(script_z);
-    const script_ref = jsc.JSStringCreateWithUTF8CString(script_z.ptr);
-    defer jsc.JSStringRelease(script_ref);
-    return jsc.JSEvaluateScript(ctx, script_ref, null, null, 1, null);
+    return out.?;
 }
 
 /// new TextDecoder(label?)：返回带 decode 方法的对象；当前仅支持 utf-8
