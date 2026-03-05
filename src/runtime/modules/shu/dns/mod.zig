@@ -88,9 +88,10 @@ fn scheduleDnsTick(ctx: jsc.JSContextRef) void {
     const k_immediate = jsc.JSStringCreateWithUTF8CString("setImmediate");
     defer jsc.JSStringRelease(k_immediate);
     const set_immediate = jsc.JSObjectGetProperty(ctx, global, k_immediate, null);
-    if (jsc.JSObjectIsFunction(ctx, @ptrCast(set_immediate))) {
+    const set_immediate_obj = jsc.JSValueToObject(ctx, set_immediate, null);
+    if (set_immediate_obj != null and jsc.JSObjectIsFunction(ctx, set_immediate_obj.?)) {
         var args = [_]jsc.JSValueRef{tick_fn};
-        _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(set_immediate), null, 1, &args, null);
+        _ = jsc.JSObjectCallAsFunction(ctx, set_immediate_obj.?, null, 1, &args, null);
     }
 }
 
