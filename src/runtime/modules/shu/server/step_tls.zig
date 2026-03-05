@@ -37,6 +37,7 @@ pub const WsErrorCbContext = step_plain.WsErrorCbContext;
 
 /// 对单条 TLS 连接执行状态机一步（非阻塞 readNonblock/writeNonblock）；fd 用于 WSS 时注册 ws_id。
 /// 当 !build_options.have_tls 时直接返回 .continue_；否则委托 stepTlsConnBody。
+// Hot-path
 pub fn stepTlsConn(
     state: *ServerState,
     allocator: std.mem.Allocator,
@@ -62,13 +63,14 @@ const stepTlsConnBody = if (build_options.have_tls) struct {
         switch (conn.phase) {
             .reading_preface => unreachable,
             .reading_headers => {
-                const n = conn.stream.readNonblock(conn.read_buf[conn.read_len..]) catch |e| {
+                const avail = conn.read_buf.len -| 64 -| conn.read_len;
+                const n = conn.stream.readNonblock(conn.read_buf[conn.read_len..][0..avail]) catch |e| {
                     if (e == error.WantRead or e == error.WantWrite) return .continue_;
                     return .remove_and_close;
                 };
                 if (n == 0 and conn.read_len == 0) return .remove_and_close;
                 if (n > 0) conn.read_len += n;
-                if (conn.read_len >= 24 and std.mem.eql(u8, conn.read_buf[0..24], http2.CLIENT_PREFACE)) {
+                if (conn.read_len >= 24 and http2.eqlClientPreface(conn.read_buf[0..24])) {
                     conn.write_buf.shrinkRetainingCapacity(0);
                     http2.appendServerPrefaceTo(&conn.write_buf, allocator) catch return .remove_and_close;
                     conn.phase = .h2_send_preface;
@@ -76,7 +78,15 @@ const stepTlsConnBody = if (build_options.have_tls) struct {
                     return .continue_;
                 }
                 var arena = std.heap.ArenaAllocator.init(allocator);
-                const parsed_result = parse.tryParseHeadersFromBufferZeroCopy(conn.read_buf[0..conn.read_len], &state.config) catch |e| {
+                // 00 §1.6 Lane 填充：末尾 64 字节清零后传予 indexOfCrLfCrLf，消除 SIMD 尾部分支
+                const head_slice: []const u8 = blk: {
+                    if (conn.read_len + 64 <= conn.read_buf.len) {
+                        @memset(conn.read_buf[conn.read_len..][0..64], 0);
+                        break :blk @as([*]const u8, @ptrCast(conn.read_buf.ptr))[0..conn.read_len + 64];
+                    }
+                    break :blk @as([*]const u8, @ptrCast(conn.read_buf.ptr))[0..conn.read_len];
+                };
+                const parsed_result = parse.tryParseHeadersFromBufferZeroCopy(head_slice, &state.config) catch |e| {
                     arena.deinit();
                     if (e == error.NeedMore) return .continue_;
                     conn.arena = arena;
@@ -116,13 +126,13 @@ const stepTlsConnBody = if (build_options.have_tls) struct {
                     conn.write_buf.shrinkRetainingCapacity(0);
                     ws_mod.appendHandshakeTo(&conn.write_buf, accept_key, allocator) catch return .remove_and_close;
                     if (conn.ws_read_buf == null) {
-                        conn.ws_read_buf = state.plain_mux.allocator.alloc(u8, state.config.ws_read_buffer_size) catch return .remove_and_close;
+                        conn.ws_read_buf = state.plain_mux.allocator.alignedAlloc(u8, .@"64", state.config.ws_read_buffer_size) catch return .remove_and_close;
                     }
                     conn.phase = .ws_handshake_writing;
                     conn.write_off = 0;
                     conn.ws_id = state.next_ws_id;
                     state.next_ws_id += 1;
-                    _ = state.ws_registry.put(conn.ws_id, .{ .fd = fd }) catch {};
+                    _ = state.ws_registry.put(state.allocator, conn.ws_id, .{ .fd = fd }) catch {};
                     if (cb.make_ws_obj(ctx, conn.ws_id)) |ws_obj| {
                         if (state.ws_options.?.on_open) |on_open_fn| {
                             const args = [_]jsc.JSValueRef{ws_obj};
@@ -132,7 +142,7 @@ const stepTlsConnBody = if (build_options.have_tls) struct {
                     return .continue_;
                 }
                 if (is_chunked) {
-                    conn.chunked_body_buf = std.ArrayList(u8).initCapacity(allocator, 0) catch return .remove_and_close;
+                    conn.chunked_body_buf = std.ArrayListUnmanaged(u8).initCapacity(allocator, 0) catch return .remove_and_close;
                     conn.chunked_parse_state = .reading_size_line;
                     conn.chunked_consumed = 0;
                     conn.phase = .reading_chunked_body;
@@ -190,7 +200,8 @@ const stepTlsConnBody = if (build_options.have_tls) struct {
             },
             .reading_body => {
                 const want = conn.body_len_want;
-                const n = conn.stream.readNonblock(conn.read_buf[conn.read_len..]) catch |e| {
+                const avail_body = conn.read_buf.len -| 64 -| conn.read_len;
+                const n = conn.stream.readNonblock(conn.read_buf[conn.read_len..][0..avail_body]) catch |e| {
                     if (e == error.WantRead or e == error.WantWrite) return .continue_;
                     return .remove_and_close;
                 };
@@ -205,7 +216,8 @@ const stepTlsConnBody = if (build_options.have_tls) struct {
                 return .continue_;
             },
             .reading_chunked_body => {
-                const nr = conn.stream.readNonblock(conn.read_buf[conn.read_len..]) catch |e| {
+                const avail_chunked = conn.read_buf.len -| 64 -| conn.read_len;
+                const nr = conn.stream.readNonblock(conn.read_buf[conn.read_len..][0..avail_chunked]) catch |e| {
                     if (e == error.WantRead or e == error.WantWrite) return .continue_;
                     return .remove_and_close;
                 };
@@ -250,7 +262,7 @@ const stepTlsConnBody = if (build_options.have_tls) struct {
             .responding => {
                 const parsed = conn.parsed orelse return .remove_and_close;
                 var response_ct_buf: [1024]u8 = undefined;
-                const response_body_buf = allocator.alloc(u8, step_plain.RESPONSE_BODY_BUF_SIZE) catch return .remove_and_close;
+                const response_body_buf = allocator.alignedAlloc(u8, .@"64", step_plain.RESPONSE_BODY_BUF_SIZE) catch return .remove_and_close;
                 defer allocator.free(response_body_buf);
                 conn.header_list.shrinkRetainingCapacity(0);
                 const req_obj = request_js.makeRequestObject(ctx, conn.arena.?.allocator(), &parsed) orelse {
@@ -396,7 +408,7 @@ const stepTlsConnBody = if (build_options.have_tls) struct {
                     conn.write_off += wn;
                 }
                 if (result.parse_error or result.close_requested) {
-                    _ = state.ws_registry.remove(conn.ws_id);
+                    _ = state.ws_registry.fetchRemove(conn.ws_id);
                     if (opts.on_close) |on_close_fn| {
                         const args = [_]jsc.JSValueRef{ws_obj_ptr};
                         _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(on_close_fn), null, 1, &args, null);
@@ -420,7 +432,8 @@ const stepTlsConnBody = if (build_options.have_tls) struct {
             },
             .h2c_wait_preface => {
                 if (conn.read_len < 24) {
-                    const nr = conn.stream.readNonblock(conn.read_buf[conn.read_len..]) catch |e| {
+                    const avail_preface = conn.read_buf.len -| 64 -| conn.read_len;
+                    const nr = conn.stream.readNonblock(conn.read_buf[conn.read_len..][0..avail_preface]) catch |e| {
                         if (e == error.WantRead or e == error.WantWrite) return .continue_;
                         return .remove_and_close;
                     };
@@ -428,7 +441,7 @@ const stepTlsConnBody = if (build_options.have_tls) struct {
                     if (nr > 0) conn.read_len += nr;
                     return .continue_;
                 }
-                if (!std.mem.eql(u8, conn.read_buf[0..24], http2.CLIENT_PREFACE)) return .remove_and_close;
+                if (!http2.eqlClientPreface(conn.read_buf[0..24])) return .remove_and_close;
                 conn.write_buf.shrinkRetainingCapacity(0);
                 http2.appendServerPrefaceTo(&conn.write_buf, allocator) catch return .remove_and_close;
                 conn.phase = .h2_send_preface;
@@ -443,7 +456,7 @@ const stepTlsConnBody = if (build_options.have_tls) struct {
                 if (slice.len == 0) {
                     conn.phase = .h2_frames;
                     conn.read_len = 0;
-                    conn.h2_streams = std.AutoHashMap(u31, H2StreamEntry).init(allocator);
+                    conn.h2_streams = .{};
                     return .continue_;
                 }
                 const wn = conn.stream.writeNonblock(slice) catch |e| {
@@ -454,7 +467,8 @@ const stepTlsConnBody = if (build_options.have_tls) struct {
                 return .continue_;
             },
             .h2_frames => {
-                const nr = conn.stream.readNonblock(conn.read_buf[conn.read_len..]) catch |e| {
+                const avail_h2 = conn.read_buf.len -| 64 -| conn.read_len;
+                const nr = conn.stream.readNonblock(conn.read_buf[conn.read_len..][0..avail_h2]) catch |e| {
                     if (e == error.WantRead or e == error.WantWrite) return .continue_;
                     return .remove_and_close;
                 };
@@ -479,7 +493,7 @@ const stepTlsConnBody = if (build_options.have_tls) struct {
                                 var arena_state = std.heap.ArenaAllocator.init(allocator);
                                 errdefer arena_state.deinit();
                                 const arena = arena_state.allocator();
-                                var headers_list = std.ArrayList(http2.HeaderEntry).initCapacity(allocator, http2.MAX_H2_HEADERS) catch return .remove_and_close;
+                                var headers_list = std.ArrayListUnmanaged(http2.HeaderEntry).initCapacity(allocator, http2.MAX_H2_HEADERS) catch return .remove_and_close;
                                 http2.decodeHpackBlockCapped(arena, block, &headers_list, http2.MAX_H2_HEADERS) catch {
                                     headers_list.deinit(allocator);
                                     arena_state.deinit();
@@ -488,16 +502,16 @@ const stepTlsConnBody = if (build_options.have_tls) struct {
                                 var method: []const u8 = "";
                                 var path: []const u8 = "";
                                 for (headers_list.items) |h| {
-                                    if (std.mem.eql(u8, h.name, ":method")) method = h.value else if (std.mem.eql(u8, h.name, ":path")) path = h.value;
+                                    if (http2.h2PseudoMethod(h.name)) method = h.value else if (http2.h2PseudoPath(h.name)) path = h.value;
                                 }
                                 if (method.len == 0) method = "GET";
                                 if (path.len == 0) path = "/";
-                                var body_list = std.ArrayList(u8).initCapacity(allocator, 0) catch {
+                                var body_list = std.ArrayListUnmanaged(u8).initCapacity(allocator, 0) catch {
                                     headers_list.deinit(allocator);
                                     arena_state.deinit();
                                     return .remove_and_close;
                                 };
-                                streams.put(stream_id, .{
+                                streams.put(allocator, stream_id, .{
                                     .arena = arena_state,
                                     .headers_list = headers_list,
                                     .method = method,
@@ -511,7 +525,7 @@ const stepTlsConnBody = if (build_options.have_tls) struct {
                                 };
                                 if (f.header.flags & http2.FLAG_END_STREAM != 0) {
                                     const entry = streams.getPtr(stream_id).?;
-                                    var head_list = std.ArrayList(u8).initCapacity(entry.arena.allocator(), 512) catch return .remove_and_close;
+                                    var head_list = std.ArrayListUnmanaged(u8).initCapacity(entry.arena.allocator(), 512) catch return .remove_and_close;
                                     const arena_al = entry.arena.allocator();
                                     for (entry.headers_list.items) |h| {
                                         head_list.appendSlice(arena_al, h.name) catch return .remove_and_close;
@@ -527,11 +541,11 @@ const stepTlsConnBody = if (build_options.have_tls) struct {
                                         .body = if (entry.body.items.len > 0) entry.body.items else null,
                                     };
                                     var response_ct_buf: [1024]u8 = undefined;
-                                    const response_body_buf = allocator.alloc(u8, step_plain.RESPONSE_BODY_BUF_SIZE) catch return .remove_and_close;
+                                    const response_body_buf = allocator.alignedAlloc(u8, .@"64", step_plain.RESPONSE_BODY_BUF_SIZE) catch return .remove_and_close;
                                     defer allocator.free(response_body_buf);
                                     cb.send_h2_response_to_buffer(&conn.write_buf, allocator, ctx, stream_id, state.handler_fn, &state.config, state.compression_enabled, state.error_callback, &parsed, &response_ct_buf, response_body_buf);
                                     entry.deinitEntry(allocator);
-                                    _ = streams.remove(stream_id);
+                                    _ = streams.fetchRemove(stream_id);
                                 }
                             }
                         },
@@ -541,11 +555,11 @@ const stepTlsConnBody = if (build_options.have_tls) struct {
                                 if (e.body.items.len + f.payload.len > state.config.max_request_body) {
                                     http2.appendRstStreamTo(&conn.write_buf, allocator, stream_id, 7) catch {};
                                     e.deinitEntry(allocator);
-                                    _ = streams.remove(stream_id);
+                                    _ = streams.fetchRemove(stream_id);
                                 } else {
                                     e.body.appendSlice(allocator, f.payload) catch {};
                                     if (f.header.flags & http2.FLAG_END_STREAM != 0) {
-                                        var head_list = std.ArrayList(u8).initCapacity(e.arena.allocator(), 512) catch return .remove_and_close;
+                                        var head_list = std.ArrayListUnmanaged(u8).initCapacity(e.arena.allocator(), 512) catch return .remove_and_close;
                                         const arena_al = e.arena.allocator();
                                         for (e.headers_list.items) |h| {
                                             head_list.appendSlice(arena_al, h.name) catch return .remove_and_close;
@@ -561,11 +575,11 @@ const stepTlsConnBody = if (build_options.have_tls) struct {
                                             .body = if (e.body.items.len > 0) e.body.items else null,
                                         };
                                         var response_ct_buf: [1024]u8 = undefined;
-                                        const response_body_buf = allocator.alloc(u8, step_plain.RESPONSE_BODY_BUF_SIZE) catch return .remove_and_close;
+                                        const response_body_buf = allocator.alignedAlloc(u8, .@"64", step_plain.RESPONSE_BODY_BUF_SIZE) catch return .remove_and_close;
                                         defer allocator.free(response_body_buf);
                                         cb.send_h2_response_to_buffer(&conn.write_buf, allocator, ctx, stream_id, state.handler_fn, &state.config, state.compression_enabled, state.error_callback, &parsed, &response_ct_buf, response_body_buf);
                                         e.deinitEntry(allocator);
-                                        _ = streams.remove(stream_id);
+                                        _ = streams.fetchRemove(stream_id);
                                     }
                                 }
                             }
