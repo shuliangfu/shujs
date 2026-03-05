@@ -70,15 +70,10 @@ fn streamNotImplementedCallback(
     const msg = jsc.JSStringCreateWithUTF8CString("shu:tty ReadStream/WriteStream read/write/setRawMode not implemented");
     defer jsc.JSStringRelease(msg);
     var args = [_]jsc.JSValueRef{jsc.JSValueMakeString(ctx, msg)};
-    var exception: jsc.JSValueRef = undefined;
-    _ = jsc.JSObjectCallAsConstructor(ctx, err_obj, 1, &args, @ptrCast(&exception));
-    const k_t = jsc.JSStringCreateWithUTF8CString("__throw");
-    defer jsc.JSStringRelease(k_t);
-    _ = jsc.JSObjectSetProperty(ctx, global, k_t, exception, jsc.kJSPropertyAttributeNone, null);
-    const script = "throw globalThis.__throw;";
-    const script_ref = jsc.JSStringCreateWithUTF8CString(script);
-    defer jsc.JSStringRelease(script_ref);
-    _ = jsc.JSEvaluateScript(ctx, script_ref, null, null, 1, null);
+    var exception: ?jsc.JSValueRef = null;
+    const err_instance = jsc.JSObjectCallAsConstructor(ctx, err_obj, 1, &args, @ptrCast(&exception));
+    if (exception != null) return jsc.JSValueMakeUndefined(ctx);
+    _ = common.setThrowAndThrow(ctx, err_instance);
     return jsc.JSValueMakeUndefined(ctx);
 }
 
