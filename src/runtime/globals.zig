@@ -22,3 +22,7 @@ pub threadlocal var drain_async_file_io: ?*const fn (jsc.JSContextRef) void = nu
 pub threadlocal var drain_fetch_results: ?*const fn (jsc.JSContextRef) void = null;
 /// 每轮事件循环需调用的 drain：处理 cmd 异步完成项（当前未使用，预留）
 pub threadlocal var drain_cmd_results: ?*const fn (jsc.JSContextRef) void = null;
+/// 每轮事件循环需调用的 drain：若有待处理 DNS 回调则调度 setImmediate(dnsTick)，供 dns 工作线程完成后由主线程统一调度（JSC 禁止在工作线程使用 ctx）
+pub threadlocal var drain_dns_pending: ?*const fn (jsc.JSContextRef) void = null;
+/// 每轮事件循环需调用的 drain：收割 fs.watch 事件并回调 JS listener；由 fs 模块在首次 watch 时注册
+pub threadlocal var drain_fs_watch: ?*const fn (jsc.JSContextRef) void = null;
