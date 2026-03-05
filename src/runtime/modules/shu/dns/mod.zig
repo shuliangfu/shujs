@@ -1,5 +1,6 @@
 // shu:dns — Node 风格 API：dns.lookup、lookupService、resolve*、reverse、setServers、getServers（与 node:dns 对齐）
 // 使用系统 getaddrinfo/getnameinfo，异步通过工作线程 + setImmediate 回主线程调 callback
+// 所有权：工作线程内 [Allocates] 的 lookup_address、lookup_all、service_*、reverse_*、resolve_addresses、err_msg 等由主线程 drainPendingDns 消费并 free；传给 JS 的字符串/数组由 JSC 持有，Zig 侧在 callback 前释放。
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -71,9 +72,12 @@ const PendingDns = struct {
 };
 
 var g_dns_pending_mutex: std.Io.Mutex = .{ .state = std.atomic.Value(std.Io.Mutex.State).init(.unlocked) };
-var g_dns_pending: ?std.ArrayList(PendingDns) = null;
-var g_dns_servers: ?std.ArrayList([]const u8) = null;
-var g_dns_pending_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+/// 待处理 DNS 回调队列；Unmanaged 不存 allocator，所有操作由调用方显式传 allocator（01 §1.2、00 §1.5）
+var g_dns_pending: ?std.ArrayListUnmanaged(PendingDns) = null;
+/// 自定义 DNS 服务器列表；Unmanaged，setServers/getServers 显式传 allocator
+var g_dns_servers: ?std.ArrayListUnmanaged([]const u8) = null;
+/// 待处理 DNS 回调数；按缓存行隔离，避免与其它全局原子 false sharing（00 §5.3）。
+var g_dns_pending_count: std.atomic.Value(usize) align(64) = std.atomic.Value(usize).init(0);
 
 /// 调度下一轮 dnsTick（setImmediate）
 fn scheduleDnsTick(ctx: jsc.JSContextRef) void {
@@ -131,7 +135,7 @@ fn jsValueToUtf8(ctx: jsc.JSContextRef, value: jsc.JSValueRef, allocator: std.me
 fn drainPendingDns(ctx: jsc.JSContextRef) void {
     const allocator = globals.current_allocator orelse return;
     const io = libs_io.getProcessIo() orelse return;
-    var taken = std.ArrayList(PendingDns).initCapacity(allocator, 0) catch return;
+    var taken = std.ArrayListUnmanaged(PendingDns).initCapacity(allocator, 0) catch return;
     defer taken.deinit(allocator);
     {
         g_dns_pending_mutex.lock(io) catch return;
@@ -380,7 +384,7 @@ fn lookupThreadMain(args: *LookupArgs) void {
     g_dns_pending_mutex.lock(io) catch return;
     defer g_dns_pending_mutex.unlock(io);
     if (g_dns_pending == null) {
-        g_dns_pending = std.ArrayList(PendingDns).initCapacity(allocator, 4) catch {
+        g_dns_pending = std.ArrayListUnmanaged(PendingDns).initCapacity(allocator, 4) catch {
             if (result.lookup_all) |a| {
                 for (a) |e| allocator.free(e.address);
                 allocator.free(a);
@@ -524,7 +528,7 @@ fn lookupServiceThreadMain(args: *LookupServiceArgs) void {
     }
     g_dns_pending_mutex.lock(io) catch return;
     defer g_dns_pending_mutex.unlock(io);
-    if (g_dns_pending == null) g_dns_pending = std.ArrayList(PendingDns).initCapacity(allocator, 4) catch null;
+    if (g_dns_pending == null) g_dns_pending = std.ArrayListUnmanaged(PendingDns).initCapacity(allocator, 4) catch null;
     if (g_dns_pending) |*list| list.append(allocator, result) catch {};
     scheduleDnsTick(args.ctx);
     _ = port_str;
@@ -628,7 +632,7 @@ fn reverseThreadMain(args: *ReverseArgs) void {
                 allocator.free(h);
                 g_dns_pending_mutex.lock(io) catch return;
                 defer g_dns_pending_mutex.unlock(io);
-                if (g_dns_pending == null) g_dns_pending = std.ArrayList(PendingDns).initCapacity(allocator, 4) catch null;
+                if (g_dns_pending == null) g_dns_pending = std.ArrayListUnmanaged(PendingDns).initCapacity(allocator, 4) catch null;
                 if (g_dns_pending) |*list| list.append(allocator, result) catch {};
                 scheduleDnsTick(args.ctx);
                 return;
@@ -639,7 +643,7 @@ fn reverseThreadMain(args: *ReverseArgs) void {
     }
     g_dns_pending_mutex.lock(io) catch return;
     defer g_dns_pending_mutex.unlock(io);
-    if (g_dns_pending == null) g_dns_pending = std.ArrayList(PendingDns).initCapacity(allocator, 4) catch null;
+    if (g_dns_pending == null) g_dns_pending = std.ArrayListUnmanaged(PendingDns).initCapacity(allocator, 4) catch null;
     if (g_dns_pending) |*list| list.append(allocator, result) catch {};
     scheduleDnsTick(args.ctx);
 }
@@ -760,7 +764,7 @@ fn resolveThreadMain(args: *ResolveArgs) void {
     }
     g_dns_pending_mutex.lock(io) catch return;
     defer g_dns_pending_mutex.unlock(io);
-    if (g_dns_pending == null) g_dns_pending = std.ArrayList(PendingDns).initCapacity(allocator, 4) catch null;
+    if (g_dns_pending == null) g_dns_pending = std.ArrayListUnmanaged(PendingDns).initCapacity(allocator, 4) catch null;
     if (g_dns_pending) |*list| list.append(allocator, result) catch {};
     scheduleDnsTick(args.ctx);
 }
@@ -852,7 +856,7 @@ fn resolveCallback(
     }
     switch (rrtype.len) {
         1 => {
-            if (std.mem.eql(u8, rrtype, "A")) {
+            if (rrtype[0] == 'A') {
                 allocator.free(hostname);
                 if (argumentCount > 2) allocator.free(rrtype);
                 const global = jsc.JSContextGetGlobalObject(ctx);
@@ -862,7 +866,9 @@ fn resolveCallback(
             }
         },
         4 => {
-            if (std.mem.eql(u8, rrtype, "AAAA")) {
+            var a4: [4]u8 = undefined;
+            @memcpy(a4[0..], rrtype[0..4]);
+            if (@as(u32, @bitCast(a4)) == 0x41414141) { // "AAAA" LE
                 allocator.free(hostname);
                 if (argumentCount > 2) allocator.free(rrtype);
                 const global = jsc.JSContextGetGlobalObject(ctx);
@@ -896,7 +902,7 @@ fn setServersCallback(
     const arr_obj = jsc.JSValueToObject(ctx, arr_val, null) orelse return jsc.JSValueMakeUndefined(ctx);
     const len_val = jsc.JSObjectGetProperty(ctx, arr_obj, k_length, null);
     const len = @as(usize, @intFromFloat(jsc.JSValueToNumber(ctx, len_val, null)));
-    var list = std.ArrayList([]const u8).initCapacity(allocator, len) catch return jsc.JSValueMakeUndefined(ctx);
+    var list = std.ArrayListUnmanaged([]const u8).initCapacity(allocator, len) catch return jsc.JSValueMakeUndefined(ctx);
     const k_str = jsc.JSStringCreateWithUTF8CString("0");
     defer jsc.JSStringRelease(k_str);
     var i: usize = 0;
