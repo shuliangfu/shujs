@@ -168,6 +168,10 @@ pub const Suite = struct {
     only_in_subtree: bool = false,
     /// 本 suite 或子树内是否有 todo；由 computeTodoInSubtree 填充，--todo 时 buildJobList 前必须已算好
     todo_in_subtree: bool = false,
+    /// describe(name, fn, { timeout }) 的 timeout，子 suite 与 it 继承（子级覆盖）
+    timeout_ms: ?u32 = null,
+    /// describe(name, fn, { skipIf }) 的 skipIf，子 suite 与 it 继承（子级覆盖）
+    skip_if_ref: ?jsc.JSValueRef = null,
 
     allocator: std.mem.Allocator,
 
