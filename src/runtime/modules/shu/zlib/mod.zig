@@ -1,11 +1,14 @@
 // shu:zlib 压缩模块：gzip / deflate / brotli
 // 供 Shu.zlib、require("shu:zlib") / node:zlib 与 Shu.server 响应压缩共用
 // 所有权：gzipSync/deflateSync 等返回值 JSC 持有；getBytesFromArg [Allocates] 调用方 free；内部压缩缓冲在回调内分配并 free。
+// 异步与 bytesToUint8Array 已改为纯 Zig（微任务 + JSC TypedArray API），无内联 JS。
 
 const std = @import("std");
 const jsc = @import("jsc");
 const common = @import("../../../common.zig");
 const globals = @import("../../../globals.zig");
+const promise = @import("../promise.zig");
+const timer_state = @import("../timers/state.zig");
 const gzip = @import("gzip.zig");
 const brotli_mod = @import("brotli.zig");
 
@@ -23,12 +26,14 @@ pub fn getExports(ctx: jsc.JSContextRef, _: std.mem.Allocator) jsc.JSValueRef {
     return zlib_obj;
 }
 
-/// 向 shu_obj 上注册 Shu.zlib 子对象（委托 getExports）
+/// 向 shu_obj 上注册 Shu.zlib 子对象（委托 getExports）；并注册全局 __zlibAsyncMicrotask 供异步微任务使用
 pub fn register(ctx: jsc.JSGlobalContextRef, shu_obj: jsc.JSObjectRef) void {
     const allocator = globals.current_allocator orelse return;
     const name_zlib = jsc.JSStringCreateWithUTF8CString("zlib");
     defer jsc.JSStringRelease(name_zlib);
     _ = jsc.JSObjectSetProperty(ctx, shu_obj, name_zlib, getExports(ctx, allocator), jsc.kJSPropertyAttributeNone, null);
+    const global = jsc.JSContextGetGlobalObject(ctx);
+    common.setMethod(ctx, @ptrCast(global), "__zlibAsyncMicrotask", zlibAsyncMicrotaskCallback);
 }
 
 // ---------- 内部辅助与回调 ----------
@@ -47,38 +52,159 @@ fn getBytesFromArg(ctx: jsc.JSContextRef, arguments: [*]const jsc.JSValueRef, al
     return allocator.dupe(u8, buf[0 .. n - 1]) catch null;
 }
 
-/// 异步压缩通用逻辑：将 data 以 base64 注入脚本，在 setImmediate 中调用 syncMethodName(data)，返回 Promise
-fn compressAsyncScript(ctx: jsc.JSContextRef, allocator: std.mem.Allocator, data: []const u8, syncMethodName: []const u8) jsc.JSValueRef {
-    const enc_len = std.base64.standard.Encoder.calcSize(data.len);
-    const b64_buf = allocator.alloc(u8, enc_len) catch return jsc.JSValueMakeUndefined(ctx);
-    defer allocator.free(b64_buf);
-    const b64_slice = std.base64.standard.Encoder.encode(b64_buf, data);
-    const script_slice = std.fmt.allocPrint(
-        allocator,
-        "(function(b64){{ var s=atob(b64); var a=new Uint8Array(s.length); for(var i=0;i<s.length;i++) a[i]=s.charCodeAt(i); return new Promise(function(resolve,reject){{ setImmediate(function(){{ try {{ resolve(Shu.zlib.{s}(a)); }} catch(e) {{ reject(e); }} }}); }}); }})(\"{s}\")",
-        .{ syncMethodName, b64_slice },
-    ) catch return jsc.JSValueMakeUndefined(ctx);
-    defer allocator.free(script_slice);
-    const script = allocator.dupeZ(u8, script_slice) catch return jsc.JSValueMakeUndefined(ctx);
-    defer allocator.free(script);
-    const script_ref = jsc.JSStringCreateWithUTF8CString(script.ptr);
-    defer jsc.JSStringRelease(script_ref);
-    return jsc.JSEvaluateScript(ctx, script_ref, null, null, 1, null);
+/// JSC 回收 Uint8Array 时调用的释放回调；context 为 *ZlibBytesContext
+fn zlibBytesDeallocator(bytes: *anyopaque, deallocator_context: ?*anyopaque) callconv(.c) void {
+    _ = bytes;
+    const ctx = @as(*ZlibBytesContext, @ptrCast(@alignCast(deallocator_context orelse return)));
+    ctx.allocator.free(ctx.slice);
+    ctx.allocator.destroy(ctx);
+}
+const ZlibBytesContext = struct {
+    allocator: std.mem.Allocator,
+    slice: []u8,
+};
+
+/// 将 Zig 字节复制后交给 JSC 的 Uint8Array（NoCopy，GC 时 deallocator 释放）；[Allocates] 调用方不 free，由 JSC 回收时释放
+fn bytesToUint8Array(ctx: jsc.JSContextRef, allocator: std.mem.Allocator, data: []const u8) jsc.JSValueRef {
+    const copy = allocator.dupe(u8, data) catch return jsc.JSValueMakeUndefined(ctx);
+    const dc = allocator.create(ZlibBytesContext) catch {
+        allocator.free(copy);
+        return jsc.JSValueMakeUndefined(ctx);
+    };
+    dc.* = .{ .allocator = allocator, .slice = copy };
+    var exception: ?jsc.JSValueRef = null;
+    const out = jsc.JSObjectMakeTypedArrayWithBytesNoCopy(
+        ctx,
+        .Uint8Array,
+        copy.ptr,
+        copy.len,
+        zlibBytesDeallocator,
+        dc,
+        @ptrCast(&exception),
+    );
+    if (out == null) {
+        allocator.free(copy);
+        allocator.destroy(dc);
+        return jsc.JSValueMakeUndefined(ctx);
+    }
+    return out.?;
 }
 
-/// 将 Zig 压缩结果通过 base64 注入脚本，返回 JS 的 Uint8Array（避免依赖 JSC ArrayBuffer API）
-fn bytesToUint8ArrayScript(ctx: jsc.JSContextRef, allocator: std.mem.Allocator, data: []const u8) jsc.JSValueRef {
-    const enc_len = std.base64.standard.Encoder.calcSize(data.len);
-    const b64_buf = allocator.alloc(u8, enc_len) catch return jsc.JSValueMakeUndefined(ctx);
-    defer allocator.free(b64_buf);
-    const b64_slice = std.base64.standard.Encoder.encode(b64_buf, data);
-    const script_slice = std.fmt.allocPrint(allocator, "(function(b64){{ var s=atob(b64); var a=new Uint8Array(s.length); for(var i=0;i<s.length;i++) a[i]=s.charCodeAt(i); return a; }})(\"{s}\")", .{b64_slice}) catch return jsc.JSValueMakeUndefined(ctx);
-    defer allocator.free(script_slice);
-    const script = allocator.dupeZ(u8, script_slice) catch return jsc.JSValueMakeUndefined(ctx);
-    defer allocator.free(script);
-    const script_ref = jsc.JSStringCreateWithUTF8CString(script.ptr);
-    defer jsc.JSStringRelease(script_ref);
-    return jsc.JSEvaluateScript(ctx, script_ref, null, null, 1, null);
+// ---------- 异步压缩：微任务 + Shu.zlib.xxxSync，纯 Zig ----------
+
+const ZlibAsyncPayload = struct {
+    allocator: std.mem.Allocator,
+    method_name: []const u8,
+    data: []const u8,
+    input_uint8array_js: jsc.JSValueRef,
+    resolve: jsc.JSValueRef,
+    reject: jsc.JSValueRef,
+};
+var pending_zlib_async_list: ?std.ArrayListUnmanaged(*ZlibAsyncPayload) = null;
+
+fn ensureZlibAsyncList(allocator: std.mem.Allocator) void {
+    if (pending_zlib_async_list == null) {
+        pending_zlib_async_list = std.ArrayListUnmanaged(*ZlibAsyncPayload).initCapacity(allocator, 8) catch return;
+    }
+}
+
+fn zlibAsyncMicrotaskCallback(
+    ctx: jsc.JSContextRef,
+    _: jsc.JSObjectRef,
+    _: jsc.JSObjectRef,
+    _: usize,
+    _: [*]const jsc.JSValueRef,
+    _: [*]jsc.JSValueRef,
+) callconv(.c) jsc.JSValueRef {
+    const allocator = globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
+    var list_opt = pending_zlib_async_list orelse return jsc.JSValueMakeUndefined(ctx);
+    if (list_opt.items.len == 0) return jsc.JSValueMakeUndefined(ctx);
+    const payload = list_opt.orderedRemove(0);
+    pending_zlib_async_list = list_opt;
+    defer {
+        jsc.JSValueUnprotect(ctx, payload.resolve);
+        jsc.JSValueUnprotect(ctx, payload.reject);
+        jsc.JSValueUnprotect(ctx, payload.input_uint8array_js);
+        allocator.free(payload.data);
+        allocator.destroy(payload);
+    }
+    const global = jsc.JSContextGetGlobalObject(ctx);
+    const k_Shu = jsc.JSStringCreateWithUTF8CString("Shu");
+    defer jsc.JSStringRelease(k_Shu);
+    const k_zlib = jsc.JSStringCreateWithUTF8CString("zlib");
+    defer jsc.JSStringRelease(k_zlib);
+    const Shu = jsc.JSObjectGetProperty(ctx, global, k_Shu, null);
+    const zlib_obj = jsc.JSObjectGetProperty(ctx, @ptrCast(Shu), k_zlib, null);
+    const method_str = jsc.JSStringCreateWithUTF8CString(payload.method_name.ptr);
+    defer jsc.JSStringRelease(method_str);
+    const method_val = jsc.JSObjectGetProperty(ctx, @ptrCast(zlib_obj), method_str, null);
+    if (!jsc.JSObjectIsFunction(ctx, @ptrCast(method_val))) {
+        const rej_fn = jsc.JSValueToObject(ctx, payload.reject, null);
+        var rej_args: [1]jsc.JSValueRef = .{jsc.JSValueMakeUndefined(ctx)};
+        _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(rej_fn), null, 1, &rej_args, null);
+        return jsc.JSValueMakeUndefined(ctx);
+    }
+    var one: [1]jsc.JSValueRef = .{payload.input_uint8array_js};
+    var exception: ?jsc.JSValueRef = null;
+    const result = jsc.JSObjectCallAsFunction(ctx, @ptrCast(method_val), @ptrCast(zlib_obj), 1, &one, @ptrCast(&exception));
+    if (exception != null) {
+        const rej_fn = jsc.JSValueToObject(ctx, payload.reject, null);
+        var rej_args: [1]jsc.JSValueRef = .{exception.?};
+        _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(rej_fn), null, 1, &rej_args, null);
+        return jsc.JSValueMakeUndefined(ctx);
+    }
+    const resolve_fn = jsc.JSValueToObject(ctx, payload.resolve, null);
+    var res_args: [1]jsc.JSValueRef = .{result};
+    _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(resolve_fn), null, 1, &res_args, null);
+    return jsc.JSValueMakeUndefined(ctx);
+}
+
+fn zlibAsyncOnExecutor(ctx: jsc.JSContextRef, resolve_val: jsc.JSValueRef, reject_val: jsc.JSValueRef, user_data: ?*anyopaque) void {
+    const payload = @as(*ZlibAsyncPayload, @ptrCast(@alignCast(user_data orelse return)));
+    payload.resolve = resolve_val;
+    payload.reject = reject_val;
+    const input_js = bytesToUint8Array(ctx, payload.allocator, payload.data);
+    if (jsc.JSValueIsUndefined(ctx, input_js)) {
+        payload.allocator.free(payload.data);
+        payload.allocator.destroy(payload);
+        return;
+    }
+    payload.input_uint8array_js = input_js;
+    jsc.JSValueProtect(ctx, resolve_val);
+    jsc.JSValueProtect(ctx, reject_val);
+    jsc.JSValueProtect(ctx, input_js);
+    const allocator = globals.current_allocator orelse return;
+    ensureZlibAsyncList(allocator);
+    var list = &pending_zlib_async_list.?;
+    list.append(allocator, payload) catch return;
+    const state = globals.current_timer_state orelse return;
+    const global = jsc.JSContextGetGlobalObject(ctx);
+    const k = jsc.JSStringCreateWithUTF8CString("__zlibAsyncMicrotask");
+    defer jsc.JSStringRelease(k);
+    const fn_val = jsc.JSObjectGetProperty(ctx, global, k, null);
+    if (jsc.JSValueIsUndefined(ctx, fn_val) or jsc.JSValueIsNull(ctx, fn_val)) return;
+    const fn_obj = jsc.JSValueToObject(ctx, fn_val, null) orelse return;
+    if (!jsc.JSObjectIsFunction(ctx, fn_obj)) return;
+    jsc.JSValueProtect(ctx, fn_val);
+    state.enqueueMicrotask(@ptrCast(ctx), fn_val);
+}
+
+/// 异步压缩：Promise(executor) + 微任务中调用 Shu.zlib.xxxSync，纯 Zig
+fn compressAsync(ctx: jsc.JSContextRef, allocator: std.mem.Allocator, data: []const u8, syncMethodName: []const u8) jsc.JSValueRef {
+    const data_dup = allocator.dupe(u8, data) catch return jsc.JSValueMakeUndefined(ctx);
+    const payload = allocator.create(ZlibAsyncPayload) catch {
+        allocator.free(data_dup);
+        return jsc.JSValueMakeUndefined(ctx);
+    };
+    payload.* = .{
+        .allocator = allocator,
+        .method_name = syncMethodName,
+        .data = data_dup,
+        .input_uint8array_js = undefined,
+        .resolve = undefined,
+        .reject = undefined,
+    };
+    return promise.createWithExecutor(ctx, zlibAsyncOnExecutor, payload);
 }
 
 fn gzipSyncCallback(
@@ -95,7 +221,7 @@ fn gzipSyncCallback(
     defer allocator.free(input);
     const compressed = gzip.compressGzip(allocator, input) catch return jsc.JSValueMakeUndefined(ctx);
     defer allocator.free(compressed);
-    return bytesToUint8ArrayScript(ctx, allocator, compressed);
+    return bytesToUint8Array(ctx, allocator, compressed);
 }
 
 fn deflateSyncCallback(
@@ -112,7 +238,7 @@ fn deflateSyncCallback(
     defer allocator.free(input);
     const compressed = gzip.compressDeflate(allocator, input) catch return jsc.JSValueMakeUndefined(ctx);
     defer allocator.free(compressed);
-    return bytesToUint8ArrayScript(ctx, allocator, compressed);
+    return bytesToUint8Array(ctx, allocator, compressed);
 }
 
 fn brotliSyncCallback(
@@ -129,7 +255,7 @@ fn brotliSyncCallback(
     defer allocator.free(input);
     const compressed = brotli_mod.compressBrotli(allocator, input) catch return jsc.JSValueMakeUndefined(ctx);
     defer allocator.free(compressed);
-    return bytesToUint8ArrayScript(ctx, allocator, compressed);
+    return bytesToUint8Array(ctx, allocator, compressed);
 }
 
 fn gzipAsyncCallback(
@@ -144,7 +270,7 @@ fn gzipAsyncCallback(
     const allocator = globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
     const input = getBytesFromArg(ctx, arguments, allocator) orelse return jsc.JSValueMakeUndefined(ctx);
     defer allocator.free(input);
-    return compressAsyncScript(ctx, allocator, input, "gzipSync");
+    return compressAsync(ctx, allocator, input, "gzipSync");
 }
 
 fn deflateAsyncCallback(
@@ -159,7 +285,7 @@ fn deflateAsyncCallback(
     const allocator = globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
     const input = getBytesFromArg(ctx, arguments, allocator) orelse return jsc.JSValueMakeUndefined(ctx);
     defer allocator.free(input);
-    return compressAsyncScript(ctx, allocator, input, "deflateSync");
+    return compressAsync(ctx, allocator, input, "deflateSync");
 }
 
 fn brotliAsyncCallback(
@@ -174,7 +300,7 @@ fn brotliAsyncCallback(
     const allocator = globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
     const input = getBytesFromArg(ctx, arguments, allocator) orelse return jsc.JSValueMakeUndefined(ctx);
     defer allocator.free(input);
-    return compressAsyncScript(ctx, allocator, input, "brotliSync");
+    return compressAsync(ctx, allocator, input, "brotliSync");
 }
 
 // ---------- 供 Shu.server、package 等直接调用的压缩/解压 API（与 gzip.zig / brotli.zig 一致） ----------
