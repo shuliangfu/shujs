@@ -26,8 +26,51 @@ pub fn ensureAdaptInjected(ctx: jsc.JSContextRef, allocator: std.mem.Allocator) 
     injectAdaptAndCreateFetch(ctx, allocator) catch {};
 }
 
-/// 在 globalThis 上注入 __shuHttpAdapt 与 __shuHttpCreateFetch（仅执行一次）
+/// __shuHttpCreateFetch(listener) 返回的包装函数被调用时：取 callee.__listener，再调 __shuHttpAdapt(req, listener)
+fn createFetchWrapperCallback(
+    ctx: jsc.JSContextRef,
+    _: jsc.JSObjectRef,
+    callee: jsc.JSObjectRef,
+    argumentCount: usize,
+    arguments: [*]const jsc.JSValueRef,
+    _: [*]jsc.JSValueRef,
+) callconv(.c) jsc.JSValueRef {
+    if (argumentCount < 1) return jsc.JSValueMakeUndefined(ctx);
+    const k_listener = jsc.JSStringCreateWithUTF8CString("__listener");
+    defer jsc.JSStringRelease(k_listener);
+    const listener = jsc.JSObjectGetProperty(ctx, callee, k_listener, null);
+    const global = jsc.JSContextGetGlobalObject(ctx);
+    const k_adapt = jsc.JSStringCreateWithUTF8CString("__shuHttpAdapt");
+    defer jsc.JSStringRelease(k_adapt);
+    const adapt_fn = jsc.JSObjectGetProperty(ctx, global, k_adapt, null);
+    if (!jsc.JSObjectIsFunction(ctx, @ptrCast(adapt_fn))) return jsc.JSValueMakeUndefined(ctx);
+    var two: [2]jsc.JSValueRef = .{ arguments[0], listener };
+    return jsc.JSObjectCallAsFunction(ctx, @ptrCast(adapt_fn), null, 2, &two, null);
+}
+
+/// __shuHttpCreateFetch(listener)：返回带 __listener 的包装函数，纯 Zig 无脚本
+fn createFetchCallback(
+    ctx: jsc.JSContextRef,
+    _: jsc.JSObjectRef,
+    _: jsc.JSObjectRef,
+    argumentCount: usize,
+    arguments: [*]const jsc.JSValueRef,
+    _: [*]jsc.JSValueRef,
+) callconv(.c) jsc.JSValueRef {
+    if (argumentCount < 1) return jsc.JSValueMakeUndefined(ctx);
+    const listener = arguments[0];
+    const name_wrapper = jsc.JSStringCreateWithUTF8CString("__shuHttpCreateFetchWrapper");
+    defer jsc.JSStringRelease(name_wrapper);
+    const wrapper_fn = jsc.JSObjectMakeFunctionWithCallback(ctx, name_wrapper, createFetchWrapperCallback);
+    const k_listener = jsc.JSStringCreateWithUTF8CString("__listener");
+    defer jsc.JSStringRelease(k_listener);
+    _ = jsc.JSObjectSetProperty(ctx, wrapper_fn, k_listener, listener, jsc.kJSPropertyAttributeNone, null);
+    return wrapper_fn;
+}
+
+/// 在 globalThis 上注入 __shuHttpAdapt 与 __shuHttpCreateFetch（仅执行一次），纯 Zig 无内联脚本
 fn injectAdaptAndCreateFetch(ctx: jsc.JSContextRef, allocator: std.mem.Allocator) !void {
+    _ = allocator;
     if (g_http_adapt_injected) return;
     g_http_adapt_injected = true;
     const global = jsc.JSContextGetGlobalObject(ctx);
@@ -35,16 +78,11 @@ fn injectAdaptAndCreateFetch(ctx: jsc.JSContextRef, allocator: std.mem.Allocator
     defer jsc.JSStringRelease(name_adapt);
     const adapt_fn = jsc.JSObjectMakeFunctionWithCallback(ctx, name_adapt, adaptCallback);
     _ = jsc.JSObjectSetProperty(ctx, global, name_adapt, adapt_fn, jsc.kJSPropertyAttributeNone, null);
-    const script =
-        "(function(){ globalThis.__shuHttpCreateFetch = function(listener){ return function(req){ return globalThis.__shuHttpAdapt(req, listener); }; }; })()";
-    const script_z = try allocator.dupeZ(u8, script);
-    defer allocator.free(script_z);
-    const script_ref = jsc.JSStringCreateWithUTF8CString(script_z.ptr);
-    defer jsc.JSStringRelease(script_ref);
-    _ = jsc.JSEvaluateScript(ctx, script_ref, global, null, 0, null);
+    common.setMethod(ctx, global, "__shuHttpCreateFetch", createFetchCallback);
 }
 
-/// createServer([options], requestListener)：仅支持 createServer(requestListener)，返回带 listen 的 server 对象
+/// createServer([options], requestListener)：仅支持 createServer(requestListener)，返回带 listen 的 server 对象。
+/// 与 options.getOptionalCallback 一致：先 IsUndefined/IsNull 再 JSValueToObject，避免 JSC tagged 值被当指针导致 segfault。
 fn createServerCallback(
     ctx: jsc.JSContextRef,
     _: jsc.JSObjectRef,
@@ -55,8 +93,9 @@ fn createServerCallback(
 ) callconv(.c) jsc.JSValueRef {
     if (argumentCount < 1) return jsc.JSValueMakeUndefined(ctx);
     const requestListener = arguments[0];
-    if (!jsc.JSObjectIsFunction(ctx, @ptrCast(requestListener)))
-        return jsc.JSValueMakeUndefined(ctx);
+    if (jsc.JSValueIsUndefined(ctx, requestListener) or jsc.JSValueIsNull(ctx, requestListener)) return jsc.JSValueMakeUndefined(ctx);
+    const listener_obj = jsc.JSValueToObject(ctx, requestListener, null);
+    if (listener_obj == null or !jsc.JSObjectIsFunction(ctx, listener_obj.?)) return jsc.JSValueMakeUndefined(ctx);
     const server = jsc.JSObjectMake(ctx, null, null);
     const k_listener = jsc.JSStringCreateWithUTF8CString("_requestListener");
     defer jsc.JSStringRelease(k_listener);
@@ -78,7 +117,9 @@ fn listenCallback(
     const k_listener = jsc.JSStringCreateWithUTF8CString("_requestListener");
     defer jsc.JSStringRelease(k_listener);
     const listener_val = jsc.JSObjectGetProperty(ctx, this, k_listener, null);
-    if (!jsc.JSObjectIsFunction(ctx, @ptrCast(listener_val))) return jsc.JSValueMakeUndefined(ctx);
+    if (jsc.JSValueIsUndefined(ctx, listener_val) or jsc.JSValueIsNull(ctx, listener_val)) return jsc.JSValueMakeUndefined(ctx);
+    const listener_obj = jsc.JSValueToObject(ctx, listener_val, null);
+    if (listener_obj == null or !jsc.JSObjectIsFunction(ctx, listener_obj.?)) return jsc.JSValueMakeUndefined(ctx);
     const port_val = arguments[0];
     const port_n = jsc.JSValueToNumber(ctx, port_val, null);
     if (port_n != port_n or port_n < 1 or port_n > 65535) return jsc.JSValueMakeUndefined(ctx);
@@ -91,7 +132,9 @@ fn listenCallback(
     const create_fn = jsc.JSValueToObject(ctx, create_val, null) orelse return jsc.JSValueMakeUndefined(ctx);
     var listener_args = [_]jsc.JSValueRef{listener_val};
     const fetch_val = jsc.JSObjectCallAsFunction(ctx, create_fn, null, 1, &listener_args, null);
-    if (!jsc.JSObjectIsFunction(ctx, @ptrCast(fetch_val))) return jsc.JSValueMakeUndefined(ctx);
+    if (jsc.JSValueIsUndefined(ctx, fetch_val) or jsc.JSValueIsNull(ctx, fetch_val)) return jsc.JSValueMakeUndefined(ctx);
+    const fetch_obj = jsc.JSValueToObject(ctx, fetch_val, null);
+    if (fetch_obj == null or !jsc.JSObjectIsFunction(ctx, fetch_obj.?)) return jsc.JSValueMakeUndefined(ctx);
     var host_buf: [256]u8 = undefined;
     const host_slice: []const u8 = blk: {
         if (argumentCount < 2 or jsc.JSValueIsUndefined(ctx, arguments[1])) break :blk "0.0.0.0";
@@ -140,9 +183,12 @@ fn listenCallback(
     if (!jsc.JSValueIsUndefined(ctx, v_reload)) _ = jsc.JSObjectSetProperty(ctx, this, k_reload, v_reload, jsc.kJSPropertyAttributeNone, null);
     const v_restart = jsc.JSObjectGetProperty(ctx, result_obj, k_restart, null);
     if (!jsc.JSValueIsUndefined(ctx, v_restart)) _ = jsc.JSObjectSetProperty(ctx, this, k_restart, v_restart, jsc.kJSPropertyAttributeNone, null);
-    if (argumentCount >= 3 and jsc.JSObjectIsFunction(ctx, @ptrCast(arguments[2]))) {
-        const cb_args = [_]jsc.JSValueRef{jsc.JSValueMakeUndefined(ctx)};
-        _ = jsc.JSObjectCallAsFunction(ctx, @ptrCast(arguments[2]), this, 1, &cb_args, null);
+    if (argumentCount >= 3) {
+        const cb_obj = jsc.JSValueToObject(ctx, arguments[2], null);
+        if (cb_obj != null and jsc.JSObjectIsFunction(ctx, cb_obj.?)) {
+            const cb_args = [_]jsc.JSValueRef{jsc.JSValueMakeUndefined(ctx)};
+            _ = jsc.JSObjectCallAsFunction(ctx, cb_obj.?, this, 1, &cb_args, null);
+        }
     }
     return this;
 }
