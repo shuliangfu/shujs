@@ -81,6 +81,10 @@ pub fn main(init: std.process.Init) !void {
     const parse_result = cli_args.parse(rest);
 
     if (parse_result.parsed.help) {
+        if (std.mem.eql(u8, subcommand, "test")) {
+            try cli_test.printTestHelp(io);
+            return;
+        }
         try cli_help.printGlobalUsage(io);
         return;
     }
