@@ -8,12 +8,10 @@ const libs_io = @import("libs_io");
 const errors = @import("errors");
 const globals = @import("../../../globals.zig");
 const common = @import("../../../common.zig");
+const promise = @import("../promise.zig");
 
 /// §1.1 显式 allocator 收敛：register 时注入，fetch 回调优先使用
 threadlocal var g_fetch_allocator: ?std.mem.Allocator = null;
-/// Promise 执行器入参：当前待入队的 fetch id / ctx，由 callback 在 new Promise(executor) 前设置
-threadlocal var g_fetch_pending_id: u32 = 0;
-threadlocal var g_fetch_pending_ctx: ?jsc.JSGlobalContextRef = null;
 
 /// 静态错误文案，worker 在 dupeZ 失败时使用；drain 中不可 free 此切片
 const ERR_MSG_FETCH_FAILED: []const u8 = "fetch request failed";
@@ -188,55 +186,14 @@ pub fn register(ctx: jsc.JSGlobalContextRef, allocator: ?std.mem.Allocator) void
     _ = jsc.JSObjectSetProperty(ctx, global, name_fetch, fetch_fn, jsc.kJSPropertyAttributeNone, null);
 }
 
-/// Promise 执行器 C 回调：被 JSC 以 (resolve, reject) 调用时，将二者存入 pending[id] 并 Protect
-fn executorCallback(
-    ctx: jsc.JSContextRef,
-    _: jsc.JSObjectRef,
-    _: jsc.JSObjectRef,
-    argumentCount: usize,
-    arguments: [*]const jsc.JSValueRef,
-    _: [*]jsc.JSValueRef,
-) callconv(.c) jsc.JSValueRef {
-    if (argumentCount < 2 or g_fetch_state == null) return jsc.JSValueMakeUndefined(ctx);
-    const state = g_fetch_state.?;
-    const resolve = arguments[0];
-    const reject = arguments[1];
+/// createWithExecutor 的 Zig 回调：将 resolve/reject 存入 pending[id] 并 Protect
+fn fetchOnExecutor(ctx: jsc.JSContextRef, resolve: jsc.JSValueRef, reject: jsc.JSValueRef, user_data: ?*anyopaque) void {
+    const p = @as(*const struct { id: u32, state: *FetchState }, @alignCast(@ptrCast(user_data orelse return)));
     jsc.JSValueProtect(@ptrCast(ctx), resolve);
     jsc.JSValueProtect(@ptrCast(ctx), reject);
-    state.mutex.lock();
-    state.pending.put(state.allocator, g_fetch_pending_id, .{ .ctx = @ptrCast(ctx), .resolve = resolve, .reject = reject }) catch {};
-    state.mutex.unlock();
-    return jsc.JSValueMakeUndefined(ctx);
-}
-
-/// 调用 Promise.resolve(value)，返回已 resolve 的 Promise
-fn promiseResolve(ctx: jsc.JSContextRef, value: jsc.JSValueRef) jsc.JSValueRef {
-    const global = jsc.JSContextGetGlobalObject(ctx);
-    const k_promise = jsc.JSStringCreateWithUTF8CString("Promise");
-    defer jsc.JSStringRelease(k_promise);
-    const Promise_ctor = jsc.JSObjectGetProperty(ctx, global, k_promise, null);
-    if (jsc.JSValueIsUndefined(ctx, Promise_ctor)) return jsc.JSValueMakeUndefined(ctx);
-    const k_resolve = jsc.JSStringCreateWithUTF8CString("resolve");
-    defer jsc.JSStringRelease(k_resolve);
-    const resolve_fn = jsc.JSObjectGetProperty(ctx, @ptrCast(Promise_ctor), k_resolve, null);
-    if (!jsc.JSObjectIsFunction(ctx, @ptrCast(resolve_fn))) return jsc.JSValueMakeUndefined(ctx);
-    var args: [1]jsc.JSValueRef = .{value};
-    return jsc.JSObjectCallAsFunction(ctx, @ptrCast(resolve_fn), @ptrCast(Promise_ctor), 1, &args, null);
-}
-
-/// 调用 Promise.reject(reason)，返回已 reject 的 Promise
-fn promiseReject(ctx: jsc.JSContextRef, reason: jsc.JSValueRef) jsc.JSValueRef {
-    const global = jsc.JSContextGetGlobalObject(ctx);
-    const k_promise = jsc.JSStringCreateWithUTF8CString("Promise");
-    defer jsc.JSStringRelease(k_promise);
-    const Promise_ctor = jsc.JSObjectGetProperty(ctx, global, k_promise, null);
-    if (jsc.JSValueIsUndefined(ctx, Promise_ctor)) return jsc.JSValueMakeUndefined(ctx);
-    const k_reject = jsc.JSStringCreateWithUTF8CString("reject");
-    defer jsc.JSStringRelease(k_reject);
-    const reject_fn = jsc.JSObjectGetProperty(ctx, @ptrCast(Promise_ctor), k_reject, null);
-    if (!jsc.JSObjectIsFunction(ctx, @ptrCast(reject_fn))) return jsc.JSValueMakeUndefined(ctx);
-    var args: [1]jsc.JSValueRef = .{reason};
-    return jsc.JSObjectCallAsFunction(ctx, @ptrCast(reject_fn), @ptrCast(Promise_ctor), 1, &args, null);
+    p.state.mutex.lock();
+    p.state.pending.put(p.state.allocator, p.id, .{ .ctx = @ptrCast(ctx), .resolve = resolve, .reject = reject }) catch {};
+    p.state.mutex.unlock();
 }
 
 /// Response.text() 的 C 回调：返回 Promise.resolve(this.body)，与标准 fetch Response 一致
@@ -251,7 +208,7 @@ fn responseTextCallback(
     const k_body = jsc.JSStringCreateWithUTF8CString("body");
     defer jsc.JSStringRelease(k_body);
     const body_val = jsc.JSObjectGetProperty(ctx, thisObject, k_body, null);
-    return promiseResolve(ctx, body_val);
+    return promise.resolve(ctx, body_val);
 }
 
 /// Response.json() 的 C 回调：用全局 JSON.parse(this.body) 解析，返回 Promise.resolve(parsed) 或 parse 失败时 Promise.reject
@@ -270,11 +227,11 @@ fn responseJsonCallback(
     const k_JSON = jsc.JSStringCreateWithUTF8CString("JSON");
     defer jsc.JSStringRelease(k_JSON);
     const JSON_obj = jsc.JSObjectGetProperty(ctx, global, k_JSON, null);
-    if (jsc.JSValueIsUndefined(ctx, JSON_obj)) return promiseResolve(ctx, body_val);
+    if (jsc.JSValueIsUndefined(ctx, JSON_obj)) return promise.resolve(ctx, body_val);
     const k_parse = jsc.JSStringCreateWithUTF8CString("parse");
     defer jsc.JSStringRelease(k_parse);
     const parse_fn = jsc.JSObjectGetProperty(ctx, @ptrCast(JSON_obj), k_parse, null);
-    if (!jsc.JSObjectIsFunction(ctx, @ptrCast(parse_fn))) return promiseResolve(ctx, body_val);
+    if (!jsc.JSObjectIsFunction(ctx, @ptrCast(parse_fn))) return promise.resolve(ctx, body_val);
     var exception: jsc.JSValueRef = undefined;
     var argv: [1]jsc.JSValueRef = .{body_val};
     const parsed = jsc.JSObjectCallAsFunction(
@@ -285,8 +242,8 @@ fn responseJsonCallback(
         &argv,
         @as(?[*]jsc.JSValueRef, @ptrCast(&exception)),
     );
-    if (!jsc.JSValueIsUndefined(ctx, exception)) return promiseReject(ctx, exception);
-    return promiseResolve(ctx, parsed);
+    if (!jsc.JSValueIsUndefined(ctx, exception)) return promise.reject(ctx, exception);
+    return promise.resolve(ctx, parsed);
 }
 
 /// fetch 的 C 回调：入队请求、创建 Promise(executor)、返回 Promise，不阻塞；无权限时同步 reject
@@ -315,7 +272,7 @@ fn callback(
         errors.reportToStderr(.{ .code = .permission_denied, .message = "fetch requires --allow-net" }) catch {};
         const err_msg = jsc.JSStringCreateWithUTF8CString("fetch requires --allow-net");
         defer jsc.JSStringRelease(err_msg);
-        return promiseReject(ctx, jsc.JSValueMakeString(ctx, err_msg));
+        return promise.reject(ctx, jsc.JSValueMakeString(ctx, err_msg));
     }
     const state = getOrCreateState(allocator) catch return jsc.JSValueMakeUndefined(ctx);
     const url_dup = allocator.dupe(u8, url) catch return jsc.JSValueMakeUndefined(ctx);
@@ -330,17 +287,6 @@ fn callback(
     };
     state.mutex.unlock();
 
-    g_fetch_pending_id = id;
-    g_fetch_pending_ctx = @ptrCast(ctx);
-    const k_executor = jsc.JSStringCreateWithUTF8CString("executor");
-    defer jsc.JSStringRelease(k_executor);
-    const executor_fn = jsc.JSObjectMakeFunctionWithCallback(ctx, k_executor, executorCallback);
-    const global = jsc.JSContextGetGlobalObject(ctx);
-    const k_promise = jsc.JSStringCreateWithUTF8CString("Promise");
-    defer jsc.JSStringRelease(k_promise);
-    const Promise_ctor = jsc.JSObjectGetProperty(ctx, global, k_promise, null);
-    if (jsc.JSValueIsUndefined(ctx, Promise_ctor)) return jsc.JSValueMakeUndefined(ctx);
-    var args: [1]jsc.JSValueRef = .{executor_fn};
-    const promise = jsc.JSObjectCallAsConstructor(ctx, @ptrCast(Promise_ctor), 1, &args, null);
-    return promise;
+    var payload = .{ .id = id, .state = state };
+    return promise.createWithExecutor(ctx, fetchOnExecutor, @ptrCast(&payload));
 }
