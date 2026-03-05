@@ -12,6 +12,19 @@ pub fn setMethod(ctx: jsc.JSContextRef, obj: jsc.JSObjectRef, name: [*]const u8,
     _ = jsc.JSObjectSetProperty(ctx, obj, name_ref, fn_ref, jsc.kJSPropertyAttributeNone, null);
 }
 
+/// 将 error_value 设为 globalThis.__throw 并执行 throw（JSC C API 无直接“抛异常”接口，仅此一行脚本）；调用方在 Zig 中已创建 Error/TypeError/DOMException
+pub fn setThrowAndThrow(ctx: jsc.JSContextRef, error_value: jsc.JSValueRef) jsc.JSValueRef {
+    const global = jsc.JSContextGetGlobalObject(ctx);
+    const k = jsc.JSStringCreateWithUTF8CString("__throw");
+    defer jsc.JSStringRelease(k);
+    _ = jsc.JSObjectSetProperty(ctx, global, k, error_value, jsc.kJSPropertyAttributeNone, null);
+    const script = "throw globalThis.__throw;";
+    const script_ref = jsc.JSStringCreateWithUTF8CString(script);
+    defer jsc.JSStringRelease(script_ref);
+    _ = jsc.JSEvaluateScript(ctx, script_ref, null, null, 1, null);
+    return jsc.JSValueMakeUndefined(ctx);
+}
+
 /// 执行一段 JS 脚本并返回执行结果（用于异步 API 返回 Promise、crond 返回 { stop } 等）
 pub fn evalPromiseScript(ctx: jsc.JSContextRef, script: []const u8) jsc.JSValueRef {
     const allocator = globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
