@@ -13,8 +13,8 @@ const shu_builtin = @import("../builtin.zig");
 const pkg_resolver = @import("../../../../package/resolver.zig");
 const libs_io = @import("libs_io");
 
-/// 单次 run 的模块缓存：resolved_path -> 已保护的 exports 值（避免 GC）；allocator 由 initCache(allocator) 调用方传入，put/clear 等由各回调的 globals.current_allocator 或参数提供（§1.1 不持全局 allocator）
-var g_cache: ?*std.StringHashMap(CacheEntry) = null;
+/// 单次 run 的模块缓存：resolved_path -> 已保护的 exports 值（01 §1.2 Unmanaged，显式传 allocator）；allocator 由 initCache(allocator) 调用方传入
+var g_cache: ?*std.StringHashMapUnmanaged(CacheEntry) = null;
 
 const CacheEntry = struct {
     exports: jsc.JSValueRef,
@@ -41,8 +41,8 @@ pub fn runAsModule(
 
 fn initCache(allocator: std.mem.Allocator) void {
     if (g_cache == null) {
-        const p = allocator.create(std.StringHashMap(CacheEntry)) catch return;
-        p.* = std.StringHashMap(CacheEntry).init(allocator);
+        const p = allocator.create(std.StringHashMapUnmanaged(CacheEntry)) catch return;
+        p.* = .{};
         g_cache = p;
     } else {
         clearCache(allocator, null);
@@ -60,7 +60,7 @@ fn clearCache(allocator: std.mem.Allocator, ctx: ?jsc.JSContextRef) void {
         if (ctx) |c| jsc.JSValueUnprotect(c, entry.value_ptr.exports);
     }
     for (keys.items) |k| {
-        _ = cache.remove(k);
+        _ = cache.fetchRemove(k);
         allocator.free(k);
     }
 }
@@ -76,6 +76,19 @@ fn getParentPathFromRequire(ctx: jsc.JSContextRef, require_fn: jsc.JSObjectRef, 
     jsc.JSStringRelease(str_ref);
     if (n == 0) return null;
     return buf[0 .. n - 1];
+}
+
+/// 两切片相等：先比长度，≤8 字节用单次 u64 比较（00 §2.1），否则 std.mem.eql；用于 parent/dir 路径段比较
+fn sliceEqlShort(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    if (a.len <= 8) {
+        var x: [8]u8 = [_]u8{0} ** 8;
+        var y: [8]u8 = [_]u8{0} ** 8;
+        @memcpy(x[0..a.len], a);
+        @memcpy(y[0..b.len], b);
+        return @as(u64, @bitCast(x)) == @as(u64, @bitCast(y));
+    }
+    return std.mem.eql(u8, a, b);
 }
 
 /// require(id) 的 C 回调：从 callee 的 __parentPath 取父目录，解析 id，走缓存或 loadModule
@@ -110,7 +123,7 @@ fn requireCallback(
         const exports_val = node_builtin.getNodeBuiltin(ctx, allocator, id);
         if (jsc.JSValueIsUndefined(ctx, exports_val)) return exports_val;
         jsc.JSValueProtect(ctx, exports_val);
-        cache_ptr.put(allocator.dupe(u8, id) catch return exports_val, .{ .exports = exports_val }) catch return exports_val;
+        cache_ptr.put(allocator, allocator.dupe(u8, id) catch return exports_val, .{ .exports = exports_val }) catch return exports_val;
         return exports_val;
     }
     // shu:fs / shu:path / shu:zlib 等内置：从 globalThis.Shu 取子对象并缓存
@@ -120,7 +133,7 @@ fn requireCallback(
         const exports_val = shu_builtin.getShuBuiltin(ctx, allocator, id);
         if (jsc.JSValueIsUndefined(ctx, exports_val)) return exports_val;
         jsc.JSValueProtect(ctx, exports_val);
-        cache_ptr.put(allocator.dupe(u8, id) catch return exports_val, .{ .exports = exports_val }) catch return exports_val;
+        cache_ptr.put(allocator, allocator.dupe(u8, id) catch return exports_val, .{ .exports = exports_val }) catch return exports_val;
         return exports_val;
     }
     const result = resolveId(allocator, parent_dir, id) catch return jsc.JSValueMakeUndefined(ctx);
@@ -133,7 +146,7 @@ fn requireCallback(
     defer allocator.free(content);
     const exports_val = runModuleWithSource(ctx, allocator, result.file_path, child_dir, content) catch return jsc.JSValueMakeUndefined(ctx);
     jsc.JSValueProtect(ctx, exports_val);
-    cache_ptr.put(allocator.dupe(u8, result.cache_key) catch return exports_val, .{ .exports = exports_val }) catch return exports_val;
+    cache_ptr.put(allocator, allocator.dupe(u8, result.cache_key) catch return exports_val, .{ .exports = exports_val }) catch return exports_val;
     return exports_val;
 }
 
@@ -188,7 +201,7 @@ pub fn resolveRequest(allocator: std.mem.Allocator, parent_dir: []const u8, id: 
 
 /// 为 findPackageJSON 解析 specifier：相对 base_path 得到「起始路径」（文件或目录）。
 /// 相对路径（./ ../）用 path.resolve；裸说明符（无 /、非 . 开头）按 Node 规则从 dirname(base_path) 向上查 node_modules/<specifier>。
-/// 返回解析后的绝对路径（可能是文件或目录），调用方负责 free。内置协议（node:/shu:/deno:/bun:）及空串返回 null，不当作路径或 node_modules 解析。
+/// [Allocates] 返回解析后的绝对路径（可能是文件或目录），调用方负责 free。内置协议（node:/shu:/deno:/bun:）及空串返回 null，不当作路径或 node_modules 解析。
 pub fn resolveSpecifierForPackageJson(allocator: std.mem.Allocator, base_path: []const u8, specifier: []const u8) ?[]const u8 {
     if (specifier.len == 0) return null;
     if (std.mem.startsWith(u8, specifier, "node:")) return null;
@@ -211,7 +224,7 @@ pub fn resolveSpecifierForPackageJson(allocator: std.mem.Allocator, base_path: [
         defer dir_handle.close(io);
         var nm_handle = dir_handle.openDir(io, "node_modules", .{}) catch {
             const parent = std.fs.path.dirname(dir) orelse break;
-            if (std.mem.eql(u8, parent, dir)) break;
+            if (sliceEqlShort(parent, dir)) break;
             const new_dir = allocator.dupe(u8, parent) catch break;
             allocator.free(dir);
             dir = new_dir;
@@ -220,7 +233,7 @@ pub fn resolveSpecifierForPackageJson(allocator: std.mem.Allocator, base_path: [
         defer nm_handle.close(io);
         var sub = nm_handle.openDir(io, specifier, .{}) catch {
             const parent = std.fs.path.dirname(dir) orelse break;
-            if (std.mem.eql(u8, parent, dir)) break;
+            if (sliceEqlShort(parent, dir)) break;
             const new_dir = allocator.dupe(u8, parent) catch break;
             allocator.free(dir);
             dir = new_dir;
