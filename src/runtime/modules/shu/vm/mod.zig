@@ -14,16 +14,14 @@ const no_exception_ref: jsc.JSValueRef = @ptrCast(&vm_no_exception_sentinel);
 var vm_dummy_this_sentinel: u8 = 0;
 const dummy_this_ref: jsc.JSObjectRef = @ptrCast(&vm_dummy_this_sentinel);
 
-/// 已 contextify 的 sandbox 与其专属 VM 上下文的映射（同一 group，便于共享值）
-var context_map: std.AutoHashMap(u64, jsc.JSGlobalContextRef) = undefined;
-var map_init: bool = false;
+/// 已 contextify 的 sandbox 与其专属 VM 上下文的映射。Unmanaged，put/deinit 显式传 allocator（01 §1.2）
+var context_map: ?std.AutoHashMapUnmanaged(u64, jsc.JSGlobalContextRef) = null;
 
 /// 初始化 context_map（惰性，首次 createContext 时调用）；无 allocator 时不初始化，createContext 会失败
 fn ensureMap() bool {
-    if (!map_init) {
-        const allocator = globals.current_allocator orelse return false;
-        context_map = std.AutoHashMap(u64, jsc.JSGlobalContextRef).init(allocator);
-        map_init = true;
+    if (context_map == null) {
+        _ = globals.current_allocator orelse return false;
+        context_map = .{};
     }
     return true;
 }
@@ -41,13 +39,14 @@ fn disposeContextCallback(
         return jsc.JSValueMakeUndefined(ctx);
     }
     const sandbox = jsc.JSValueToObject(ctx, arguments[0], exception) orelse return jsc.JSValueMakeUndefined(ctx);
-    if (!map_init) return jsc.JSValueMakeUndefined(ctx);
+    if (context_map == null) return jsc.JSValueMakeUndefined(ctx);
+    const allocator = globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
     const key = @intFromPtr(sandbox);
-    if (context_map.fetchRemove(key)) |kv| {
+    if (context_map.?.fetchRemove(key)) |kv| {
         jsc.JSGlobalContextRelease(kv.value);
-        if (context_map.count() == 0) {
-            context_map.deinit();
-            map_init = false;
+        if (context_map.?.count() == 0) {
+            context_map.?.deinit(allocator);
+            context_map = null;
         }
     }
     return jsc.JSValueMakeUndefined(ctx);
@@ -92,8 +91,9 @@ fn createContextCallback(
         sandbox = obj;
     }
 
+    const allocator = globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
     const key = @intFromPtr(sandbox);
-    if (context_map.fetchRemove(key)) |kv| {
+    if (context_map.?.fetchRemove(key)) |kv| {
         jsc.JSGlobalContextRelease(kv.value);
     }
 
@@ -102,7 +102,7 @@ fn createContextCallback(
     _ = jsc.JSGlobalContextRetain(vm_ctx);
     const vm_global = jsc.JSContextGetGlobalObject(vm_ctx);
     copyObjectToObject(ctx, sandbox, vm_ctx, vm_global);
-    context_map.put(key, vm_ctx) catch {
+    context_map.?.put(allocator, key, vm_ctx) catch {
         jsc.JSGlobalContextRelease(vm_ctx);
         return jsc.JSValueMakeUndefined(ctx);
     };
@@ -129,7 +129,7 @@ fn runInContextCallback(
     const contextified = jsc.JSValueToObject(ctx, contextified_val, exception) orelse return jsc.JSValueMakeUndefined(ctx);
 
     const key = @intFromPtr(contextified);
-    const vm_ctx = context_map.get(key) orelse {
+    const vm_ctx = context_map.?.get(key) orelse {
         const global = jsc.JSContextGetGlobalObject(ctx);
         const err_name = jsc.JSStringCreateWithUTF8CString("Error");
         defer jsc.JSStringRelease(err_name);
@@ -286,9 +286,9 @@ fn isContextCallback(
         return jsc.JSValueMakeBoolean(ctx, false);
     }
     const obj = jsc.JSValueToObject(ctx, arguments[0], null) orelse return jsc.JSValueMakeBoolean(ctx, false);
-    if (!map_init) return jsc.JSValueMakeBoolean(ctx, false);
+    if (context_map == null) return jsc.JSValueMakeBoolean(ctx, false);
     const key = @intFromPtr(obj);
-    return jsc.JSValueMakeBoolean(ctx, context_map.contains(key));
+    return jsc.JSValueMakeBoolean(ctx, if (context_map) |*m| m.contains(key) else false);
 }
 
 /// vm.Script(code[, options]) 构造函数：创建预编译脚本对象，带 __code 与 runInContext/runInNewContext/runInThisContext 方法
