@@ -43,6 +43,14 @@ fn ensureUtilStrings() void {
     util_strings_init = true;
 }
 
+/// 取 comptime 字符串前 8 字节转 u64（不足零填充），用于 typeCheck 与 buf 比较（00 §2.1）
+fn fullTagPrefix8(comptime str: []const u8) u64 {
+    var buf: [8]u8 = [_]u8{0} ** 8;
+    const n = @min(8, str.len);
+    for (str[0..n], buf[0..n]) |c, *p| p.* = c;
+    return @as(u64, @bitCast(buf));
+}
+
 /// inspect(obj)：先尝试 JSON.stringify，失败则 String(obj)
 fn inspectCallback(
     ctx: jsc.JSContextRef,
@@ -244,8 +252,10 @@ pub fn getExports(ctx: jsc.JSContextRef, _: std.mem.Allocator) jsc.JSValueRef {
 }
 
 /// 用 Object.prototype.toString.call(v) 与 "[object Tag]" 比较（tag 不含 "[object " 前缀，内部拼上）
+/// full_tag 为 comptime，≤8 字节时用 u64 比较（00 §2.1）
 fn typeCheckCallback(comptime tag: []const u8) jsc.JSObjectCallAsFunctionCallback {
     const full_tag = "[object " ++ tag ++ "]";
+    const prefix_val = fullTagPrefix8(full_tag);
     return struct {
         fn cb(
             ctx: jsc.JSContextRef,
@@ -272,6 +282,12 @@ fn typeCheckCallback(comptime tag: []const u8) jsc.JSObjectCallAsFunctionCallbac
             var buf: [64]u8 = undefined;
             const n = jsc.JSStringGetUTF8CString(result_str, &buf, buf.len);
             const len = if (n > 0) n - 1 else 0;
+            if (len != full_tag.len) return jsc.JSValueMakeBoolean(ctx, false);
+            if (full_tag.len <= 8) {
+                var x: [8]u8 = [_]u8{0} ** 8;
+                @memcpy(x[0..len], buf[0..len]);
+                return jsc.JSValueMakeBoolean(ctx, @as(u64, @bitCast(x)) == prefix_val);
+            }
             return jsc.JSValueMakeBoolean(ctx, std.mem.eql(u8, buf[0..len], full_tag));
         }
     }.cb;
