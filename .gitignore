@@ -39,8 +39,10 @@ shu.lock
 *~
 Thumbs.db
 
-# 测试与覆盖率
+# 测试与覆盖率（快照与覆盖率在项目根；测试公共输出在 tests/test-data）
+snapshots/
 coverage/
+tests/test-data/
 *.profraw
 *.profdata
 
