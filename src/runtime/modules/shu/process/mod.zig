@@ -8,7 +8,7 @@ const jsc = @import("jsc");
 const errors = @import("errors");
 const libs_process = @import("libs_process");
 const run_options_mod = @import("../../../run_options.zig");
-const fork_child = @import("../system/fork_child.zig");
+const fork_child = @import("../cmd/fork_child.zig");
 const thread_worker = @import("../threads/worker.zig");
 
 /// 向全局对象注入 process（cwd、argv、env）、__dirname、__filename；is_forked 时挂 send/receiveSync，is_thread_worker 时挂线程通道
