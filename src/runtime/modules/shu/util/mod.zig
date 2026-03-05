@@ -5,6 +5,7 @@ const std = @import("std");
 const jsc = @import("jsc");
 const common = @import("../../../common.zig");
 const globals = @import("../../../globals.zig");
+const promise = @import("../promise.zig");
 
 var k_JSON: jsc.JSStringRef = undefined;
 var k_stringify: jsc.JSStringRef = undefined;
@@ -74,6 +75,44 @@ fn inspectCallback(
     return jsc.JSObjectCallAsFunction(ctx, str_ctor, null, 1, &one, null);
 }
 
+/// promise.createWithExecutor 的 Zig 回调：将 resolve/reject 写入 holder 后调用 fn.apply(that, args_with_cb)
+fn promisifyOnExecutor(ctx: jsc.JSContextRef, resolve_val: jsc.JSValueRef, reject_val: jsc.JSValueRef, user_data: ?*anyopaque) void {
+    const holder_ptr = @as(*jsc.JSObjectRef, @alignCast(@ptrCast(user_data orelse return)));
+    const holder = holder_ptr.*;
+    ensureUtilStrings();
+    _ = jsc.JSObjectSetProperty(ctx, holder, k_resolve, resolve_val, jsc.kJSPropertyAttributeNone, null);
+    _ = jsc.JSObjectSetProperty(ctx, holder, k_reject, reject_val, jsc.kJSPropertyAttributeNone, null);
+    const fn_val = jsc.JSObjectGetProperty(ctx, holder, k___fn, null);
+    const fn_obj = jsc.JSValueToObject(ctx, fn_val, null) orelse return;
+    const k_args = jsc.JSStringCreateWithUTF8CString("args");
+    defer jsc.JSStringRelease(k_args);
+    const k_that = jsc.JSStringCreateWithUTF8CString("that");
+    defer jsc.JSStringRelease(k_that);
+    const args_val = jsc.JSObjectGetProperty(ctx, holder, k_args, null);
+    const that_val = jsc.JSObjectGetProperty(ctx, holder, k_that, null);
+    const apply_val = jsc.JSObjectGetProperty(ctx, fn_obj, k_apply, null);
+    const apply_fn = jsc.JSValueToObject(ctx, apply_val, null) orelse return;
+    const node_cb_name = jsc.JSStringCreateWithUTF8CString("nodeCb");
+    defer jsc.JSStringRelease(node_cb_name);
+    const node_cb = jsc.JSObjectMakeFunctionWithCallback(ctx, node_cb_name, promisifyNodeCallback);
+    _ = jsc.JSObjectSetProperty(ctx, node_cb, k_holder, holder, jsc.kJSPropertyAttributeNone, null);
+    const args_obj = jsc.JSValueToObject(ctx, args_val, null) orelse return;
+    const k_length = jsc.JSStringCreateWithUTF8CString("length");
+    defer jsc.JSStringRelease(k_length);
+    const len_val = jsc.JSObjectGetProperty(ctx, args_obj, k_length, null);
+    const len_f = jsc.JSValueToNumber(ctx, len_val, null);
+    const len: usize = @intFromFloat(len_f);
+    var args_with_cb: [65]jsc.JSValueRef = undefined;
+    var i: usize = 0;
+    while (i < len and i < 64) : (i += 1) {
+        args_with_cb[i] = jsc.JSObjectGetPropertyAtIndex(ctx, args_obj, @intCast(i), null);
+    }
+    args_with_cb[i] = node_cb;
+    i += 1;
+    var apply_args: [2]jsc.JSValueRef = .{ that_val, jsc.JSObjectMakeArray(ctx, i, &args_with_cb, null) };
+    _ = jsc.JSObjectCallAsFunction(ctx, apply_fn, fn_obj, 2, &apply_args, null);
+}
+
 /// promisify 返回的函数被调用时：创建 Promise(executor)，executor 内调用 fn(...args, nodeStyleCallback)
 fn promisifiedCallCallback(
     ctx: jsc.JSContextRef,
@@ -86,62 +125,16 @@ fn promisifiedCallCallback(
     _ = globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
     const fn_val = jsc.JSObjectGetProperty(ctx, callee, k___fn, null);
     _ = jsc.JSValueToObject(ctx, fn_val, null) orelse return jsc.JSValueMakeUndefined(ctx);
-    const global = jsc.JSContextGetGlobalObject(ctx);
-    const promise_val = jsc.JSObjectGetProperty(ctx, global, k_Promise, null);
-    const promise_ctor = jsc.JSValueToObject(ctx, promise_val, null) orelse return jsc.JSValueMakeUndefined(ctx);
-    const executor_name = jsc.JSStringCreateWithUTF8CString("executor");
-    defer jsc.JSStringRelease(executor_name);
-    const executor_fn = jsc.JSObjectMakeFunctionWithCallback(ctx, executor_name, promisifyExecutorCallback);
     const holder = jsc.JSObjectMake(ctx, null, null);
     _ = jsc.JSObjectSetProperty(ctx, holder, k___fn, fn_val, jsc.kJSPropertyAttributeNone, null);
     _ = jsc.JSObjectSetProperty(ctx, holder, k_resolve, jsc.JSValueMakeUndefined(ctx), jsc.kJSPropertyAttributeNone, null);
     _ = jsc.JSObjectSetProperty(ctx, holder, k_reject, jsc.JSValueMakeUndefined(ctx), jsc.kJSPropertyAttributeNone, null);
+    const k_args = jsc.JSStringCreateWithUTF8CString("args");
+    defer jsc.JSStringRelease(k_args);
     const args_arr = jsc.JSObjectMakeArray(ctx, argumentCount, if (argumentCount > 0) arguments else @as([*]const jsc.JSValueRef, &[_]jsc.JSValueRef{}), null);
-    _ = jsc.JSObjectSetProperty(ctx, holder, jsc.JSStringCreateWithUTF8CString("args"), args_arr, jsc.kJSPropertyAttributeNone, null);
+    _ = jsc.JSObjectSetProperty(ctx, holder, k_args, args_arr, jsc.kJSPropertyAttributeNone, null);
     _ = jsc.JSObjectSetProperty(ctx, holder, jsc.JSStringCreateWithUTF8CString("that"), thisObject, jsc.kJSPropertyAttributeNone, null);
-    _ = jsc.JSObjectSetProperty(ctx, executor_fn, k_holder, holder, jsc.kJSPropertyAttributeNone, null);
-    var one: [1]jsc.JSValueRef = .{executor_fn};
-    return jsc.JSObjectCallAsConstructor(ctx, promise_ctor, 1, &one, null);
-}
-
-fn promisifyExecutorCallback(
-    ctx: jsc.JSContextRef,
-    _: jsc.JSObjectRef,
-    callee: jsc.JSObjectRef,
-    argumentCount: usize,
-    arguments: [*]const jsc.JSValueRef,
-    _: [*]jsc.JSValueRef,
-) callconv(.c) jsc.JSValueRef {
-    if (argumentCount < 2) return jsc.JSValueMakeUndefined(ctx);
-    const holder_val = jsc.JSObjectGetProperty(ctx, callee, k_holder, null);
-    const holder = jsc.JSValueToObject(ctx, holder_val, null) orelse return jsc.JSValueMakeUndefined(ctx);
-    _ = jsc.JSObjectSetProperty(ctx, holder, k_resolve, arguments[0], jsc.kJSPropertyAttributeNone, null);
-    _ = jsc.JSObjectSetProperty(ctx, holder, k_reject, arguments[1], jsc.kJSPropertyAttributeNone, null);
-    const fn_val = jsc.JSObjectGetProperty(ctx, holder, k___fn, null);
-    const fn_obj = jsc.JSValueToObject(ctx, fn_val, null) orelse return jsc.JSValueMakeUndefined(ctx);
-    const args_val = jsc.JSObjectGetProperty(ctx, holder, jsc.JSStringCreateWithUTF8CString("args"), null);
-    const that_val = jsc.JSObjectGetProperty(ctx, holder, jsc.JSStringCreateWithUTF8CString("that"), null);
-    const apply_val = jsc.JSObjectGetProperty(ctx, fn_obj, k_apply, null);
-    const apply_fn = jsc.JSValueToObject(ctx, apply_val, null) orelse return jsc.JSValueMakeUndefined(ctx);
-    const node_cb_name = jsc.JSStringCreateWithUTF8CString("nodeCb");
-    defer jsc.JSStringRelease(node_cb_name);
-    const node_cb = jsc.JSObjectMakeFunctionWithCallback(ctx, node_cb_name, promisifyNodeCallback);
-    _ = jsc.JSObjectSetProperty(ctx, node_cb, k_holder, holder, jsc.kJSPropertyAttributeNone, null);
-    const args_obj = jsc.JSValueToObject(ctx, args_val, null) orelse return jsc.JSValueMakeUndefined(ctx);
-    const len_val = jsc.JSObjectGetProperty(ctx, args_obj, jsc.JSStringCreateWithUTF8CString("length"), null);
-    const len_f = jsc.JSValueToNumber(ctx, len_val, null);
-    const len: usize = @intFromFloat(len_f);
-    var args_with_cb: [65]jsc.JSValueRef = undefined;
-    var i: usize = 0;
-    while (i < len and i < 64) : (i += 1) {
-        args_with_cb[i] = jsc.JSObjectGetPropertyAtIndex(ctx, args_obj, @intCast(i), null);
-    }
-    args_with_cb[i] = node_cb;
-    i += 1;
-    // fn.apply(that, args_with_cb)
-    var apply_args: [2]jsc.JSValueRef = .{ that_val, jsc.JSObjectMakeArray(ctx, i, &args_with_cb, null) };
-    _ = jsc.JSObjectCallAsFunction(ctx, apply_fn, fn_obj, 2, &apply_args, null);
-    return jsc.JSValueMakeUndefined(ctx);
+    return promise.createWithExecutor(ctx, promisifyOnExecutor, @ptrCast(@constCast(&holder)));
 }
 
 fn promisifyNodeCallback(
