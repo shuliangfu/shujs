@@ -70,6 +70,7 @@ pub const TimerState = struct {
     /// 先收割 fetch worker 完成项并 resolve 对应 Promise；再跑一次 RunLoop 迭代（macOS）以便 JSC 执行 Promise then/catch 微任务。
     pub fn runMicrotasks(self: *TimerState, ctx: jsc.JSGlobalContextRef) void {
         if (globals.drain_fetch_results) |drain| drain(ctx);
+        if (globals.drain_cmd_results) |drain| drain(ctx);
         const list = &self.microtask_queue;
         while (list.items.len > 0) {
             const e = list.orderedRemove(0);
