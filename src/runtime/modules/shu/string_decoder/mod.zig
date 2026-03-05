@@ -25,19 +25,57 @@ fn ensureSDStrings() void {
     sd_strings_init = true;
 }
 
-/// 注入全局 __sdDecode(decoder, bufArray) 供 end() 合并并解码（仅执行一次）
+/// __sdDecode(decoder, bufArray) 的 C 回调：合并 arr 中所有 Uint8Array 后调用 decoder.decode，纯 Zig 无脚本
+fn sdDecodeCallback(
+    ctx: jsc.JSContextRef,
+    _: jsc.JSObjectRef,
+    _: jsc.JSObjectRef,
+    argumentCount: usize,
+    arguments: [*]const jsc.JSValueRef,
+    _: [*]jsc.JSValueRef,
+) callconv(.c) jsc.JSValueRef {
+    if (argumentCount < 2) return jsc.JSValueMakeUndefined(ctx);
+    const dec = arguments[0];
+    const arr_val = arguments[1];
+    const arr_obj = jsc.JSValueToObject(ctx, arr_val, null) orelse return jsc.JSValueMakeUndefined(ctx);
+    const k_length = jsc.JSStringCreateWithUTF8CString("length");
+    defer jsc.JSStringRelease(k_length);
+    const len_val = jsc.JSObjectGetProperty(ctx, arr_obj, k_length, null);
+    const arr_len_f = jsc.JSValueToNumber(ctx, len_val, null);
+    const arr_len: usize = @intFromFloat(arr_len_f);
+    var total: usize = 0;
+    var i: usize = 0;
+    while (i < arr_len) : (i += 1) {
+        const item = jsc.JSObjectGetPropertyAtIndex(ctx, arr_obj, @intCast(i), null);
+        const item_obj = jsc.JSValueToObject(ctx, item, null) orelse continue;
+        total += jsc.JSObjectGetTypedArrayByteLength(ctx, item_obj);
+    }
+    const combined = jsc.JSObjectMakeTypedArray(ctx, .Uint8Array, total) orelse return jsc.JSValueMakeUndefined(ctx);
+    const dest_ptr = jsc.JSObjectGetTypedArrayBytesPtr(ctx, combined, null) orelse return jsc.JSValueMakeUndefined(ctx);
+    var offset: usize = 0;
+    i = 0;
+    while (i < arr_len) : (i += 1) {
+        const item = jsc.JSObjectGetPropertyAtIndex(ctx, arr_obj, @intCast(i), null);
+        const item_obj = jsc.JSValueToObject(ctx, item, null) orelse continue;
+        const n = jsc.JSObjectGetTypedArrayByteLength(ctx, item_obj);
+        const src_ptr = jsc.JSObjectGetTypedArrayBytesPtr(ctx, item_obj, null) orelse continue;
+        @memcpy(@as([*]u8, @ptrCast(dest_ptr))[offset..][0..n], @as([*]const u8, @ptrCast(src_ptr))[0..n]);
+        offset += n;
+    }
+    const k_decode = jsc.JSStringCreateWithUTF8CString("decode");
+    defer jsc.JSStringRelease(k_decode);
+    const decode_fn = jsc.JSObjectGetProperty(ctx, @ptrCast(dec), k_decode, null);
+    if (!jsc.JSObjectIsFunction(ctx, @ptrCast(decode_fn))) return jsc.JSValueMakeUndefined(ctx);
+    var one: [1]jsc.JSValueRef = .{combined};
+    return jsc.JSObjectCallAsFunction(ctx, @ptrCast(decode_fn), @ptrCast(dec), 1, &one, null);
+}
+
+/// 注入全局 __sdDecode 为 C 回调（仅执行一次），纯 Zig 无内联脚本
 fn ensureSDDecodeHelper(ctx: jsc.JSContextRef) void {
     const global = jsc.JSContextGetGlobalObject(ctx);
     const existing = jsc.JSObjectGetProperty(ctx, global, k__sdDecode, null);
     if (!jsc.JSValueIsUndefined(ctx, existing)) return;
-    const script =
-        "(function(){ globalThis.__sdDecode=function(dec,arr){ var n=0; for(var i=0;i<arr.length;i++) n+=arr[i].length; var u=new Uint8Array(n),o=0; for(var i=0;i<arr.length;i++){ u.set(arr[i],o); o+=arr[i].length; } return dec.decode(u); }; })();";
-    const allocator = globals.current_allocator orelse return;
-    const script_z = allocator.dupeZ(u8, script) catch return;
-    defer allocator.free(script_z);
-    const script_ref = jsc.JSStringCreateWithUTF8CString(script_z.ptr);
-    defer jsc.JSStringRelease(script_ref);
-    _ = jsc.JSEvaluateScript(ctx, script_ref, global, null, 0, null);
+    common.setMethod(ctx, global, "__sdDecode", sdDecodeCallback);
 }
 
 /// 构造函数：this.encoding = enc||'utf8'，this.decoder = new TextDecoder(encoding)，this._buf = []
