@@ -297,9 +297,34 @@ fn crondCallback(
     const expression = buf[0 .. n - 1];
     const id = shu_timers.scheduleCron(ctx, callback, expression);
     if (id == 0) return jsc.JSValueMakeUndefined(ctx);
-    var script: [128]u8 = undefined;
-    const written = std.fmt.bufPrint(&script, "(function(id){{ return {{ stop: function() {{ Shu.crondClear(id); }} }}; }})({d});", .{id}) catch return jsc.JSValueMakeUndefined(ctx);
-    return common.evalPromiseScript(ctx, written);
+    const result_obj = jsc.JSObjectMake(ctx, null, null);
+    const k_stop = jsc.JSStringCreateWithUTF8CString("stop");
+    defer jsc.JSStringRelease(k_stop);
+    const k_crond_id = jsc.JSStringCreateWithUTF8CString("__crond_id");
+    defer jsc.JSStringRelease(k_crond_id);
+    const stop_fn = jsc.JSObjectMakeFunctionWithCallback(ctx, k_stop, crondStopCallback);
+    _ = jsc.JSObjectSetProperty(ctx, stop_fn, k_crond_id, jsc.JSValueMakeNumber(ctx, @floatFromInt(id)), jsc.kJSPropertyAttributeNone, null);
+    _ = jsc.JSObjectSetProperty(ctx, result_obj, k_stop, stop_fn, jsc.kJSPropertyAttributeNone, null);
+    return result_obj;
+}
+
+/// stop() 的 C 回调：从 callee 取 __crond_id 并 cancelTimer，纯 Zig 无内联 JS
+fn crondStopCallback(
+    ctx: jsc.JSContextRef,
+    _: jsc.JSObjectRef,
+    callee: jsc.JSObjectRef,
+    argumentCount: usize,
+    _: [*]const jsc.JSValueRef,
+    _: [*]jsc.JSValueRef,
+) callconv(.c) jsc.JSValueRef {
+    _ = argumentCount;
+    const k = jsc.JSStringCreateWithUTF8CString("__crond_id");
+    defer jsc.JSStringRelease(k);
+    const id_val = jsc.JSObjectGetProperty(ctx, callee, k, null);
+    const n = jsc.JSValueToNumber(ctx, id_val, null);
+    const id: u32 = @intFromFloat(n);
+    shu_timers.cancelTimer(id);
+    return jsc.JSValueMakeUndefined(ctx);
 }
 
 fn crondClearCallback(
