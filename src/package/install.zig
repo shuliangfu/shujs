@@ -71,7 +71,7 @@ fn canSkipResolution(
 /// 解析/安装阶段 worker 或并发数的**静态上限**；实际使用上限在运行时由 getPackageConcurrencyCap()
 /// 根据 CPU 核心数计算（见下），避免单核机开过多线程。网络速度、当前 I/O 状态暂无自动探测，可后续通过环境变量或配置扩展。
 /// 解析阶段 JSR 并发 worker 数；与 npm 对齐，提高以压榨网络（解析为纯 I/O，32 可更好饱和带宽）
-const JSR_RESOLVE_MAX_WORKERS = 32;
+const JSR_RESOLVE_MAX_WORKERS = 16;
 
 /// 每批请求数：超过后重建 Client，避免同一连接复用过多导致服务端关闭或返回非 JSON（常见于「最后一包」报 JsrMetaNoJsonObject）。与 CPU 无关，保持常量。
 const JSR_RESOLVE_CLIENT_REUSE_LIMIT = 32;
@@ -82,7 +82,7 @@ const JSR_RESOLVE_RETRIES = 2;
 const JSR_RESOLVE_RETRY_DELAY_NS: u64 = 200_000_000;
 
 /// npm 解析阶段每层并发 worker 数；与 JSR 对齐，解析为纯 I/O 故用 32 更好饱和网络，实际上限由 getConcurrencyCapForRequests 决定。
-const NPM_RESOLVE_MAX_WORKERS = 32;
+const NPM_RESOLVE_MAX_WORKERS = 16;
 
 /// JSR 并发解析单条结果：version/imports 由 worker 用本批 Arena 分配，主线程合并后 Arena deinit 统一释放（00 §1.2）。
 const JsrResolveResult = struct {
@@ -96,12 +96,15 @@ const JsrResolveItem = struct { name: []const u8, spec: []const u8 };
 
 /// Worker 线程上下文：items 与 results 在 join 前有效；next_index 原子递增取任务下标。allocator 为 per-batch Arena，join 后主线程 deinit（00 §1.2）。
 /// resolving_progress 非 null 时 worker 每完成一个包即更新 count/name，与 Installing 一致。
+/// result_ready 非 null 时 worker 写完 results[i] 后置 result_ready[i]=true，供主线程流式合并并更新 total（每就绪一条合并一条，不卡整波）。
 const JsrResolveWorkerCtx = struct {
     items: []const JsrResolveItem,
     results: [*]JsrResolveResult,
     next_index: *std.atomic.Value(usize),
     allocator: std.mem.Allocator,
     resolving_progress: ?*ResolvingProgress = null,
+    /// 与 items 同长；worker 写完 results[i] 后 store(true)，主线程按序消费
+    result_ready: ?[*]std.atomic.Value(bool) = null,
 };
 
 /// npm 并发解析单条结果：version、tarball_url、dependencies 由 worker 用本批 Arena 分配，主线程合并后 Arena deinit 统一释放（00 §1.2）。
@@ -117,15 +120,18 @@ const NpmResolveItem = struct { name: []const u8, spec: []const u8, display_name
 
 /// Worker 上下文：items 与 results 在 join 前有效；next_index 原子递增取任务下标。allocator 为 per-batch Arena，join 后主线程 deinit（00 §1.2）。
 /// resolving_progress 非 null 时 worker 每完成一个包即更新 count/name，供 CLI 进度线程轮询（与 Installing 一致）。
+/// result_ready 非 null 时 worker 写完 results[i] 后置 result_ready[i]=true，供主线程流式合并并更新 total。
 const NpmResolveWorkerCtx = struct {
     items: []const NpmResolveItem,
     results: [*]NpmResolveResult,
     next_index: *std.atomic.Value(usize),
     allocator: std.mem.Allocator,
     resolving_progress: ?*ResolvingProgress = null,
+    /// 与 items 同长；worker 写完 results[i] 后 store(true)，主线程按序消费
+    result_ready: ?[*]std.atomic.Value(bool) = null,
 };
 
-/// npm 解析 worker：每 worker 持有一个 Client，循环取任务并调用 resolveVersionTarballAndDeps，结果写入 results[i]。领到任务后立即更新 resolving_progress.count（claim 时计数），保证 count 与 total 一致不缺口。
+/// npm 解析 worker：每 worker 持有一个 Client，循环取任务并调用 resolveVersionTarballAndDeps，结果写入 results[i]。解析完成（写入 results[i]）后更新 resolving_progress.count/name，使进度条为「已解析数 / 当前总任务数」。
 fn npmResolveWorker(ctx: *const NpmResolveWorkerCtx) void {
     const a = ctx.allocator;
     const io = libs_process.getProcessIo() orelse return;
@@ -135,6 +141,27 @@ fn npmResolveWorker(ctx: *const NpmResolveWorkerCtx) void {
         const i = ctx.next_index.fetchAdd(1, .monotonic);
         if (i >= ctx.items.len) return;
         const item = ctx.items[i];
+        const r = registry.resolveVersionTarballAndDeps(a, item.registry_url, item.name, item.spec, &client) catch |e| {
+            ctx.results[i] = .{ .err = e };
+            if (ctx.result_ready) |ready| ready[i].store(true, .release);
+            if (ctx.resolving_progress) |p| {
+                _ = p.count.fetchAdd(1, .monotonic);
+                p.name_mutex.lock(io) catch {};
+                const name_slice = item.display_name orelse item.name;
+                const copy_len = @min(name_slice.len, 63);
+                @memcpy(p.name_buf[0..copy_len], name_slice[0..copy_len]);
+                p.name_buf[copy_len] = 0;
+                p.name_len.store(copy_len, .monotonic);
+                p.name_mutex.unlock(io);
+            }
+            continue;
+        };
+        ctx.results[i] = .{
+            .version = r.version,
+            .tarball_url = r.tarball_url,
+            .dependencies = r.dependencies,
+        };
+        if (ctx.result_ready) |ready| ready[i].store(true, .release);
         if (ctx.resolving_progress) |p| {
             _ = p.count.fetchAdd(1, .monotonic);
             p.name_mutex.lock(io) catch {};
@@ -145,15 +172,6 @@ fn npmResolveWorker(ctx: *const NpmResolveWorkerCtx) void {
             p.name_len.store(copy_len, .monotonic);
             p.name_mutex.unlock(io);
         }
-        const r = registry.resolveVersionTarballAndDeps(a, item.registry_url, item.name, item.spec, &client) catch |e| {
-            ctx.results[i] = .{ .err = e };
-            continue;
-        };
-        ctx.results[i] = .{
-            .version = r.version,
-            .tarball_url = r.tarball_url,
-            .dependencies = r.dependencies,
-        };
     }
 }
 
@@ -189,9 +207,11 @@ const JsrInstallWorkerCtx = struct {
     last_completed_name: ?*LastCompletedName = null,
 };
 
-/// JSR 安装 worker：使用主进程传入的 ctx.io，循环取任务并调用 downloadPackageToDir。
+/// JSR 安装 worker：使用主进程传入的 ctx.io，持有一个 std.http.Client 复用多包 _meta 请求（同 host jsr.io），循环取任务并调用 downloadPackageToDir。
 fn jsrInstallWorker(ctx: *const JsrInstallWorkerCtx) void {
     const io = ctx.io;
+    var meta_client = std.http.Client{ .allocator = ctx.allocator, .io = io };
+    defer meta_client.deinit();
     while (true) {
         const i = ctx.next_index.fetchAdd(1, .monotonic);
         if (i >= ctx.tasks.len) return;
@@ -200,7 +220,7 @@ fn jsrInstallWorker(ctx: *const JsrInstallWorkerCtx) void {
         var ok = false;
         for (0..INSTALL_NETWORK_RETRIES) |ri| {
             if (ri > 0) std.Io.sleep(io, std.Io.Duration.fromNanoseconds(INSTALL_NETWORK_RETRY_DELAYS_NS[ri - 1]), .awake) catch {};
-            jsr.downloadPackageToDir(ctx.allocator, ctx.pool, task.name, task.version, task.pkg_dest, io) catch |e| {
+            jsr.downloadPackageToDir(ctx.allocator, ctx.pool, task.name, task.version, task.pkg_dest, io, &meta_client) catch |e| {
                 last_err = e;
                 continue;
             };
@@ -453,17 +473,18 @@ fn jsrResolveWorker(ctx: *const JsrResolveWorkerCtx) void {
                 return;
             }
             const item = ctx.items[i];
-            if (ctx.resolving_progress) |p| {
-                _ = p.count.fetchAdd(1, .monotonic);
-                p.name_mutex.lock(io) catch {};
-                const copy_len = @min(item.name.len, 63);
-                @memcpy(p.name_buf[0..copy_len], item.name[0..copy_len]);
-                p.name_buf[copy_len] = 0;
-                p.name_len.store(copy_len, .monotonic);
-                p.name_mutex.unlock(io);
-            }
             const jsr_spec = std.fmt.allocPrint(a, "jsr:{s}@{s}", .{ item.name, item.spec }) catch {
                 ctx.results[i].err = error.OutOfMemory;
+                if (ctx.result_ready) |ready| ready[i].store(true, .release);
+                if (ctx.resolving_progress) |p| {
+                    _ = p.count.fetchAdd(1, .monotonic);
+                    p.name_mutex.lock(io) catch {};
+                    const copy_len = @min(item.name.len, 63);
+                    @memcpy(p.name_buf[0..copy_len], item.name[0..copy_len]);
+                    p.name_buf[copy_len] = 0;
+                    p.name_len.store(copy_len, .monotonic);
+                    p.name_mutex.unlock(io);
+                }
                 client.deinit();
                 return;
             };
@@ -498,6 +519,16 @@ fn jsrResolveWorker(ctx: *const JsrResolveWorkerCtx) void {
             if (retry_client) |*rc| rc.deinit();
             if (!resolved_ok) {
                 ctx.results[i].err = last_err;
+                if (ctx.result_ready) |ready| ready[i].store(true, .release);
+                if (ctx.resolving_progress) |p| {
+                    _ = p.count.fetchAdd(1, .monotonic);
+                    p.name_mutex.lock(io) catch {};
+                    const copy_len = @min(item.name.len, 63);
+                    @memcpy(p.name_buf[0..copy_len], item.name[0..copy_len]);
+                    p.name_buf[copy_len] = 0;
+                    p.name_len.store(copy_len, .monotonic);
+                    p.name_mutex.unlock(io);
+                }
                 client.deinit();
                 return;
             }
@@ -505,12 +536,32 @@ fn jsrResolveWorker(ctx: *const JsrResolveWorkerCtx) void {
                 defer lst.deinit(a);
                 const slice = a.dupe(jsr.DenoImportDep, lst.items) catch |e| {
                     ctx.results[i].err = e;
+                    if (ctx.result_ready) |ready| ready[i].store(true, .release);
+                    if (ctx.resolving_progress) |p| {
+                        _ = p.count.fetchAdd(1, .monotonic);
+                        p.name_mutex.lock(io) catch {};
+                        const copy_len = @min(item.name.len, 63);
+                        @memcpy(p.name_buf[0..copy_len], item.name[0..copy_len]);
+                        p.name_buf[copy_len] = 0;
+                        p.name_len.store(copy_len, .monotonic);
+                        p.name_mutex.unlock(io);
+                    }
                     client.deinit();
                     return;
                 };
                 ctx.results[i] = .{ .version = version, .imports = slice };
             } else {
                 ctx.results[i] = .{ .version = version, .imports = null };
+            }
+            if (ctx.result_ready) |ready| ready[i].store(true, .release);
+            if (ctx.resolving_progress) |p| {
+                _ = p.count.fetchAdd(1, .monotonic);
+                p.name_mutex.lock(io) catch {};
+                const copy_len = @min(item.name.len, 63);
+                @memcpy(p.name_buf[0..copy_len], item.name[0..copy_len]);
+                p.name_buf[copy_len] = 0;
+                p.name_len.store(copy_len, .monotonic);
+                p.name_mutex.unlock(io);
             }
         }
         client.deinit();
@@ -806,6 +857,24 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
             }
         }
 
+        // 无镜像缓存时在波循环前完成默认 registry 探测并写入 ~/.shu/registry，避免在进度条显示后主线程阻塞数秒导致「3/3 卡住再跳到 44」。
+        // 为何会阻塞：probe（ping 多个镜像 + 解析一个包）是在主线程上同步调用的，内部用 registryGet 做阻塞 HTTP，主线程在等待网络 I/O 的几秒内完全卡住。
+        // 为何不在 worker 里跑：worker 只负责「对单个包 resolve」；probe 是「选 registry + 测速」的一次性准备，结果要在 spawn npm worker 之前就确定（getCachedRegistry），
+        // 故当前设计在主线程执行；若放到线程里需主线程 join 等结果，总耗时不变。真正非阻塞需把 probe 放到后台线程且主线程不等待、或接入异步 I/O，改动较大。
+        var first_npm_probe_result: ?registry.TarballAndDepsResult = null;
+        const had_cache = registry.getCachedRegistry(allocator);
+        if (had_cache) |url| allocator.free(url);
+        if (had_cache == null) {
+            for (to_process.items) |item| {
+                if (item.is_jsr) continue;
+                const first_reg = npmrc.getRegistryForPackage(a, cwd, item.name) catch try a.dupe(u8, REGISTRY_BASE_URL);
+                if (isDefaultRegistryUrl(first_reg)) {
+                    first_npm_probe_result = registry.probeRegistriesWithPingThenResolvePackage(allocator, item.name, item.spec) catch null;
+                }
+                break;
+            }
+        }
+
         // 按层（wave）处理：每层先收集待处理项，npm 并行、JSR 并发拉 version + deno.json，再合并结果并扩展 to_process
         // total_resolve_tasks 累加每波实际派发的解析任务数，与 worker 的 count 一致，结束时显示 521/521 而非 465/521。
         var total_resolve_tasks: usize = 0;
@@ -835,11 +904,8 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                 p.total.store(total_resolve_tasks + wave_tasks, .monotonic);
             };
 
-            // 无镜像缓存时先完成默认 registry 探测并写入 ~/.shu/registry，再发后续包请求，避免对不可达镜像发请求
-            var first_npm_probe_result: ?registry.TarballAndDepsResult = null;
-            const had_cache = registry.getCachedRegistry(allocator);
-            if (had_cache) |url| allocator.free(url);
-            if (had_cache == null and npm_indices.items.len > 0) {
+            // 仅当波前未做过 probe 时再探测（通常已在波循环前完成，此处不再阻塞）
+            if (had_cache == null and npm_indices.items.len > 0 and first_npm_probe_result == null) {
                 const first_pi = npm_indices.items[0];
                 const first_item = to_process.items[first_pi];
                 const first_reg = npmrc.getRegistryForPackage(a, cwd, first_item.name) catch try a.dupe(u8, REGISTRY_BASE_URL);
@@ -852,6 +918,8 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
             wave_parallel: {
                 var npm_work_items: ?[]NpmResolveItem = null;
                 var npm_results_slice: ?[]NpmResolveResult = null;
+                var result_ready_npm_slice: ?[]std.atomic.Value(bool) = null;
+                var result_ready_jsr_slice: ?[]std.atomic.Value(bool) = null;
                 var npm_threads = std.ArrayList(std.Thread).initCapacity(allocator, 0) catch |e| {
                     if (first_error == null) first_error = map_install_err(e);
                     break :wave_parallel;
@@ -883,11 +951,21 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                         break :wave_parallel;
                     };
                     npm_results_slice = npm_results;
+                    // 流式合并：主线程按 result_ready 逐条合并并更新 total，不卡在 join
+                    result_ready_npm_slice = allocator.alloc(std.atomic.Value(bool), npm_indices.items.len) catch |e| {
+                        if (first_error == null) first_error = map_install_err(e);
+                        for (work_items) |wi| allocator.free(wi.registry_url);
+                        allocator.free(npm_results);
+                        break :wave_parallel;
+                    };
+                    for (result_ready_npm_slice.?) |*v| v.* = std.atomic.Value(bool).init(false);
                     const n_workers = @min(npm_indices.items.len, libs_process.getConcurrencyCapForRequests(NPM_RESOLVE_MAX_WORKERS));
                     npm_threads.ensureTotalCapacity(allocator, n_workers) catch |e| {
                         if (first_error == null) first_error = map_install_err(e);
                         for (work_items) |wi| allocator.free(wi.registry_url);
                         allocator.free(npm_results);
+                        allocator.free(result_ready_npm_slice.?);
+                        result_ready_npm_slice = null;
                         break :wave_parallel;
                     };
                     const npm_ctx = NpmResolveWorkerCtx{
@@ -896,6 +974,7 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                         .next_index = &npm_next,
                         .allocator = npm_arena.allocator(),
                         .resolving_progress = if (reporter) |r| r.resolving_progress else null,
+                        .result_ready = result_ready_npm_slice.?.ptr,
                     };
                     for (0..n_workers) |_| {
                         npm_threads.append(allocator, std.Thread.spawn(.{}, npmResolveWorker, .{&npm_ctx}) catch |e2| {
@@ -937,10 +1016,20 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                     if (jsr_items_buf_wave) |jsr_items_buf| {
                         if (allocator.alloc(JsrResolveResult, jsr_indices.items.len)) |slice| {
                             jsr_results_wave = slice;
+                            result_ready_jsr_slice = allocator.alloc(std.atomic.Value(bool), jsr_indices.items.len) catch |e| {
+                                if (first_error == null) first_error = map_install_err(e);
+                                allocator.free(jsr_items_buf_wave.?);
+                                allocator.free(slice);
+                                break :wave_parallel;
+                            };
+                            for (result_ready_jsr_slice.?) |*v| v.* = std.atomic.Value(bool).init(false);
                             const n_workers = @min(jsr_indices.items.len, libs_process.getConcurrencyCapForRequests(JSR_RESOLVE_MAX_WORKERS));
                             jsr_threads.ensureTotalCapacity(allocator, n_workers) catch |e| {
                                 if (first_error == null) first_error = map_install_err(e);
                                 allocator.free(jsr_items_buf_wave.?);
+                                allocator.free(slice);
+                                allocator.free(result_ready_jsr_slice.?);
+                                result_ready_jsr_slice = null;
                                 break :wave_parallel;
                             };
                             var ctx = JsrResolveWorkerCtx{
@@ -949,6 +1038,7 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                                 .next_index = &jsr_next,
                                 .allocator = jsr_arena.allocator(),
                                 .resolving_progress = if (reporter) |r| r.resolving_progress else null,
+                                .result_ready = result_ready_jsr_slice.?.ptr,
                             };
                             var t: usize = 0;
                             while (t < n_workers) : (t += 1) {
@@ -970,15 +1060,23 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                     }
                 }
 
-                for (npm_threads.items) |t| t.join();
-                for (jsr_threads.items) |th| th.join();
-
-                // 合并 npm 结果（首包在无缓存且默认 registry 时优先用 first_npm_probe_result）
-                if (npm_work_items) |work_items| {
-                    const npm_results = npm_results_slice.?;
-                    var first_probe_consumed = false;
-                    for (npm_indices.items, npm_results, 0..) |pi, res, ni| {
-                        const item = to_process.items[pi];
+                // 流式合并：按 result_ready 逐条合并并更新 total，避免 44/44 卡住再跳 total
+                var merged_npm: usize = 0;
+                var merged_jsr: usize = 0;
+                const npm_len = if (npm_results_slice != null) npm_indices.items.len else 0;
+                const jsr_len = if (jsr_results_wave != null) jsr_indices.items.len else 0;
+                var first_probe_consumed = false;
+                while (merged_npm < npm_len or merged_jsr < jsr_len) {
+                    const npm_ready = if (result_ready_npm_slice) |r| merged_npm < r.len and r[merged_npm].load(.acquire) else false;
+                    const jsr_ready = if (result_ready_jsr_slice) |r| merged_jsr < r.len and r[merged_jsr].load(.acquire) else false;
+                    if (npm_ready) {
+                        one_npm: {
+                            const work_items = npm_work_items.?;
+                            const npm_results = npm_results_slice.?;
+                            const ni = merged_npm;
+                            const pi = npm_indices.items[ni];
+                            const res = npm_results[ni];
+                            const item = to_process.items[pi];
                         if (reporter) |r| {
                             if (r.resolving_progress != null) {
                                 resolving_emitted = true;
@@ -1015,7 +1113,7 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                                 .dependencies = res.dependencies.?,
                             };
                         };
-                        const res_val = res_opt orelse continue;
+                        const res_val = res_opt orelse break :one_npm;
                         const version = res_val.version;
                         const tarball_url = res_val.tarball_url;
                         const deps = res_val.dependencies;
@@ -1046,7 +1144,7 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                             } else {
                                 @constCast(&deps).deinit();
                             }
-                            continue;
+                            break :one_npm;
                         };
                         var dep_iter = deps.iterator();
                         while (dep_iter.next()) |e| {
@@ -1068,7 +1166,7 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                                     @constCast(&deps).deinit();
                                 }
                                 if (first_error == null) first_error = error.OutOfMemory;
-                                continue;
+                                break :one_npm;
                             };
                             dep_names.append(allocator, dname_dup) catch {
                                 allocator.free(dname_dup);
@@ -1087,7 +1185,7 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                                     @constCast(&deps).deinit();
                                 }
                                 if (first_error == null) first_error = error.OutOfMemory;
-                                continue;
+                                break :one_npm;
                             };
                             if (!resolved.contains(dname)) {
                                 to_process.append(allocator, .{ .name = try allocator.dupe(u8, dname), .spec = try allocator.dupe(u8, dspec), .display_name = null, .is_jsr = false }) catch {
@@ -1106,8 +1204,9 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                                         @constCast(&deps).deinit();
                                     }
                                     if (first_error == null) first_error = error.OutOfMemory;
-                                    continue;
+                                    break :one_npm;
                                 };
+                                if (reporter) |r| if (r.resolving_progress) |p| p.total.store(total_resolve_tasks + (to_process.items.len - resolution_idx), .monotonic);
                             }
                         }
                         if (deps_of.getPtr(item.name)) |ptr| {
@@ -1133,7 +1232,7 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                                     @constCast(&deps).deinit();
                                 }
                                 if (first_error == null) first_error = error.OutOfMemory;
-                                continue;
+                                break :one_npm;
                             };
                         }
                         if (from_probe) {
@@ -1149,152 +1248,168 @@ pub fn install(allocator: std.mem.Allocator, cwd: []const u8, reporter: ?*const 
                         } else {
                             @constCast(&deps).deinit();
                         }
-                    }
-                    for (work_items) |wi| allocator.free(wi.registry_url);
-                    allocator.free(work_items);
-                    allocator.free(npm_results);
-                }
-
-                // 合并 JSR 结果到 resolved/deps_of/to_process；worker 分配由 jsr_arena.deinit 统一释放（00 §1.2）
-                if (jsr_results_wave) |jsr_results| {
-                    for (jsr_indices.items, jsr_results) |pi, res| {
-                                const item = to_process.items[pi];
-                                if (res.err) |e| {
-                                    if (reporter) |r| if (r.onResolveFailure) |cb| cb(r.ctx);
-                                    logInstallFailure("[shu install] failed: {s}@{s} (JSR resolve): {s}\n", .{ item.name, item.spec, @errorName(e) });
-                                    if (first_error == null) {
-                                        first_error = map_install_err(e);
-                                        if (error_detail) |ed| {
-                                            ed.err = e;
-                                            ed.name = allocator.dupe(u8, item.name) catch null;
-                                            ed.version = allocator.dupe(u8, item.spec) catch null;
-                                        }
-                                    }
-                                    continue;
+                        }
+                        merged_npm += 1;
+                    } else if (jsr_ready) {
+                        one_jsr: {
+                            const jsr_results = jsr_results_wave.?;
+                            const ji = merged_jsr;
+                            const pi = jsr_indices.items[ji];
+                            const res = jsr_results[ji];
+                            const item = to_process.items[pi];
+                        if (res.err) |e| {
+                            if (reporter) |r| if (r.onResolveFailure) |cb| cb(r.ctx);
+                            logInstallFailure("[shu install] failed: {s}@{s} (JSR resolve): {s}\n", .{ item.name, item.spec, @errorName(e) });
+                            if (first_error == null) {
+                                first_error = map_install_err(e);
+                                if (error_detail) |ed| {
+                                    ed.err = e;
+                                    ed.name = allocator.dupe(u8, item.name) catch null;
+                                    ed.version = allocator.dupe(u8, item.spec) catch null;
                                 }
-                                const version_owned = if (resolved.get(item.name)) |ver|
-                                    try allocator.dupe(u8, ver)
-                                else
-                                    try allocator.dupe(u8, res.version);
-                                if (resolved.getPtr(item.name)) |vptr| {
-                                    allocator.free(vptr.*);
-                                    vptr.* = version_owned;
-                                } else {
-                                    const resolved_key = allocator.dupe(u8, item.name) catch {
-                                        allocator.free(version_owned);
-                                        if (first_error == null) first_error = error.OutOfMemory;
-                                        continue;
-                                    };
-                                    resolved.put(resolved_key, version_owned) catch {
-                                        allocator.free(resolved_key);
-                                        allocator.free(version_owned);
-                                        if (first_error == null) first_error = error.OutOfMemory;
-                                        continue;
-                                    };
-                                }
-                                var dep_names = std.ArrayListUnmanaged([]const u8).initCapacity(allocator, 0) catch {
-                                    if (first_error == null) first_error = error.OutOfMemory;
-                                    continue;
-                                };
-                                // 若本迭代因 try 返回或异常路径离开且未并入 deps_of，errdefer 统一释放，避免 GPA 泄漏；break :merge_jsr 时已在 catch 里释放，用 freed_in_catch 避免重复释放
-                                var merged_into_deps = false;
-                                var freed_in_catch = false;
-                                errdefer if (!merged_into_deps and !freed_in_catch) {
-                                    for (dep_names.items) |p| allocator.free(p);
-                                    dep_names.deinit(allocator);
-                                };
-                                // 用块与 break :merge_jsr 保证：内层 catch 里 deinit dep_names 后必须跳过当前项的 name_key/deps_of.put，否则下一轮 dep_entry 会 use-after-free 且本项分配会泄漏
-                                merge_jsr: {
-                                    if (res.imports) |imports| {
-                                        for (imports) |dep_entry| {
-                                            const dep_name_dup = allocator.dupe(u8, dep_entry.name) catch {
-                                                for (dep_names.items) |p| allocator.free(p);
-                                                dep_names.deinit(allocator);
-                                                freed_in_catch = true;
-                                                if (first_error == null) first_error = error.OutOfMemory;
-                                                break :merge_jsr;
-                                            };
-                                            dep_names.append(allocator, dep_name_dup) catch {
-                                                allocator.free(dep_name_dup);
-                                                for (dep_names.items) |p| allocator.free(p);
-                                                dep_names.deinit(allocator);
-                                                freed_in_catch = true;
-                                                if (first_error == null) first_error = error.OutOfMemory;
-                                                break :merge_jsr;
-                                            };
-                                            if (!resolved.contains(dep_entry.name)) {
-                                                const tp_name = allocator.dupe(u8, dep_entry.name) catch {
-                                                    for (dep_names.items) |p| allocator.free(p);
-                                                    dep_names.deinit(allocator);
-                                                    freed_in_catch = true;
-                                                    if (first_error == null) first_error = error.OutOfMemory;
-                                                    break :merge_jsr;
-                                                };
-                                                const tp_spec = allocator.dupe(u8, dep_entry.spec) catch {
-                                                    allocator.free(tp_name);
-                                                    for (dep_names.items) |p| allocator.free(p);
-                                                    dep_names.deinit(allocator);
-                                                    freed_in_catch = true;
-                                                    if (first_error == null) first_error = error.OutOfMemory;
-                                                    break :merge_jsr;
-                                                };
-                                                to_process.append(allocator, .{
-                                                    .name = tp_name,
-                                                    .spec = tp_spec,
-                                                    .display_name = null,
-                                                    .is_jsr = dep_entry.is_jsr,
-                                                }) catch {
-                                                    allocator.free(tp_name);
-                                                    allocator.free(tp_spec);
-                                                    for (dep_names.items) |p| allocator.free(p);
-                                                    dep_names.deinit(allocator);
-                                                    freed_in_catch = true;
-                                                    if (first_error == null) first_error = error.OutOfMemory;
-                                                    break :merge_jsr;
-                                                };
-                                            }
-                                        }
-                                    }
-                                    const name_key = allocator.dupe(u8, item.name) catch {
+                            }
+                            break :one_jsr;
+                        }
+                        const version_owned = if (resolved.get(item.name)) |ver|
+                            try allocator.dupe(u8, ver)
+                        else
+                            try allocator.dupe(u8, res.version);
+                        if (resolved.getPtr(item.name)) |vptr| {
+                            allocator.free(vptr.*);
+                            vptr.* = version_owned;
+                        } else {
+                            const resolved_key = allocator.dupe(u8, item.name) catch {
+                                allocator.free(version_owned);
+                                if (first_error == null) first_error = error.OutOfMemory;
+                                break :one_jsr;
+                            };
+                            resolved.put(resolved_key, version_owned) catch {
+                                allocator.free(resolved_key);
+                                allocator.free(version_owned);
+                                if (first_error == null) first_error = error.OutOfMemory;
+                                break :one_jsr;
+                            };
+                        }
+                        var dep_names = std.ArrayListUnmanaged([]const u8).initCapacity(allocator, 0) catch {
+                            if (first_error == null) first_error = error.OutOfMemory;
+                            break :one_jsr;
+                        };
+                        // 若本迭代因 try 返回或异常路径离开且未并入 deps_of，errdefer 统一释放，避免 GPA 泄漏；break :merge_jsr 时已在 catch 里释放，用 freed_in_catch 避免重复释放
+                        var merged_into_deps = false;
+                        var freed_in_catch = false;
+                        errdefer if (!merged_into_deps and !freed_in_catch) {
+                            for (dep_names.items) |p| allocator.free(p);
+                            dep_names.deinit(allocator);
+                        };
+                        // 用块与 break :merge_jsr 保证：内层 catch 里 deinit dep_names 后必须跳过当前项的 name_key/deps_of.put，否则下一轮 dep_entry 会 use-after-free 且本项分配会泄漏
+                        merge_jsr: {
+                            if (res.imports) |imports| {
+                                for (imports) |dep_entry| {
+                                    const dep_name_dup = allocator.dupe(u8, dep_entry.name) catch {
                                         for (dep_names.items) |p| allocator.free(p);
                                         dep_names.deinit(allocator);
                                         freed_in_catch = true;
                                         if (first_error == null) first_error = error.OutOfMemory;
                                         break :merge_jsr;
                                     };
-                                    // 同一包名可能多轮出现，fetchPut 只更新 value 不替换 key，返回的旧 key 仍在 map 中，不能 free
-                                    const old_kv = deps_of.fetchPut(allocator, name_key, dep_names) catch {
-                                        allocator.free(name_key);
+                                    dep_names.append(allocator, dep_name_dup) catch {
+                                        allocator.free(dep_name_dup);
                                         for (dep_names.items) |p| allocator.free(p);
                                         dep_names.deinit(allocator);
                                         freed_in_catch = true;
                                         if (first_error == null) first_error = error.OutOfMemory;
                                         break :merge_jsr;
                                     };
-                                    if (old_kv) |kv| {
-                                        allocator.free(name_key); // map 保留旧 key，本次 dupe 的 key 未写入，须释放防泄漏
-                                        var old_list = kv.value; // 拷贝出 value 以便 deinit（fetchPut 返回 const）
-                                        for (old_list.items) |p| allocator.free(p);
-                                        old_list.deinit(allocator);
-                                        // 不释放 kv.key：fetchPut 仅更新 value，key 仍由 map 持有，defer 中会统一 free
-                                    }
-                                    merged_into_deps = true;
-                                    if (a.dupe(u8, item.name)) |jsr_key| {
-                                        _ = jsr_packages.put(jsr_key, {}) catch a.free(jsr_key);
-                                    } else |_| {}
-                                    if (reporter) |r| {
-                                        if (r.resolving_progress != null) {
-                                            resolving_emitted = true;
-                                        } else if (r.onResolving) |cb| {
-                                            resolving_emitted = true;
-                                            resolved_count += 1;
-                                            cb(r.ctx, item.display_name orelse item.name, resolved_count, to_process.items.len);
-                                        }
+                                    if (!resolved.contains(dep_entry.name)) {
+                                        const tp_name = allocator.dupe(u8, dep_entry.name) catch {
+                                            for (dep_names.items) |p| allocator.free(p);
+                                            dep_names.deinit(allocator);
+                                            freed_in_catch = true;
+                                            if (first_error == null) first_error = error.OutOfMemory;
+                                            break :merge_jsr;
+                                        };
+                                        const tp_spec = allocator.dupe(u8, dep_entry.spec) catch {
+                                            allocator.free(tp_name);
+                                            for (dep_names.items) |p| allocator.free(p);
+                                            dep_names.deinit(allocator);
+                                            freed_in_catch = true;
+                                            if (first_error == null) first_error = error.OutOfMemory;
+                                            break :merge_jsr;
+                                        };
+                                        to_process.append(allocator, .{
+                                            .name = tp_name,
+                                            .spec = tp_spec,
+                                            .display_name = null,
+                                            .is_jsr = dep_entry.is_jsr,
+                                        }) catch {
+                                            allocator.free(tp_name);
+                                            allocator.free(tp_spec);
+                                            for (dep_names.items) |p| allocator.free(p);
+                                            dep_names.deinit(allocator);
+                                            freed_in_catch = true;
+                                            if (first_error == null) first_error = error.OutOfMemory;
+                                            break :merge_jsr;
+                                        };
+                                        if (reporter) |r| if (r.resolving_progress) |p| p.total.store(total_resolve_tasks + (to_process.items.len - resolution_idx), .monotonic);
                                     }
                                 }
                             }
+                            const name_key = allocator.dupe(u8, item.name) catch {
+                                for (dep_names.items) |p| allocator.free(p);
+                                dep_names.deinit(allocator);
+                                freed_in_catch = true;
+                                if (first_error == null) first_error = error.OutOfMemory;
+                                break :merge_jsr;
+                            };
+                            // 同一包名可能多轮出现，fetchPut 只更新 value 不替换 key，返回的旧 key 仍在 map 中，不能 free
+                            const old_kv = deps_of.fetchPut(allocator, name_key, dep_names) catch {
+                                allocator.free(name_key);
+                                for (dep_names.items) |p| allocator.free(p);
+                                dep_names.deinit(allocator);
+                                freed_in_catch = true;
+                                if (first_error == null) first_error = error.OutOfMemory;
+                                break :merge_jsr;
+                            };
+                            if (old_kv) |kv| {
+                                allocator.free(name_key); // map 保留旧 key，本次 dupe 的 key 未写入，须释放防泄漏
+                                var old_list = kv.value; // 拷贝出 value 以便 deinit（fetchPut 返回 const）
+                                for (old_list.items) |p| allocator.free(p);
+                                old_list.deinit(allocator);
+                                // 不释放 kv.key：fetchPut 仅更新 value，key 仍由 map 持有，defer 中会统一 free
+                            }
+                            merged_into_deps = true;
+                            if (a.dupe(u8, item.name)) |jsr_key| {
+                                _ = jsr_packages.put(jsr_key, {}) catch a.free(jsr_key);
+                            } else |_| {}
+                            if (reporter) |r| {
+                                if (r.resolving_progress != null) {
+                                    resolving_emitted = true;
+                                } else if (r.onResolving) |cb| {
+                                    resolving_emitted = true;
+                                    resolved_count += 1;
+                                    cb(r.ctx, item.display_name orelse item.name, resolved_count, to_process.items.len);
+                                }
+                            }
+                        }
+                        }
+                        merged_jsr += 1;
+                    } else {
+                        std.Thread.yield() catch {};
+                    }
+                }
+                for (npm_threads.items) |t| t.join();
+                for (jsr_threads.items) |th| th.join();
+
+                if (npm_work_items) |work_items| {
+                    for (work_items) |wi| allocator.free(wi.registry_url);
+                    allocator.free(work_items);
+                    allocator.free(npm_results_slice.?);
+                    if (result_ready_npm_slice) |r| allocator.free(r);
+                }
+                if (jsr_results_wave) |jsr_results| {
                     allocator.free(jsr_items_buf_wave.?);
                     allocator.free(jsr_results);
+                    if (result_ready_jsr_slice) |r| allocator.free(r);
                 }
             } // wave_parallel
         }
