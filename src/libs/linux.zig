@@ -69,7 +69,7 @@ const ThreadLocalSlotCache = struct {
     }
 
     fn refill(self: *ThreadLocalSlotCache) void {
-        const batch = self.io.popFreeSlotBatch(self.stack[self.len..][0 .. @min(SLOT_CACHE_BATCH, SLOT_CACHE_STACK_SIZE - self.len)]);
+        const batch = self.io.popFreeSlotBatch(self.stack[self.len..][0..@min(SLOT_CACHE_BATCH, SLOT_CACHE_STACK_SIZE - self.len)]);
         self.len += batch;
     }
 
@@ -155,7 +155,7 @@ pub const HighPerfIO = struct {
     /// 初始化 Linux I/O 子系统：优先尝试 SQPOLL（0 syscall），无权限时优雅降级为标准轮询并打 performance-hint
     pub fn init(allocator: std.mem.Allocator, options: api.InitOptions) !HighPerfIO {
         const entries: u16 = @intCast(std.math.min(options.max_connections * 2, 4096));
-        
+
         // 性能增强标志（00 §3.1）：
         // - IORING_SETUP_SQPOLL: 内核线程轮询，减少 syscall
         // - IORING_SETUP_SINGLE_ISSUER: 限制单线程提交，减少内核锁（适合 Thread-per-Core）
@@ -163,16 +163,16 @@ pub const HighPerfIO = struct {
         // - IORING_SETUP_TASKRUN_FLAG: 配合 COOP_TASKRUN 使用（5.19+）
         // - IORING_SETUP_DEFER_TASKRUN: 推迟任务运行至 enter，极大降低高并发下处理开销（6.1+）
         const IORING_SETUP_DEFER_TASKRUN: u32 = 1 << 13;
-        const perf_flags = linux.IORING_SETUP_SQPOLL | 
-                           linux.IORING_SETUP_SINGLE_ISSUER |
-                           linux.IORING_SETUP_COOP_TASKRUN |
-                           linux.IORING_SETUP_TASKRUN_FLAG |
-                           IORING_SETUP_DEFER_TASKRUN;
+        const perf_flags = linux.IORING_SETUP_SQPOLL |
+            linux.IORING_SETUP_SINGLE_ISSUER |
+            linux.IORING_SETUP_COOP_TASKRUN |
+            linux.IORING_SETUP_TASKRUN_FLAG |
+            IORING_SETUP_DEFER_TASKRUN;
 
         var params = std.mem.zeroInit(linux.io_uring_params, .{
-            .flags = perf_flags | 
-                     (if (options.linux_sq_thread_cpu != null) linux.IORING_SETUP_SQ_AFF else 0) |
-                     (if (options.linux_attach_wq_fd != null) linux.IORING_SETUP_ATTACH_WQ else 0),
+            .flags = perf_flags |
+                (if (options.linux_sq_thread_cpu != null) linux.IORING_SETUP_SQ_AFF else 0) |
+                (if (options.linux_attach_wq_fd != null) linux.IORING_SETUP_ATTACH_WQ else 0),
             .sq_thread_idle = 1000,
             .sq_thread_cpu = options.linux_sq_thread_cpu orelse 0,
             .wq_fd = @intCast(options.linux_attach_wq_fd orelse 0),
@@ -290,7 +290,7 @@ pub const HighPerfIO = struct {
         if (self.registered_fds.len > 0) return error.AlreadyRegistered;
         const reg_fds = try self.allocator.dupe(i32, fds);
         errdefer self.allocator.free(reg_fds);
-        
+
         const ret = linux.syscall4(
             linux.SYS.io_uring_register,
             @as(usize, @intCast(self.ring.fd)),
@@ -417,14 +417,14 @@ pub const HighPerfIO = struct {
         const gid = if (group_id < MAX_BUFFER_GROUPS) group_id else BUFFER_GROUP_ID_DEFAULT;
         const idx = self.slot_cache.take() orelse return;
         self.slot_data.set(idx, .{ .tag = .accept, .listen_fd = listen_fd, .caller_user_data = user_data, .accept_group_id = gid });
-        
+
         const sqe = self.ring.get_sqe() catch {
             @branchHint(.cold);
             self.slot_data.set(idx, .{ .tag = .free });
             self.slot_cache.release(idx);
             return;
         };
-        
+
         // IORING_OP_ACCEPT
         sqe.opcode = .ACCEPT;
         sqe.user_data = @intCast(idx);
@@ -432,7 +432,7 @@ pub const HighPerfIO = struct {
         sqe.off = 0;
         sqe.len = 0;
         sqe.accept_flags = posix.SOCK.NONBLOCK;
-        
+
         // 若 listen_fd 已在固定表（0..31），使用 IOSQE_FIXED_FILE
         if (self.findRegisteredFileIndex(listen_fd)) |reg_idx| {
             sqe.fd = @intCast(reg_idx);
@@ -455,21 +455,21 @@ pub const HighPerfIO = struct {
         const gid = if (group_id < MAX_BUFFER_GROUPS) group_id else BUFFER_GROUP_ID_DEFAULT;
         const idx = self.slot_cache.take() orelse return;
         self.slot_data.set(idx, .{ .tag = .accept, .listen_fd = listen_fd, .caller_user_data = user_data, .accept_group_id = gid });
-        
+
         const sqe = self.ring.get_sqe() catch {
             @branchHint(.cold);
             self.slot_data.set(idx, .{ .tag = .free });
             self.slot_cache.release(idx);
             return;
         };
-        
+
         sqe.opcode = .ACCEPT;
         sqe.user_data = @intCast(idx);
         sqe.addr = 0;
         sqe.off = 0;
         sqe.len = 0;
         sqe.accept_flags = posix.SOCK.NONBLOCK;
-        
+
         if (self.findRegisteredFileIndex(listen_fd)) |reg_idx| {
             sqe.fd = @intCast(reg_idx);
             sqe.flags |= linux.IOSQE_FIXED_FILE;
@@ -556,7 +556,7 @@ pub const HighPerfIO = struct {
         const grp = &self.groups[gid];
         self.slot_data.set(idx, .{ .tag = .free });
         self.slot_cache.release(idx);
-        
+
         const res = cqe.res;
         if (res < 0) {
             @branchHint(.cold);
@@ -571,17 +571,12 @@ pub const HighPerfIO = struct {
 
         const chunk_len = if (grp.chunk_count > 0) grp.chunk_size else CHUNK_SIZE;
         const recv_gid = if (grp.chunk_count > 0) gid else BUFFER_GROUP_ID_DEFAULT;
-        
+
         // 如果使用了固定槽位，res 往往是 0（或者 fd）；我们记录该 client 的固定索引
         const client_is_fixed = (self.registered_fds.len > 0);
         const client_fd: i32 = if (client_is_fixed) @intCast(32 + idx) else res;
 
-        self.slot_data.set(recv_idx, .{ 
-            .tag = .recv, 
-            .client_fd = client_fd, 
-            .caller_user_data = caller_ud, 
-            .recv_group_id = recv_gid 
-        });
+        self.slot_data.set(recv_idx, .{ .tag = .recv, .client_fd = client_fd, .caller_user_data = caller_ud, .recv_group_id = recv_gid });
 
         const sqe = self.ring.recv(
             RECV_USER_DATA_TAG | @as(u64, recv_idx),
@@ -774,7 +769,7 @@ pub const HighPerfIO = struct {
         const grp = &self.groups[gid];
         const chunk_len = if (grp.chunk_count > 0) grp.chunk_size else CHUNK_SIZE;
         self.slot_data.set(idx, .{ .tag = .conn_recv, .listen_fd = 0, .client_fd = @intCast(stream.handle), .caller_user_data = user_data, .accept_group_id = 0, .recv_group_id = gid });
-        
+
         const sqe = self.ring.recv(
             RECV_USER_DATA_TAG | @as(u64, idx),
             @intCast(stream.handle),
@@ -808,7 +803,7 @@ pub const HighPerfIO = struct {
         if (data.len == 0) return;
         const idx = self.slot_cache.take() orelse return;
         self.slot_data.set(idx, .{ .tag = .conn_send, .listen_fd = 0, .client_fd = @intCast(stream.handle), .caller_user_data = user_data, .accept_group_id = 0, .recv_group_id = 0 });
-        
+
         const sqe = self.ring.send(SEND_USER_DATA_TAG | @as(u64, idx), @intCast(stream.handle), data, 0) catch {
             @branchHint(.cold);
             self.slot_data.set(idx, .{ .tag = .free });
