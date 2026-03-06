@@ -372,7 +372,7 @@ pub fn parseHttpRequest(
     const head_for_parse: []const u8 = blk: {
         if (total_read + lane_pad <= read_buf.len) {
             @memset(read_buf[total_read..][0..lane_pad], 0);
-            break :blk @as([*]const u8, @ptrCast(read_buf.ptr))[0..total_read + lane_pad];
+            break :blk @as([*]const u8, @ptrCast(read_buf.ptr))[0 .. total_read + lane_pad];
         }
         break :blk @as([*]const u8, @ptrCast(read_buf.ptr))[0..total_read];
     };
