@@ -1,13 +1,20 @@
 //! io_core 统一文件/目录 API（file.zig）
 //!
-//! 职责
-//!   - 同步文件/目录操作：openFileAbsolute、openDirAbsolute、realpath、makeDirAbsolute、
-//!     deleteFileAbsolute、deleteDirAbsolute、renameAbsolute、accessAbsolute、createFileAbsolute、
-//!     readLinkAbsolute、symLinkAbsolute；路径字符串：pathDirname、pathBasename、pathJoin、pathResolve、
-//!     pathRelative、pathExtension、pathIsAbsolute；当前为 std.fs 薄封装，供 fs 等调用，后续可按平台特化。
-//!   - 异步文件 I/O（AsyncFileIO）：Linux/Darwin/Windows 三种实现均在本模块内（Linux 独立 io_uring，Darwin/Windows 工作线程 + pread/pwrite 或 ReadFile/WriteFile），按 builtin.os.tag 统一导出。
+//! 职责：
+//!   - 提供同步/异步文件与目录操作接口，封装平台差异。
+//!   - 实现多平台异步文件 I/O（`AsyncFileIO`）。
+//!   - 遵循 Zig 0.16 `std.Io` 标准库演进方向。
 //!
-//! 规范对应（§3.0）：所有文件/目录 I/O 经 io_core，fs 逐步从 std.fs 迁至本模块。
+//! 极致压榨亮点：
+//!   1. **多工作线程并行**：Darwin 与 Windows 实现内置多工作线程（基于 CPU 核数动态调整，最高 4 线程），显著提升大文件吞吐量。
+//!   2. **Linux 零拷贝与 SQPOLL**：Linux 版通过独立 `io_uring` 环实现，支持 `IORING_SETUP_SQPOLL`（0 系统调用提交）与 `O_DIRECT`。
+//!   3. **高效任务调度**：内置 `FileJobRing` 环形队列，实现工作线程间任务派发的 O(1) 性能。
+//!   4. **窄化错误处理**：针对文件读取设计了 `ReadReaderUpToError`，优化跳转表生成（01 §2.1）。
+//!
+//! 适用规范：
+//!   - 遵循 00 §3.0（所有文件/目录 I/O 经 libs_io）、§3.4（零拷贝）。
+//!
+//! [Allocates] 异步 I/O 实例由 `init` 创建，调用方负责 `deinit`。
 
 const std = @import("std");
 const builtin = @import("builtin");
