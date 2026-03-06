@@ -1,10 +1,20 @@
-//! 文件/目录监视 API（libs_io watch）
+//! 极致高性能文件系统监控（watch.zig）
 //!
-//! 职责：按平台提供 startWatch / drainWatchEvents / WatchHandle.deinit；
-//! 工作线程仅写事件队列，主线程在 drain 中取事件并回调 JS，禁止在非主线程使用 JSC（与 dns 一致）。
-//! 平台分派：comptime switch(builtin.os.tag)，无运行时分支（00 §2.2、§4.4）。
+//! 职责：
+//!   - 提供全平台文件/目录变化监听，防止在高频变化场景下「冻结」或「事件丢失」。
+//!   - 实现基于内核事件机制（inotify, FSEvents, ReadDirectoryChangesW）的异步分发。
 //!
-//! 平台：Linux => inotify；Darwin/BSD => kqueue EVFILT_VNODE；Windows => ReadDirectoryChangesW。
+//! 极致压榨亮点：
+//!   1. **全链路无锁分发**：使用自定义 SPSC（单生产者单消费者）无锁环形队列 `WatchEventQueue` 替代 Mutex，消除事件采集与消费间的上下文切换。
+//!   2. **硬件级伪共享隔离**：`closed` 状态与事件队列按 `std.atomic.cache_line` 对齐并隔离，避免多核间的缓存行竞争。
+//!   3. **批量事件提取**：提供 `drainWatchEventsBatch` 接口，支持一次性原子拉取数千个事件，压榨 I/O 指令吞吐。
+//!   4. **动态读取缓冲增强**：Linux/Windows 版采用 64KB 物理对齐的内核读取缓冲区，确保在极端突发流量下不丢失任何内核事件。
+//!   5. **低功耗工作模式**：Linux 工作线程采用阻塞式 `read` 与信号中断机制，在低频触发时实现 0 CPU 占用。
+//!
+//! 适用规范：
+//!   - 遵循 00 §3.5（无锁环形缓冲区）、§5.3（伪共享防御）。
+//!
+//! [Allocates] 监控句柄由 `init` 创建，调用方负责 `deinit`。
 
 const std = @import("std");
 const builtin = @import("builtin");
