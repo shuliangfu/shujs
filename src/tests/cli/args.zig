@@ -43,7 +43,7 @@ test "args.parse: --help sets help" {
 }
 
 test "args.parse: -h sets help" {
-    const argv = [_][]const u8{ "-h" };
+    const argv = [_][]const u8{"-h"};
     const result = args.parse(&argv);
     try std.testing.expect(result.parsed.help);
     try std.testing.expect(result.positional.len == 0);
@@ -67,7 +67,7 @@ test "args.parse: --allow-net" {
 }
 
 test "args.parse: --allow-read" {
-    const argv = [_][]const u8{ "--allow-read" };
+    const argv = [_][]const u8{"--allow-read"};
     const result = args.parse(&argv);
     try std.testing.expect(result.parsed.allow_read);
     try std.testing.expect(result.positional.len == 0);
@@ -81,25 +81,25 @@ test "args.parse: --allow-env" {
 }
 
 test "args.parse: --allow-write" {
-    const argv = [_][]const u8{ "--allow-write" };
+    const argv = [_][]const u8{"--allow-write"};
     const result = args.parse(&argv);
     try std.testing.expect(result.parsed.allow_write);
 }
 
 test "args.parse: --allow-run" {
-    const argv = [_][]const u8{ "--allow-run" };
+    const argv = [_][]const u8{"--allow-run"};
     const result = args.parse(&argv);
     try std.testing.expect(result.parsed.allow_run);
 }
 
 test "args.parse: --allow-hrtime" {
-    const argv = [_][]const u8{ "--allow-hrtime" };
+    const argv = [_][]const u8{"--allow-hrtime"};
     const result = args.parse(&argv);
     try std.testing.expect(result.parsed.allow_hrtime);
 }
 
 test "args.parse: --allow-ffi" {
-    const argv = [_][]const u8{ "--allow-ffi" };
+    const argv = [_][]const u8{"--allow-ffi"};
     const result = args.parse(&argv);
     try std.testing.expect(result.parsed.allow_ffi);
 }
@@ -117,7 +117,7 @@ test "args.parse: --allow-all sets all permissions" {
 }
 
 test "args.parse: --all sets all permissions" {
-    const argv = [_][]const u8{ "--all" };
+    const argv = [_][]const u8{"--all"};
     const result = args.parse(&argv);
     try std.testing.expect(result.parsed.allow_net);
     try std.testing.expect(result.parsed.allow_ffi);
