@@ -256,7 +256,10 @@ fn createListenFdsReusePort(
 /// I/O 线程主循环：绑核 → poll → 完成项入 ring_to_js → drain ring_from_js 执行 work → 补 accept
 fn ioThreadLoop(ctx: *IoThreadCtx, poll_timeout_ns: i64) void {
     if (builtin.os.tag == .linux) {
-        const c = @cImport({ @cDefine("_GNU_SOURCE", "1"); @cInclude("sched.h"); });
+        const c = @cImport({
+            @cDefine("_GNU_SOURCE", "1");
+            @cInclude("sched.h");
+        });
         var cpu_set: c.cpu_set_t = undefined;
         c.CPU_ZERO(&cpu_set);
         c.CPU_SET(@intCast(ctx.thread_index), &cpu_set);
