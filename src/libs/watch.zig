@@ -62,6 +62,33 @@ const Spinlock = struct {
     }
 };
 
+/// 通用事件队列：无锁环形队列替代 ArrayList.orderedRemove(0) 以压榨 drain 性能（00 §3.5、§5.3）
+/// 由于 WatchEvent 含有切片，不适合 RingBuffer(T)，故用 Mutex 保护的循环队列
+fn WatchEventRing(comptime CAP: usize) type {
+    return struct {
+        buf: [CAP]WatchEvent = undefined,
+        head: usize = 0,
+        len: usize = 0,
+
+        fn readItem(self: *@This()) ?WatchEvent {
+            if (self.len == 0) return null;
+            const i = self.head;
+            self.head = (self.head + 1) % CAP;
+            self.len -= 1;
+            return self.buf[i];
+        }
+        fn writeItem(self: *@This(), item: WatchEvent) bool {
+            if (self.len >= CAP) return false;
+            const tail = (self.head + self.len) % CAP;
+            self.buf[tail] = item;
+            self.len += 1;
+            return true;
+        }
+    };
+}
+
+const WATCH_EVENT_CAP = 256;
+
 /// Linux inotify 句柄；closed 与 event_mutex 缓存行隔离，减少主/工作线程 false sharing（00 §5.3）
 const WatchHandleLinux = struct {
     closed: std.atomic.Value(bool),
@@ -70,7 +97,7 @@ const WatchHandleLinux = struct {
     fd: std.posix.fd_t,
     wd: i32,
     allocator: std.mem.Allocator,
-    event_queue: std.ArrayListUnmanaged(WatchEvent) = .{},
+    event_ring: WatchEventRing(WATCH_EVENT_CAP) = .{},
     event_mutex: Spinlock = .{},
     thread: std.Thread = undefined,
     thread_started: bool = false,
@@ -108,14 +135,14 @@ const WatchHandleLinux = struct {
 
                 self.event_mutex.lock();
                 defer self.event_mutex.unlock();
-                self.event_queue.append(self.allocator, .{ .event_type = event_type, .filename = filename_owned }) catch {
+                if (!self.event_ring.writeItem(.{ .event_type = event_type, .filename = filename_owned })) {
                     self.allocator.free(filename_owned);
-                };
+                }
             }
         }
     }
 
-    /// 置 closed、移除 watch、join 线程、释放 event_queue 及其中 filename；idempotent
+    /// 置 closed、移除 watch、join 线程、释放 event_ring 及其中 filename；idempotent
     fn deinit(self: *WatchHandleLinux) void {
         self.closed.store(true, .release);
         if (self.fd != std.posix.INVALID_FD) {
@@ -126,8 +153,9 @@ const WatchHandleLinux = struct {
         if (self.thread_started) self.thread.join();
         self.event_mutex.lock();
         defer self.event_mutex.unlock();
-        for (self.event_queue.items) |e| if (e.filename.len > 0) self.allocator.free(e.filename);
-        self.event_queue.deinit(self.allocator);
+        while (self.event_ring.readItem()) |e| {
+            if (e.filename.len > 0) self.allocator.free(e.filename);
+        }
     }
 };
 
@@ -148,7 +176,7 @@ const WatchHandleDarwin = struct {
     path_fd: posix.fd_t,
     kq_fd: posix.fd_t,
     allocator: std.mem.Allocator,
-    event_queue: std.ArrayListUnmanaged(WatchEvent) = .{},
+    event_ring: WatchEventRing(WATCH_EVENT_CAP) = .{},
     event_mutex: Spinlock = .{},
     thread: std.Thread = undefined,
     thread_started: bool = false,
@@ -175,11 +203,13 @@ const WatchHandleDarwin = struct {
             const filename_empty = self.allocator.dupe(u8, &.{}) catch continue;
             self.event_mutex.lock();
             defer self.event_mutex.unlock();
-            self.event_queue.append(self.allocator, .{ .event_type = ev_type, .filename = filename_empty }) catch self.allocator.free(filename_empty);
+            if (!self.event_ring.writeItem(.{ .event_type = ev_type, .filename = filename_empty })) {
+                self.allocator.free(filename_empty);
+            }
         }
     }
 
-    /// 置 closed、关闭 path_fd/kq_fd、join 线程、释放 event_queue 及其中 filename；idempotent
+    /// 置 closed、关闭 path_fd/kq_fd、join 线程、释放 event_ring 及其中 filename；idempotent
     fn deinit(self: *WatchHandleDarwin) void {
         self.closed.store(true, .release);
         if (self.path_fd != -1) {
@@ -193,8 +223,9 @@ const WatchHandleDarwin = struct {
         if (self.thread_started) self.thread.join();
         self.event_mutex.lock();
         defer self.event_mutex.unlock();
-        for (self.event_queue.items) |e| if (e.filename.len > 0) self.allocator.free(e.filename);
-        self.event_queue.deinit(self.allocator);
+        while (self.event_ring.readItem()) |e| {
+            if (e.filename.len > 0) self.allocator.free(e.filename);
+        }
     }
 };
 
@@ -234,7 +265,7 @@ fn startWatchDarwin(allocator: std.mem.Allocator, path_abs: []const u8) WatchErr
         .path_fd = path_fd,
         .kq_fd = kq_fd,
         .allocator = allocator,
-        .event_queue = .{},
+        .event_ring = .{},
         .event_mutex = .{},
         .thread = undefined,
         .thread_started = false,
@@ -257,7 +288,7 @@ const WatchHandleWindows = struct {
     _pad: [CACHE_LINE_BYTES - @sizeOf(std.atomic.Value(bool))]u8 = undefined,
     dir_handle: std.os.windows.HANDLE,
     allocator: std.mem.Allocator,
-    event_queue: std.ArrayListUnmanaged(WatchEvent) = .{},
+    event_ring: WatchEventRing(WATCH_EVENT_CAP) = .{},
     event_mutex: Spinlock = .{},
     thread: std.Thread = undefined,
     thread_started: bool = false,
@@ -300,14 +331,16 @@ const WatchHandleWindows = struct {
                 } else self.allocator.dupe(u8, &.{}) catch continue;
                 self.event_mutex.lock();
                 defer self.event_mutex.unlock();
-                self.event_queue.append(self.allocator, .{ .event_type = event_type, .filename = filename_owned }) catch self.allocator.free(filename_owned);
+                if (!self.event_ring.writeItem(.{ .event_type = event_type, .filename = filename_owned })) {
+                    self.allocator.free(filename_owned);
+                }
                 if (info.NextEntryOffset == 0) break;
                 off += info.NextEntryOffset;
             }
         }
     }
 
-    /// 置 closed、CloseHandle(dir_handle)、join 线程、释放 event_queue 及其中 filename；idempotent
+    /// 置 closed、CloseHandle(dir_handle)、join 线程、释放 event_ring 及其中 filename；idempotent
     fn deinit(self: *WatchHandleWindows) void {
         self.closed.store(true, .release);
         if (self.dir_handle != std.os.windows.INVALID_HANDLE_VALUE) {
@@ -317,8 +350,9 @@ const WatchHandleWindows = struct {
         if (self.thread_started) self.thread.join();
         self.event_mutex.lock();
         defer self.event_mutex.unlock();
-        for (self.event_queue.items) |e| if (e.filename.len > 0) self.allocator.free(e.filename);
-        self.event_queue.deinit(self.allocator);
+        while (self.event_ring.readItem()) |e| {
+            if (e.filename.len > 0) self.allocator.free(e.filename);
+        }
     }
 };
 
@@ -354,7 +388,7 @@ fn startWatchWindows(allocator: std.mem.Allocator, path_abs: []const u8) WatchEr
         ._pad = undefined,
         .dir_handle = dir_handle,
         .allocator = allocator,
-        .event_queue = .{},
+        .event_ring = .{},
         .event_mutex = .{},
         .thread = undefined,
         .thread_started = false,
@@ -426,7 +460,7 @@ fn startWatchLinux(allocator: std.mem.Allocator, path_abs: []const u8) WatchErro
         .fd = fd,
         .wd = wd,
         .allocator = allocator,
-        .event_queue = .{},
+        .event_ring = .{},
         .event_mutex = .{},
         .thread = undefined,
         .thread_started = false,
@@ -450,19 +484,19 @@ pub fn drainWatchEvents(handle: *WatchHandle) ?WatchEvent {
             const inner = @as(*WatchHandleLinux, @ptrCast(@alignCast(handle)));
             inner.event_mutex.lock();
             defer inner.event_mutex.unlock();
-            break :blk if (inner.event_queue.items.len > 0) inner.event_queue.orderedRemove(0) else null;
+            break :blk inner.event_ring.readItem();
         },
         .macos, .freebsd, .netbsd, .openbsd => blk: {
             const inner = @as(*WatchHandleDarwin, @ptrCast(@alignCast(handle)));
             inner.event_mutex.lock();
             defer inner.event_mutex.unlock();
-            break :blk if (inner.event_queue.items.len > 0) inner.event_queue.orderedRemove(0) else null;
+            break :blk inner.event_ring.readItem();
         },
         .windows => blk: {
             const inner = @as(*WatchHandleWindows, @ptrCast(@alignCast(handle)));
             inner.event_mutex.lock();
             defer inner.event_mutex.unlock();
-            break :blk if (inner.event_queue.items.len > 0) inner.event_queue.orderedRemove(0) else null;
+            break :blk inner.event_ring.readItem();
         },
         else => null,
     };
