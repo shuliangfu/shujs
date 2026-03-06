@@ -184,7 +184,7 @@ const WatchHandleLinux = struct {
             self.fd = std.posix.INVALID_FD;
         }
         if (self.thread_started) self.thread.join();
-        
+
         // 清理未被 drain 的残留内存
         while (self.event_queue.pop()) |e| {
             if (e.filename.len > 0) self.allocator.free(e.filename);
@@ -230,10 +230,10 @@ const WatchHandleDarwin = struct {
             if (self.closed.load(.acquire)) break;
             const n = std.c.kevent(self.kq_fd, dummy_changelist[0..].ptr, 0, ev_list[0..].ptr, 1, null);
             if (n <= 0) break;
-            
+
             const fflags = ev_list[0].fflags;
             const ev_type: WatchEventType = if (fflags & (NOTE_DELETE | NOTE_RENAME) != 0) .rename else .change;
-            
+
             // Darwin vnode 监视不直接返回文件名，由 JS 层按需读取或全量扫描 (TODO: 目录监视增强)
             const filename_empty = self.allocator.dupe(u8, &.{}) catch continue;
             if (!self.event_queue.push(.{ .event_type = ev_type, .filename = filename_empty })) {
@@ -345,19 +345,19 @@ const WatchHandleWindows = struct {
                 null,
             );
             if (ok == 0 or bytes_read == 0) break;
-            
+
             var off: usize = 0;
             while (off + @sizeOf(win.FILE_NOTIFY_INFORMATION) <= bytes_read) {
                 const info = @as(*const win.FILE_NOTIFY_INFORMATION, @ptrCast(&buf[off]));
                 const name_len = info.FileNameLength;
                 const action = info.Action;
                 const event_type: WatchEventType = if (action == win.FILE_ACTION_RENAMED_OLD_NAME or action == win.FILE_ACTION_RENAMED_NEW_NAME or action == win.FILE_ACTION_REMOVED or action == win.FILE_ACTION_ADDED) .rename else .change;
-                
+
                 const name_utf16 = if (name_len > 0 and off + @sizeOf(win.FILE_NOTIFY_INFORMATION) + name_len <= bytes_read)
                     @as([*]const u16, @ptrCast(&buf[off + @sizeOf(win.FILE_NOTIFY_INFORMATION)]))[0 .. name_len / 2]
                 else
                     &[_]u16{};
-                
+
                 // 将 UTF-16 转换为 UTF-8
                 const filename_owned = if (name_utf16.len > 0) blk: {
                     const utf8_len = std.unicode.utf16CountUtf8Bytes(name_utf16) catch break :blk self.allocator.dupe(u8, &.{}) catch continue;
@@ -365,7 +365,7 @@ const WatchHandleWindows = struct {
                     _ = std.unicode.utf16ToUtf8(name_utf16, out);
                     break :blk out;
                 } else self.allocator.dupe(u8, &.{}) catch continue;
-                
+
                 if (!self.event_queue.push(.{ .event_type = event_type, .filename = filename_owned })) {
                     self.allocator.free(filename_owned);
                 }

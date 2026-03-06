@@ -32,7 +32,7 @@ pub fn findChar(block: []const u8, c: u8) usize {
     @setRuntimeSafety(false);
     const n = block.len;
     if (n == 0) return 0;
-    
+
     var i: usize = 0;
     const vc: @Vector(VECTOR_LANES, u8) = @splat(c);
     const T = std.meta.Int(.unsigned, VECTOR_LANES);
@@ -56,7 +56,7 @@ pub fn findAnyTwo(block: []const u8, c1: u8, c2: u8) usize {
     @setRuntimeSafety(false);
     const n = block.len;
     if (n == 0) return 0;
-    
+
     var i: usize = 0;
     const vc1: @Vector(VECTOR_LANES, u8) = @splat(c1);
     const vc2: @Vector(VECTOR_LANES, u8) = @splat(c2);
@@ -85,7 +85,7 @@ pub fn findCrLfPadded(block: []const u8) usize {
     const T = std.meta.Int(.unsigned, VECTOR_LANES);
     const cr: @Vector(VECTOR_LANES, u8) = @splat(0x0D);
     const lf: @Vector(VECTOR_LANES, u8) = @splat(0x0A);
-    
+
     // 盲读主循环：只要 i < n 就可以直接加载一整条向量（00 §1.6 Lane 填充）
     while (i < n) {
         const v: @Vector(VECTOR_LANES, u8) = block.ptr[i..][0..VECTOR_LANES].*;
@@ -108,7 +108,7 @@ pub fn findCrLfInBlock(block: []const u8) usize {
     @setRuntimeSafety(false);
     const n = block.len;
     if (n == 0) return 0;
-    
+
     var i: usize = 0;
     const cr: @Vector(VECTOR_LANES, u8) = @splat(0x0D);
     const lf: @Vector(VECTOR_LANES, u8) = @splat(0x0A);
@@ -137,10 +137,10 @@ pub fn scanCrLfMask(block: *const [VECTOR_LANES]u8) usize {
     const cr: @Vector(VECTOR_LANES, u8) = @splat(0x0D);
     const lf: @Vector(VECTOR_LANES, u8) = @splat(0x0A);
     const mask: @Vector(VECTOR_LANES, bool) = (v == cr) | (v == lf);
-    
+
     const T = std.meta.Int(.unsigned, VECTOR_LANES);
     const bitmap = @as(T, @bitCast(mask));
-    
+
     if (bitmap == 0) return VECTOR_LANES;
     return @ctz(bitmap);
 }
@@ -152,7 +152,7 @@ pub fn indexOfCrLfCrLfPadded(buf: []const u8) ?usize {
     @setRuntimeSafety(false);
     const n = buf.len;
     if (n < 4) return null;
-    
+
     var i: usize = 0;
     const cr: @Vector(VECTOR_LANES, u8) = @splat(0x0D);
     const lf: @Vector(VECTOR_LANES, u8) = @splat(0x0A);
@@ -164,10 +164,10 @@ pub fn indexOfCrLfCrLfPadded(buf: []const u8) ?usize {
         const v1: @Vector(VECTOR_LANES, u8) = buf.ptr[i + 1 ..][0..VECTOR_LANES].*;
         const v2: @Vector(VECTOR_LANES, u8) = buf.ptr[i + 2 ..][0..VECTOR_LANES].*;
         const v3: @Vector(VECTOR_LANES, u8) = buf.ptr[i + 3 ..][0..VECTOR_LANES].*;
-        
+
         const mask: @Vector(VECTOR_LANES, bool) = (v0 == cr) & (v1 == lf) & (v2 == cr) & (v3 == lf);
         const bitmap = @as(T, @bitCast(mask));
-        
+
         if (bitmap != 0) {
             const pos = @ctz(bitmap);
             const absolute = i + pos;
@@ -186,7 +186,7 @@ pub fn indexOfCrLfCrLf(buf: []const u8) ?usize {
     const n = buf.len;
     if (n < 4) return null;
     const pattern = [_]u8{ '\r', '\n', '\r', '\n' };
-    
+
     var i: usize = 0;
     const cr: @Vector(VECTOR_LANES, u8) = @splat(pattern[0]);
     const lf: @Vector(VECTOR_LANES, u8) = @splat(pattern[1]);
@@ -198,17 +198,17 @@ pub fn indexOfCrLfCrLf(buf: []const u8) ?usize {
         const v1: @Vector(VECTOR_LANES, u8) = buf[i + 1 ..][0..VECTOR_LANES].*;
         const v2: @Vector(VECTOR_LANES, u8) = buf[i + 2 ..][0..VECTOR_LANES].*;
         const v3: @Vector(VECTOR_LANES, u8) = buf[i + 3 ..][0..VECTOR_LANES].*;
-        
+
         // 核心：四字节对齐匹配掩码
         const mask: @Vector(VECTOR_LANES, bool) = (v0 == cr) & (v1 == lf) & (v2 == cr) & (v3 == lf);
         const bitmap = @as(T, @bitCast(mask));
-        
+
         if (bitmap != 0) {
             return i + @ctz(bitmap);
         }
         i += VECTOR_LANES;
     }
-    
+
     // 尾部标量处理
     while (i + 4 <= n) : (i += 1) {
         if (std.mem.eql(u8, buf[i..][0..4], &pattern)) return i;
