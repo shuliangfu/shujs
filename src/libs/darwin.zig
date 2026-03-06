@@ -1,39 +1,21 @@
-// macOS (Darwin) 平台 I/O 核心（darwin.zig）：kqueue 边缘触发 + sendfile 零拷贝。
-//
-// 职责
-//   - 实现 HighPerfIO：单 kqueue、预分配 buffer 池分块、accept 后对 client 做 EVFILT_READ 边缘触发，读入池中块；
-//   - 实现 sendFile：文件→网络零拷贝，BSD sendfile(file_fd, socket_fd, offset, &len, ...)，循环直至发完或错误。
-//
-// 规范对应（00-性能规则）
-//   - §4.1：I/O 多路复用用 kqueue，边缘触发 EV_CLEAR；每线程独立 kqueue；文件→网络 sendfile；
-//   - 无内核 PROVIDE_BUFFERS 等价物，采用用户态预分配池 + accept 后 read 进池，与 Linux 语义一致。
-//
-// 数据流简述
-//   - registerBufferPool：按 CHUNK_SIZE（64KB）分块，建立 free_list；
-//   - submitAcceptWithBuffer：将 (listen_fd, user_data) 加入 pending_accepts，listen_fd 首次时 kevent EV_ADD+EV_CLEAR；
-//   - pollCompletions：kevent 取事件，listen 可读时 handleListenReady（accept、取池块、对 client 注册 EVFILT_READ、写入 client_info），client 可读时 handleClientReady（read 入池块、填 completion、关闭 fd、归还块）。
-//
-// 内存与释放
-//   - 显式 allocator（§1.5）：free_list、pending_accepts、listen_fds、slot_data、free_slots、changelist 等 deinit 时释放；未完成的 client 槽位会 close(fd)。
-//
-// --- 进阶压榨（已做）---
-// 1) 批量 Kevent：changelist 累积 EV_ADD/EV_DELETE，在 pollCompletions 开头一次 kevent(changelist, events) 提交，系统调用从 O(N) 降至 O(1)。
-// 2) udata 零查找：client 用槽位索引存 ev.udata，热路径直接 slot_data[ev.udata] 取上下文，去掉 client_info HashMap。
-// 3) 边缘触发循环 accept：handleListenReady 内循环 accept 直至 EAGAIN，一次唤醒处理完所有积压连接。
-// 4) 槽位化：slot_data (SoA) + free_slots，与 Linux 版槽位模型对齐；pending_accepts 保留为列表（按 listen_fd 取一即可）。
-//
-// --- 物理极限级（最后 1%）---
-// 5) 预分配 changelist：固定 []Kevent 替代 ArrayList，消除扩容带来的延迟毛刺；容量 4*max_connections+32（含 EVFILT_READ+WRITE 双通道）。
-// 6) 单系统调用读写：kevent(kq, changelist, events) 已在一轮内完成「提交变更 + 取事件」；EV_DELETE 入 changelist 下一轮提交，无需额外 kevent。
-// 7) M 芯片 L3 友好：原 ClientSlot 32 字节对齐；可选 SoA 见下。
-//
-// --- 黑魔法级（可选，收益约 1–2%）---
-// 8) SoA：与 Linux 版对齐，使用 ClientFields + MultiArrayList；热路径只加载 client_fd 数组，缓存局部性更佳；代价为失去单槽 32 字节对齐。
-// 9) EVFILT_WRITE 预热：accept 后同时注册 EVFILT_WRITE（边缘触发 EV_CLEAR），内核在 socket 可写时即通知，sendfile 启动更早。
-// 10) M 芯片线程拓扑：setIoThreadQosUserInteractive() 在 I/O 线程调用，将当前线程设为 USER_INTERACTIVE，尽量跑在 P 核。
-//
-// --- 与 Linux 的差异 ---
-// 大页/Splice/ATTACH_WQ 为 io_uring 特性，Darwin 无直接对应。sendfile 可扩展 sf_hdtr（header+file+trailer 一次系统调用），见 sendFile 注释。
+//! macOS (Darwin) 平台 I/O 核心（darwin.zig）
+//!
+//! 职责：
+//!   - 实现 `HighPerfIO` 契约：基于 `kqueue` 边缘触发（EV_CLEAR）模型。
+//!   - 实现零拷贝 `sendFile`：基于 BSD `sendfile` 系统调用。
+//!   - 提供槽位化（Slot-based）连接管理与位图（Bitmask）快速分配。
+//!
+//! 极致压榨亮点：
+//!   1. **O(1) Accept 队列**：使用固定容量环形队列 `PendingAcceptQueue` 替代 `ArrayList`，消除连接积压时的平移开销。
+//!   2. **位图槽位分配**：`free_bitmap` 配合 `TZCNT` (@ctz) 指令，实现 O(1) 的空闲槽位查找与回收。
+//!   3. **批量 Kevent 提交**：通过 `changelist` 缓冲区在一次 `kevent` 调用中完成「变更提交 + 事件收割」。
+//!   4. **QoS 调度增强**：支持 `setIoThreadQosUserInteractive`，利用 Apple Silicon P 核处理 I/O 任务。
+//!   5. **零 fcntl 热路径**：利用监听 FD 属性继承特性，在 `accept` 后省去非阻塞设置的系统调用。
+//!
+//! 适用规范：
+//!   - 遵循 00 §4.1（macOS 低延迟优先）、§3.5（Thread-per-Core）。
+//!
+//! [Allocates] `init` 分配的资源由 `deinit` 释放。
 
 const std = @import("std");
 const builtin = @import("builtin");
