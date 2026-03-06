@@ -171,8 +171,10 @@ pub const HighPerfIO = struct {
     listen_socket: ?ws2.SOCKET = null,
     /// 槽位 SoA；completion_key 存 accept_idx，overlapped 以缓存行隔离
     slot_data: std.MultiArrayList(AcceptFields),
-    /// 空闲 accept 槽位索引（01 §1.2 Unmanaged）
-    accept_free: std.ArrayListUnmanaged(usize),
+    /// 空闲 accept 槽位位图：1=空闲 0=占用；用 @ctz 快速找空闲索引
+    accept_bitmap: []u64,
+    accept_scan_hint: usize = 0,
+    accept_free_count: usize,
 
     /// GQCSEx 预分配条目数组，一次系统调用取回多完成项
     completion_entries: []OverlappedEntry,
@@ -181,8 +183,10 @@ pub const HighPerfIO = struct {
     free_sockets: std.ArrayListUnmanaged(ws2.SOCKET),
     /// DisconnectEx 投递上下文；完成时由 lpOverlapped 判定为 disconnect 并取 socket 入 free_sockets
     disconnect_ctxs: []DisconnectCtx,
-    /// 空闲 disconnect 槽位索引（01 §1.2 Unmanaged）
-    disconnect_free: std.ArrayListUnmanaged(usize),
+    /// 空闲 disconnect 槽位位图
+    disconnect_bitmap: []u64,
+    disconnect_scan_hint: usize = 0,
+    disconnect_free_count: usize,
     /// DisconnectEx 函数指针；registerListenSocket 时通过 WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER) 加载
     disconnect_ex: ?LPFN_DISCONNECTEX = null,
     socket_reuse: bool = false,
@@ -191,8 +195,10 @@ pub const HighPerfIO = struct {
 
     /// 连接 recv/send 槽位池；completion_key = max_connections + slot_index 区分 AcceptEx
     conn_io_slots: []ConnIoSlot = undefined,
-    /// 空闲 conn_io 槽位索引（01 §1.2 Unmanaged）
-    conn_io_free: std.ArrayListUnmanaged(usize) = undefined,
+    /// 空闲 conn_io 槽位位图
+    conn_io_bitmap: []u64,
+    conn_io_scan_hint: usize = 0,
+    conn_io_free_count: usize,
 
     pub fn init(allocator: std.mem.Allocator, options: api.InitOptions) !HighPerfIO {
         const port = kernel32.CreateIoCompletionPort(win.INVALID_HANDLE_VALUE, null, 0, 0) orelse return error.SystemResources;
@@ -211,11 +217,12 @@ pub const HighPerfIO = struct {
             slot_data.appendAssumeCapacity(.{ .accept_socket = ws2.INVALID_SOCKET });
         }
 
-        var accept_free = std.ArrayListUnmanaged(usize).init(allocator);
-        errdefer accept_free.deinit(allocator);
-        try accept_free.ensureTotalCapacity(allocator, options.max_connections);
-        for (0..options.max_connections) |i| {
-            accept_free.appendAssumeCapacity(i);
+        const bitmap_words = (options.max_connections + 63) / 64;
+        const accept_bitmap = try allocator.alloc(u64, bitmap_words);
+        errdefer allocator.free(accept_bitmap);
+        @memset(accept_bitmap, std.math.maxInt(u64));
+        if (options.max_connections % 64 != 0) {
+            accept_bitmap[bitmap_words - 1] &= (1 << @as(u6, @intCast(options.max_connections % 64))) - 1;
         }
 
         const completion_entries = try allocator.alloc(OverlappedEntry, options.max_completions);
@@ -228,21 +235,21 @@ pub const HighPerfIO = struct {
         errdefer allocator.free(disconnect_ctxs);
         for (disconnect_ctxs) |*ctx| ctx.socket = ws2.INVALID_SOCKET;
 
-        var disconnect_free = std.ArrayListUnmanaged(usize).init(allocator);
-        errdefer disconnect_free.deinit(allocator);
-        try disconnect_free.ensureTotalCapacity(allocator, options.max_connections);
-        for (0..options.max_connections) |i| {
-            disconnect_free.appendAssumeCapacity(i);
+        const disconnect_bitmap = try allocator.alloc(u64, bitmap_words);
+        errdefer allocator.free(disconnect_bitmap);
+        @memset(disconnect_bitmap, std.math.maxInt(u64));
+        if (options.max_connections % 64 != 0) {
+            disconnect_bitmap[bitmap_words - 1] &= (1 << @as(u6, @intCast(options.max_connections % 64))) - 1;
         }
 
         const conn_io_slots = try allocator.alloc(ConnIoSlot, options.max_connections);
         errdefer allocator.free(conn_io_slots);
 
-        var conn_io_free = std.ArrayListUnmanaged(usize).init(allocator);
-        errdefer conn_io_free.deinit(allocator);
-        try conn_io_free.ensureTotalCapacity(allocator, options.max_connections);
-        for (0..options.max_connections) |i| {
-            conn_io_free.appendAssumeCapacity(i);
+        const conn_io_bitmap = try allocator.alloc(u64, bitmap_words);
+        errdefer allocator.free(conn_io_bitmap);
+        @memset(conn_io_bitmap, std.math.maxInt(u64));
+        if (options.max_connections % 64 != 0) {
+            conn_io_bitmap[bitmap_words - 1] &= (1 << @as(u6, @intCast(options.max_connections % 64))) - 1;
         }
 
         return .{
@@ -253,16 +260,19 @@ pub const HighPerfIO = struct {
             .max_connections = options.max_connections,
             .free_list = free_list,
             .slot_data = slot_data,
-            .accept_free = accept_free,
+            .accept_bitmap = accept_bitmap,
+            .accept_free_count = options.max_connections,
             .completion_entries = completion_entries,
             .free_sockets = free_sockets,
             .disconnect_ctxs = disconnect_ctxs,
-            .disconnect_free = disconnect_free,
+            .disconnect_bitmap = disconnect_bitmap,
+            .disconnect_free_count = options.max_connections,
             .disconnect_ex = null,
             .socket_reuse = options.windows_socket_reuse,
             .accept_backlog_target = options.windows_accept_backlog,
             .conn_io_slots = conn_io_slots,
-            .conn_io_free = conn_io_free,
+            .conn_io_bitmap = conn_io_bitmap,
+            .conn_io_free_count = options.max_connections,
         };
     }
 
@@ -275,14 +285,14 @@ pub const HighPerfIO = struct {
         for (self.disconnect_ctxs) |*ctx| {
             if (ctx.socket != ws2.INVALID_SOCKET) _ = ws2.closesocket(ctx.socket);
         }
-        self.conn_io_free.deinit(self.allocator);
+        self.allocator.free(self.conn_io_bitmap);
         self.allocator.free(self.conn_io_slots);
         self.slot_data.deinit(self.allocator);
-        self.accept_free.deinit(self.allocator);
+        self.allocator.free(self.accept_bitmap);
         self.allocator.free(self.completion_entries);
         self.free_sockets.deinit(self.allocator);
         self.allocator.free(self.disconnect_ctxs);
-        self.disconnect_free.deinit(self.allocator);
+        self.allocator.free(self.disconnect_bitmap);
         _ = kernel32.CloseHandle(self.port);
         self.allocator.free(self.completion_buffer);
         self.free_list.deinit(self.allocator);
@@ -293,6 +303,34 @@ pub const HighPerfIO = struct {
     pub fn setIoThreadIdealProcessor(self: *HighPerfIO, processor: win.DWORD) void {
         _ = self;
         _ = SetThreadIdealProcessor(GetCurrentThread(), processor);
+    }
+
+    /// 从位图中弹出一个空闲槽位索引；1=空闲，用 @ctz 快速找空闲索引
+    inline fn popFreeSlot(bitmap: []u64, hint: *usize, free_count: *usize) ?usize {
+        if (free_count.* == 0) return null;
+        const start = hint.*;
+        for (0..bitmap.len) |i| {
+            const word_i = (start + i) % bitmap.len;
+            const word = &bitmap[word_i];
+            if (word.* != 0) {
+                const bit_idx = @ctz(word.*);
+                const slot = word_i * 64 + bit_idx;
+                word.* &= ~(@as(u64, 1) << bit_idx);
+                hint.* = word_i;
+                free_count.* -= 1;
+                return slot;
+            }
+        }
+        return null;
+    }
+
+    /// 将槽位索引归还到位图
+    inline fn pushFreeSlot(bitmap: []u64, hint: *usize, free_count: *usize, slot: usize) void {
+        const word_i = slot / 64;
+        const bit = @as(u64, 1) << @as(u6, @intCast(slot % 64));
+        bitmap[word_i] |= bit;
+        if (word_i < hint.*) hint.* = word_i;
+        free_count.* += 1;
     }
 
     /// 注册监听 socket 并关联到 IOCP；须在 submitAcceptWithBuffer 前调用；若 socket_reuse 则在此加载 DisconnectEx
@@ -309,10 +347,10 @@ pub const HighPerfIO = struct {
     pub fn ensureAcceptBacklog(self: *HighPerfIO) void {
         const target = self.accept_backlog_target;
         if (target == 0) return;
-        var in_flight = self.max_connections - self.accept_free.items.len;
+        var in_flight = self.max_connections - self.accept_free_count;
         while (in_flight < target) {
             self.submitAcceptWithBuffer(0, 0);
-            const next = self.max_connections - self.accept_free.items.len;
+            const next = self.max_connections - self.accept_free_count;
             if (next <= in_flight) break;
             in_flight = next;
         }
@@ -334,9 +372,9 @@ pub const HighPerfIO = struct {
     /// 提交一次 accept+首包零拷贝入池；lpOutputBuffer 用池块，dwReceiveDataLength=ACCEPT_RECV_LEN；socket_reuse 时优先从 free_sockets 复用句柄
     pub fn submitAcceptWithBuffer(self: *HighPerfIO, _: i32, user_data: usize) void {
         const listen_sock = self.listen_socket orelse return;
-        const idx = self.accept_free.popOrNull() orelse return;
+        const idx = popFreeSlot(self.accept_bitmap, &self.accept_scan_hint, &self.accept_free_count) orelse return;
         const chunk_idx = self.chunk_cache.take() orelse {
-            _ = self.accept_free.append(self.allocator, idx) catch {};
+            pushFreeSlot(self.accept_bitmap, &self.accept_scan_hint, &self.accept_free_count, idx);
             return;
         };
 
@@ -355,13 +393,13 @@ pub const HighPerfIO = struct {
         };
         if (accept_socket == ws2.INVALID_SOCKET) {
             self.chunk_cache.release(chunk_idx);
-            _ = self.accept_free.append(self.allocator, idx) catch {};
+            pushFreeSlot(self.accept_bitmap, &self.accept_scan_hint, &self.accept_free_count, idx);
             return;
         }
         if (kernel32.CreateIoCompletionPort(accept_socket, self.port, @intCast(idx), 0) == null) {
             _ = ws2.closesocket(accept_socket);
             self.chunk_cache.release(chunk_idx);
-            _ = self.accept_free.append(self.allocator, idx) catch {};
+            pushFreeSlot(self.accept_bitmap, &self.accept_scan_hint, &self.accept_free_count, idx);
             return;
         }
 
@@ -394,7 +432,7 @@ pub const HighPerfIO = struct {
             if (err != ws2.WSA_IO_PENDING) {
                 _ = ws2.closesocket(accept_socket);
                 self.chunk_cache.release(chunk_idx);
-                _ = self.accept_free.append(self.allocator, idx) catch {};
+                pushFreeSlot(self.accept_bitmap, &self.accept_scan_hint, &self.accept_free_count, idx);
             }
         }
     }
@@ -419,37 +457,42 @@ pub const HighPerfIO = struct {
         );
         if (ok == 0 or n_removed == 0) return self.completion_buffer[0..self.completion_count];
 
+        const accept_base = @intFromPtr(self.slot_data.items(.overlapped_line).ptr);
+        const accept_end = accept_base + self.max_connections * @sizeOf(OverlappedCacheLine);
+        const conn_io_base = @intFromPtr(self.conn_io_slots.ptr);
+        const conn_io_end = conn_io_base + self.max_connections * @sizeOf(ConnIoSlot);
+        const disconnect_base = if (self.disconnect_ctxs.len > 0) @intFromPtr(&self.disconnect_ctxs[0].overlapped) else 0;
+        const disconnect_end = if (self.disconnect_ctxs.len > 0) @intFromPtr(&self.disconnect_ctxs[self.disconnect_ctxs.len - 1].overlapped) + @sizeOf(win.OVERLAPPED) else 0;
+
         const slice = self.slot_data.slice();
         const listen_sockets = slice.items(.listen_socket);
         const accept_sockets = slice.items(.accept_socket);
         const user_datas = slice.items(.user_data);
         const chunk_indices = slice.items(.chunk_index);
 
-        const disconnect_base = if (self.disconnect_ctxs.len > 0) @intFromPtr(&self.disconnect_ctxs[0].overlapped) else 0;
-        const disconnect_end = if (self.disconnect_ctxs.len > 0) @intFromPtr(&self.disconnect_ctxs[self.disconnect_ctxs.len - 1].overlapped) + @sizeOf(win.OVERLAPPED) else 0;
-
         for (self.completion_entries[0..n_removed]) |*entry| {
             const ov_ptr = entry.lp_overlapped orelse continue;
             const ov_addr = @intFromPtr(ov_ptr);
+
+            // 1) 判定是否为 DisconnectEx
             if (ov_addr >= disconnect_base and ov_addr < disconnect_end) {
                 const dix = (ov_addr - disconnect_base) / @sizeOf(DisconnectCtx);
                 if (dix < self.disconnect_ctxs.len and ov_ptr.Internal == 0) {
                     const sock = self.disconnect_ctxs[dix].socket;
                     self.disconnect_ctxs[dix].socket = ws2.INVALID_SOCKET;
-                    _ = self.disconnect_free.append(self.allocator, dix) catch {};
+                    pushFreeSlot(self.disconnect_bitmap, &self.disconnect_scan_hint, &self.disconnect_free_count, dix);
                     _ = self.free_sockets.append(self.allocator, sock) catch {};
                 }
                 continue;
             }
+
             if (self.completion_count >= self.completion_buffer.len) break;
-            const key = entry.lp_completion_key;
             const bytes = entry.dw_number_of_bytes_transferred;
             const success = (ov_ptr.Internal == 0);
 
-            // 连接 I/O：completion_key = max_connections + slot_index
-            if (key >= self.max_connections) {
-                const slot_index = key - self.max_connections;
-                if (slot_index >= self.conn_io_slots.len) continue;
+            // 2) 判定是否为连接 Recv/Send I/O (ConnIoSlot)
+            if (ov_addr >= conn_io_base and ov_addr < conn_io_end) {
+                const slot_index = (ov_addr - conn_io_base) / @sizeOf(ConnIoSlot);
                 const slot = &self.conn_io_slots[slot_index];
                 if (slot.tag == .recv) {
                     self.pushCompletionRecv(
@@ -475,20 +518,24 @@ pub const HighPerfIO = struct {
                     .Union = .{ .Pointer = null },
                     .hEvent = null,
                 };
-                _ = self.conn_io_free.append(self.allocator, slot_index) catch {};
+                pushFreeSlot(self.conn_io_bitmap, &self.conn_io_scan_hint, &self.conn_io_free_count, slot_index);
                 continue;
             }
 
-            const accept_idx = key;
-            self.handleAcceptCompletion(
-                accept_idx,
-                listen_sockets[accept_idx],
-                accept_sockets[accept_idx],
-                user_datas[accept_idx],
-                chunk_indices[accept_idx],
-                success,
-                bytes,
-            );
+            // 3) 判定是否为 AcceptEx
+            if (ov_addr >= accept_base and ov_addr < accept_end) {
+                const accept_idx = (ov_addr - accept_base) / @sizeOf(OverlappedCacheLine);
+                self.handleAcceptCompletion(
+                    accept_idx,
+                    listen_sockets[accept_idx],
+                    accept_sockets[accept_idx],
+                    user_datas[accept_idx],
+                    chunk_indices[accept_idx],
+                    success,
+                    bytes,
+                );
+                continue;
+            }
         }
         if (self.accept_backlog_target > 0) self.ensureAcceptBacklog();
         return self.completion_buffer[0..self.completion_count];
@@ -506,7 +553,7 @@ pub const HighPerfIO = struct {
         bytes_transferred: win.DWORD,
     ) void {
         self.slot_data.items(.accept_socket)[accept_idx] = ws2.INVALID_SOCKET;
-        _ = self.accept_free.append(self.allocator, accept_idx) catch {};
+        pushFreeSlot(self.accept_bitmap, &self.accept_scan_hint, &self.accept_free_count, accept_idx);
         defer self.chunk_cache.release(chunk_index);
 
         if (!success) {
@@ -577,20 +624,14 @@ pub const HighPerfIO = struct {
     }
 
     // Hot-path
-    /// 在连接上提交一次 recv：从池取块、占 conn_io 槽位、associate socket 后 WSARecv；完成时 tag=recv、chunk_index 有效，用毕须 releaseChunk
+    /// 在连接上提交一次 recv：从池取块、占 conn_io 槽位、WSARecv；完成时 tag=recv、chunk_index 有效，用毕须 releaseChunk
     pub fn submitRecv(self: *HighPerfIO, stream: std.Io.net.Stream, user_data: usize) void {
-        const slot_index = self.conn_io_free.popOrNull() orelse return;
-        const chunk_index = self.chunk_cache.acquire() orelse {
-            _ = self.conn_io_free.append(self.allocator, slot_index) catch {};
+        const slot_index = popFreeSlot(self.conn_io_bitmap, &self.conn_io_scan_hint, &self.conn_io_free_count) orelse return;
+        const chunk_index = self.chunk_cache.take() orelse {
+            pushFreeSlot(self.conn_io_bitmap, &self.conn_io_scan_hint, &self.conn_io_free_count, slot_index);
             return;
         };
         const socket: ws2.SOCKET = @ptrCast(stream.handle);
-        const key: win.ULONG_PTR = @intCast(self.max_connections + slot_index);
-        if (kernel32.CreateIoCompletionPort(socket, self.port, key, 0) == null) {
-            self.chunk_cache.release(chunk_index);
-            _ = self.conn_io_free.append(self.allocator, slot_index) catch {};
-            return;
-        }
         const slot = &self.conn_io_slots[slot_index];
         slot.overlapped = .{
             .Internal = 0,
@@ -611,7 +652,7 @@ pub const HighPerfIO = struct {
             if (err != ws2.WSA_IO_PENDING) {
                 self.chunk_cache.release(chunk_index);
                 slot.overlapped = .{ .Internal = 0, .InternalHigh = 0, .Union = .{ .Pointer = null }, .hEvent = null };
-                _ = self.conn_io_free.append(self.allocator, slot_index) catch {};
+                pushFreeSlot(self.conn_io_bitmap, &self.conn_io_scan_hint, &self.conn_io_free_count, slot_index);
             }
         }
     }
@@ -623,16 +664,11 @@ pub const HighPerfIO = struct {
     }
 
     // Hot-path
-    /// 在连接上提交 send：占 conn_io 槽位、存 buf 引用、associate 后 WSASend；完成前 data 须保持有效，完成时 tag=send、len=已发送字节数
+    /// 在连接上提交 send：占 conn_io 槽位、存 buf 引用、WSASend；完成前 data 须保持有效，完成时 tag=send、len=已发送字节数
     pub fn submitSend(self: *HighPerfIO, stream: std.Io.net.Stream, data: []const u8, user_data: usize) void {
         if (data.len == 0) return;
-        const slot_index = self.conn_io_free.popOrNull() orelse return;
+        const slot_index = popFreeSlot(self.conn_io_bitmap, &self.conn_io_scan_hint, &self.conn_io_free_count) orelse return;
         const socket: ws2.SOCKET = @ptrCast(stream.handle);
-        const key: win.ULONG_PTR = @intCast(self.max_connections + slot_index);
-        if (kernel32.CreateIoCompletionPort(socket, self.port, key, 0) == null) {
-            _ = self.conn_io_free.append(self.allocator, slot_index) catch {};
-            return;
-        }
         const slot = &self.conn_io_slots[slot_index];
         slot.overlapped = .{
             .Internal = 0,
@@ -652,7 +688,7 @@ pub const HighPerfIO = struct {
             const err = ws2.WSAGetLastError();
             if (err != ws2.WSA_IO_PENDING) {
                 slot.overlapped = .{ .Internal = 0, .InternalHigh = 0, .Union = .{ .Pointer = null }, .hEvent = null };
-                _ = self.conn_io_free.append(self.allocator, slot_index) catch {};
+                pushFreeSlot(self.conn_io_bitmap, &self.conn_io_scan_hint, &self.conn_io_free_count, slot_index);
             }
         }
     }
@@ -661,7 +697,7 @@ pub const HighPerfIO = struct {
 const TRANSMIT_FILE_MAX_CHUNK: u64 = std.math.maxInt(win.DWORD);
 
 /// 零拷贝：文件 → 网络（TransmitFile）；count 超 DWORD 时循环直至发完。
-/// 进阶：小文件（<4KB）可考虑 TF_USE_DEFAULT_WORKER 减少线程切换；短连接压榨可配合 DisconnectEx + TF_REUSE_SOCKET 复用 socket 句柄，绕过创建开销。
+/// 优化：通过 OVERLAPPED.Offset 直接指定文件偏移，消除 SetFilePointerEx 系统调用（§3.4）。
 pub fn sendFile(stream: std.Io.net.Stream, file: std.fs.File, offset: u64, count: u64) api.SendFileError!void {
     const h_socket: ws2.SOCKET = @ptrCast(stream.handle);
     const h_file: win.HANDLE = file.handle;
@@ -670,13 +706,23 @@ pub fn sendFile(stream: std.Io.net.Stream, file: std.fs.File, offset: u64, count
     while (sent < count) {
         const left = count - sent;
         const chunk = @min(left, TRANSMIT_FILE_MAX_CHUNK);
-        const move: win.LARGE_INTEGER = @intCast(current_offset);
-        if (kernel32.SetFilePointerEx(h_file, move, null, FILE_BEGIN) == 0) {
-            return error.FileRead;
-        }
+        var overlapped = std.mem.zeroInit(win.OVERLAPPED, .{
+            .Union = .{ .Offset = .{
+                .Offset = @intCast(current_offset & 0xFFFFFFFF),
+                .OffsetHigh = @intCast(current_offset >> 32),
+            } },
+        });
+
         const n: win.DWORD = @intCast(chunk);
-        if (ws2.TransmitFile(h_socket, h_file, n, 0, null, null, 0) == 0) {
-            return error.TransmitFileFailed;
+        // TransmitFile 在阻塞 socket 上配合 OVERLAPPED 依然是同步完成或返回 IO_PENDING
+        if (ws2.TransmitFile(h_socket, h_file, n, 0, &overlapped, null, 0) == 0) {
+            const err = ws2.WSAGetLastError();
+            if (err != ws2.WSA_IO_PENDING) return error.TransmitFileFailed;
+            var transferred: win.DWORD = 0;
+            var flags: win.DWORD = 0;
+            if (ws2.WSAGetOverlappedResult(h_socket, &overlapped, &transferred, win.TRUE, &flags) == 0) {
+                return error.TransmitFileFailed;
+            }
         }
         sent += chunk;
         current_offset += chunk;
