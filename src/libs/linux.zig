@@ -1,51 +1,22 @@
-// Linux 平台 I/O 核心（linux.zig）：io_uring + sendfile 零拷贝。
-//
-// 职责
-//   - 实现 HighPerfIO：单环 io_uring、PROVIDE_BUFFERS 池、accept+首包 recv 由内核直接写入注册内存；
-//   - 实现 sendFile：文件→网络零拷贝，循环 sendfile 直至发完或错误，EAGAIN 时重试。
-//
-// 规范对应（00-性能规则）
-//   - §3.1、§4.2：必须使用 io_uring，Fixed Buffers / IORING_OP_PROVIDE_BUFFERS；accept 与首包 recv 合并为内核选 buffer 填入；
-//   - §3.1 SQPOLL：初始化优先尝试 IORING_SETUP_SQPOLL（0 syscall 提交），EPERM 时优雅降级为标准轮询并打 performance-hint；
-//   - §3.4、§4.2：文件→网络一律 sendfile，禁止 read+write；每核一环、Thread-per-Core 由调用方保证。
-//
-// 数据流简述
-//   - registerBufferPool：将 BufferPool 按 64KB 分块，PROVIDE_BUFFERS 提交给内核；
-//   - submitAcceptWithBuffer：提交 accept，完成时自动提交 recv（buffer_selection 用 BUFFER_GROUP_ID），CQE 中通过 buffer_id 得到指针；
-//   - pollCompletions：copy_cqes，按 user_data 区分 accept CQE（内部再提交 recv）与 recv CQE（填 completion_buffer）；返回切片有效至下次 poll。
-//
-// 槽位与 user_data
-//   - 槽位用 SoA（SlotFields + MultiArrayList）存储，pollCompletions 热路径只摸 tag/caller_user_data/client_fd 等连续数组，缓存友好；
-//   - accept 完成时占用一 recv 槽位并提交 recv，user_data 高位用 RECV_USER_DATA_TAG 区分。
-//
-// 内存与释放
-//   - 显式 allocator（§1.5）：init 接收 allocator，deinit 中 free_list.deinit(self.allocator)、释放 completion_buffer、slot_data.deinit(allocator)。
-//
-// --- 进阶压榨（已做/可继续深挖）---
-// 1) 大页 Buffer 池：api.zig 已提供 BufferPool.allocHugePages(allocator, size)（仅 Linux），
-//    MAP_HUGETLB 2MB 页，减少 TLB 未命中；deinit 时 munmap；池大（数百 MB）时推荐使用。
-// 2) IORING_OP_SPLICE：当前仅 sendfile（文件→socket）。Socket→Socket 代理场景可用 io_uring splice，
-//    数据在内核缓冲间搬运、不经过用户态；可扩展为 submitSplice(in_fd, out_fd, len) + 完成项类型。
-// 3) IORING_SETUP_ATTACH_WQ：Thread-per-Core 多环时，后续环可用 params.wq_fd 关联首环的 work queue，
-//    共享内核线程池、降低上下文切换；需暴露「主环 fd」与 initAttached(allocator, options, primary_wq_fd) 类 API。
-// 4) 槽位 SoA：已实现，slot_data 为 MultiArrayList(SlotFields)，热路径按字段访问。
-//
-// --- 微米级压榨（已做）---
-// 5) 冷路径提示：错误与早期 return 分支使用 @branchHint(.cold)（Zig 0.16 官方 builtin），利于 CPU 流水线与分支预测。
-// 6) 批量提交：提供 submitAcceptWithBufferDeferred + flushSubmits()；降级模式（无 SQPOLL）下可先循环 Deferred 再一次 flushSubmits，将多次 submit 合并为一次系统调用。
-//
-// --- 物理极限级（指令集/硬件拓扑）---
-// 7) 寄存器传参：pollCompletions 循环前将 slot_data 各字段切片取出为局部变量，传入 handleAcceptCqe/handleRecvCqe，使 ptr+len 常驻寄存器，减少热路径结构体寻址。
-// 8) SQPOLL 亲和性：InitOptions.linux_sq_thread_cpu 设置后启用 IORING_SETUP_SQ_AFF，将 sq 内核线程钉到指定核；调用方可用 sched_setaffinity 将本线程绑到兄弟/临近核。
-// 9) 向量化空闲列表：已实现 free_bitmap + @ctz（TZCNT），popFreeSlot/pushFreeSlot 替代原 free_list，批量申请槽位时更省内存访问。
-// 10) Varying Buffer Sizes：已支持多 BUFFER_GROUP_ID；registerBufferPool 注册组 0（64KB），registerBufferGroup(group_id, pool, chunk_size) 注册它组；submitAcceptWithBuffer(..., group_id) 指定该连接使用的 buffer 组（HTTP 小包 vs 模型流大块）。
-//
-// --- 硬件定制级（通用 Web Server 外的可选扩展）---
-// 当前实现（io_uring + PROVIDE_BUFFERS + 上述优化）在通用场景下已是工程学上的顶点。若需进一步压榨，属于「硬件/场景定制」：
-//
-// 11) IORING_REGISTER_BUFFERS：当前用 PROVIDE_BUFFERS（动态选池），适合网络 recv 的「内核从池里挑一块」语义。若有**固定、极高频**读写的 buffer 集合，可改用 io_uring_register(IORING_REGISTER_BUFFERS) 将地址长期 Pin 在内核，减少每次 I/O 的内核态映射开销；recv 需走 fixed buffer 路径（buffer_index 指定槽位），与 PROVIDE_BUFFERS 二选一或分场景使用。
-//
-// 12) Zero-copy Rx (TCP_ZEROCOPY_RECEIVE)：在 100Gbps 级网卡上，内核支持网卡→用户态内存的零拷贝（页翻转）。需特定网卡驱动与 mmap 等配合，对**通用 Web Server** 而言，当前 io_uring + PROVIDE_BUFFERS 已是通用场景顶点；零拷贝 Rx 留给专用/超算场景。
+//! Linux 平台 I/O 核心（linux.zig）
+//!
+//! 职责：
+//!   - 实现 `HighPerfIO` 契约：基于 `io_uring` 极致高性能模型。
+//!   - 实现零拷贝 `sendFile`：基于 Linux `sendfile` 系统调用。
+//!   - 提供针对大规模连接与高并发请求的底层优化。
+//!
+//! 极致压榨亮点：
+//!   1. **全链路 io_uring 增强**：集成了 `IORING_SETUP_SQPOLL`、`SINGLE_ISSUER`、`COOP_TASKRUN`、以及关键的 `DEFER_TASKRUN`（Linux 6.1+），最小化内核开销。
+//!   2. **0 系统调用提交（SQPOLL）**：在权限允许时开启 SQPOLL 线程，配合 `submitSqueezed` 逻辑，仅在必要时（NEED_WAKEUP）才执行系统调用。
+//!   3. **预注册文件描述符（Fixed Files）**：通过 `IORING_REGISTER_FILES` 预先向内核注册连接表，绕过标准 FD 的内核全局锁竞争。
+//!   4. **直接 Accept 优化**：使用 `IORING_OP_ACCEPT` 配合 `file_index` 直接将新连接接受到固定文件表槽位。
+//!   5. **NUMA 亲和性绑定**：支持通过 `mbindToCurrentNode` 将 Buffer 池绑定到当前 CPU 的本地内存节点，降低跨 Socket 访问延迟。
+//!   6. **位图快速索引**：使用 `free_bitmap` 与 `TZCNT` (@ctz) 实现 O(1) 的槽位管理。
+//!
+//! 适用规范：
+//!   - 遵循 00 §3.1（提交型模型）、§4.2（Linux 极致并发）。
+//!
+//! [Allocates] 遵循「谁分配谁释放」原则，详见 deinit。
 
 const std = @import("std");
 const linux = std.os.linux;
