@@ -391,7 +391,7 @@ fn ensureDeferredFsQueue() !void {
 
 /// promise.createWithExecutor 的 Zig 回调：将 resolve/reject 写入 op，path/path2/content 复制后入队并释放原指针
 fn fsDeferredOnExecutor(ctx: jsc.JSContextRef, resolve_val: jsc.JSValueRef, reject_val: jsc.JSValueRef, user_data: ?*anyopaque) void {
-    const op = @as(*DeferredFsOp, @alignCast(@ptrCast(user_data orelse return)));
+    const op = @as(*DeferredFsOp, @ptrCast(@alignCast(user_data orelse return)));
     current_deferred_fs_op = null;
     const allocator = op.allocator;
     const path_dup = allocator.dupe(u8, op.path) catch return;
