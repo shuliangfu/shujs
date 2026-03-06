@@ -1,10 +1,20 @@
-// SIMD 向量化扫描：供 HTTP 等协议解析器参考，一次处理 16/32 字节定位 \r / \n，避免逐字节状态机成为瓶颈。
-//
-// 用法：在拿到 Completion.buffer_ptr[0..len] 后，可先调用 findCrLfInBlock 或 scanCrLfMask 快速定位行边界，
-// 再只做零拷贝 slice 引用，不 memcpy。详见 docs/IO_CORE_ROADMAP.md。
-//
-// 性能（00 §1.6）：为最佳性能，建议传入来自 BufferPool、64 字节对齐且长度≥VECTOR_LANES 的块；
-// 若调用方保证块末尾有 64 字节 padding，解析器可盲读、无标量 tail，分支预测错误率为 0。
+//! SIMD 向量化字节流扫描与协议解析（simd_scan.zig）
+//!
+//! 职责：
+//!   - 提供基于 Zig 0.16 `@Vector` 的高性能字节查找与模式匹配。
+//!   - 为 HTTP、WebSocket 等协议解析提供极致性能的底层扫描器。
+//!
+//! 极致压榨亮点：
+//!   1. **零成本位图生成**：利用 `std.meta.Int` 与 `@bitCast` 直接将向量比较结果转为整数掩码，生成 `PMOVMSKB` 等原生 SIMD 指令。
+//!   2. **车道填充（Lane Padding）**：通过在缓冲区末尾预留 64 字节零填充，实现「盲读」扫描，消除处理尾部零碎字节的分支预测失败（00 §1.6）。
+//!   3. **指令级并行查找**：内置 `indexOfCrLfCrLf` 等组合扫描器，通过一次内存加载并发检测多个字节模式。
+//!   4. **对齐内存优化**：所有扫描操作均假设或要求 SIMD 宽度对齐，显著提升内存带宽利用率。
+//!   5. **无分支边界检查**：在热路径中强制使用 `@setRuntimeSafety(false)` 并通过填充层确保指针访问安全。
+//!
+//! 适用规范：
+//!   - 遵循 00 §2.4（SIMD 向量化）、§7.1（Lane 填充）。
+//!
+//! [Borrows] 仅返回输入缓冲区的偏移量或切片，无需 free。
 
 const std = @import("std");
 const builtin = @import("builtin");
