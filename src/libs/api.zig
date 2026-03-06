@@ -43,13 +43,14 @@ pub const SendFileError = error{
     TransmitFileFailed,
 };
 
-/// 完成项类型：accept=新连接+首包，recv=连接上收到数据，send=连接上发送完成，file_read/file_write=异步文件 I/O
+/// 完成项类型：accept=新连接+首包，recv=连接上收到数据，send=连接上发送完成，file_read/file_write=异步文件 I/O，splice=Socket 间零拷贝
 pub const CompletionTag = enum {
     accept,
     recv,
     send,
     file_read,
     file_write,
+    splice,
 };
 
 /// 单次 I/O 完成项（pollCompletions 返回的元素）
@@ -84,6 +85,8 @@ pub const InitOptions = struct {
     max_completions: usize = 256,
     /// [仅 Linux] SQPOLL 内核线程绑定的 CPU 编号；设置后 params.flags 会带上 IORING_SETUP_SQ_AFF，避免 sq 线程在核间飘移导致 L1/L2 失效；可与调用方线程绑定到兄弟核或临近核
     linux_sq_thread_cpu: ?u32 = null,
+    /// [仅 Linux] 关联的首环 fd；设置后 params.flags 会带上 IORING_SETUP_ATTACH_WQ，与首环共享内核工作队列线程池，降低上下文切换与资源占用
+    linux_attach_wq_fd: ?i32 = null,
     /// [仅 Windows] 为 true 时，accept 完成后不关闭 socket，投递 DisconnectEx(..., TF_REUSE_SOCKET)，完成时句柄入池，下次 submitAcceptWithBuffer 优先复用，绕过 WSASocketW 创建开销（短连接压榨）
     windows_socket_reuse: bool = false,
     /// [仅 Windows] 预投递 AcceptEx 积压目标数；>0 时 ensureAcceptBacklog() 与 pollCompletions 后会补足，保持内核中待命 accept 数量，适合百万级连接
@@ -258,18 +261,17 @@ pub const ChunkAllocator = struct {
 
     /// 批量取块，写入 out[0..]，返回实际取到的数量；用于线程本地缓存 refill
     pub fn takeBatch(self: *ChunkAllocator, out: []usize) usize {
-        var n: usize = 0;
-        while (n < out.len) {
-            const idx = self.free_stack.pop() orelse break;
-            out[n] = idx;
-            n += 1;
-        }
+        const n = @min(out.len, self.free_stack.items.len);
+        if (n == 0) return 0;
+        const start = self.free_stack.items.len - n;
+        std.mem.copyForwards(usize, out[0..n], self.free_stack.items[start..]);
+        self.free_stack.shrinkRetainingCapacity(start);
         return n;
     }
 
     /// 批量归还块索引；用于线程本地缓存 flush
     pub fn releaseBatch(self: *ChunkAllocator, indices: []const usize) void {
-        for (indices) |idx| self.free_stack.append(self.allocator, idx) catch {};
+        self.free_stack.appendSlice(self.allocator, indices) catch {};
     }
 };
 
@@ -307,23 +309,22 @@ pub const ThreadLocalChunkCache = struct {
     }
 
     fn refill(self: *ThreadLocalChunkCache) void {
-        var count: usize = 0;
-        while (count < CHUNK_CACHE_BATCH) : (count += 1) {
-            const idx = self.global.pop() orelse break;
-            self.stack[self.len] = idx;
-            self.len += 1;
-        }
+        const n = @min(CHUNK_CACHE_BATCH, self.global.items.len);
+        if (n == 0) return;
+        const start = self.global.items.len - n;
+        std.mem.copyForwards(usize, self.stack[self.len .. self.len + n], self.global.items[start..]);
+        self.global.shrinkRetainingCapacity(start);
+        self.len += n;
     }
 
     fn flush(self: *ThreadLocalChunkCache) void {
         const n = @min(CHUNK_CACHE_BATCH, self.len);
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            self.global.append(self.allocator, self.stack[i]) catch break;
-        }
-        var j = n;
-        while (j < self.len) : (j += 1) {
-            self.stack[j - n] = self.stack[j];
+        if (n == 0) return;
+        
+        self.global.appendSlice(self.allocator, self.stack[0..n]) catch {};
+        
+        if (n < self.len) {
+            std.mem.copyForwards(usize, self.stack[0 .. self.len - n], self.stack[n..self.len]);
         }
         self.len -= n;
     }
