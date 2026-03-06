@@ -862,6 +862,20 @@ fn registryGetWithClient(client: *std.http.Client, allocator: std.mem.Allocator,
     });
 }
 
+/// [Allocates] 与 fetchUrlForJsrMeta 相同，但使用已有 std.http.Client 以复用连接（Keep-Alive）；走 Zig 路径、无超时。供 JSR 下载 worker 多请求复用同一连接。返回的切片由调用方 free。
+/// 解析阶段小体积 JSON 不需要 gzip：用 identity 促使服务端回 Content-Length，避免 chunked+gzip 的 ReadFailed，且少一次解压往往更快（见 docs/INSTALL_NETWORK_ANALYSIS.md §4.1）。
+pub fn fetchUrlForJsrMetaWithClient(client: *std.http.Client, allocator: std.mem.Allocator, url: []const u8, max_bytes: usize) ![]const u8 {
+    return libs_io.http.getWithClient(client, allocator, url, .{
+        .accept = "application/json",
+        .accept_encoding = "identity",
+        // .accept_encoding = "gzip, deflate",
+        .max_bytes = max_bytes,
+        .user_agent = REGISTRY_USER_AGENT,
+        .timeout_sec = 0,
+        .extra_headers = &.{.{ .name = "Sec-Fetch-Dest", .value = "empty" }},
+    });
+}
+
 /// [Allocates] 使用自定义 Accept 头 GET url（供 JSR 等非 npm registry 使用）；Zig 路径、一次性 Client。调用方 free 返回的切片。
 pub fn fetchUrlWithAccept(allocator: std.mem.Allocator, url: []const u8, accept_value: []const u8, max_bytes: usize) ![]const u8 {
     var client = std.http.Client{ .allocator = allocator };
@@ -885,20 +899,6 @@ pub fn fetchUrlForJsrMeta(allocator: std.mem.Allocator, url: []const u8, max_byt
     var client = std.http.Client{ .allocator = allocator, .io = io };
     defer client.deinit();
     return fetchUrlForJsrMetaWithClient(&client, allocator, url, max_bytes);
-}
-
-/// [Allocates] 与 fetchUrlForJsrMeta 相同，但使用已有 std.http.Client 以复用连接（Keep-Alive）；走 Zig 路径、无超时。供 JSR 下载 worker 多请求复用同一连接。返回的切片由调用方 free。
-/// JSR (jsr.io) 返回 Transfer-Encoding: chunked + Content-Encoding: gzip，npm 镜像多返回 Content-Length，故 JSR 易触发 Zig chunked 读 0 字节、npm 不报错。
-/// 使用 accept_encoding = "identity" 时 CDN 常回 Content-Length，走 content-length 路径可避免 chunked 导致的 ReadFailed；用 gzip 则需接受偶发 ReadFailed。
-pub fn fetchUrlForJsrMetaWithClient(client: *std.http.Client, allocator: std.mem.Allocator, url: []const u8, max_bytes: usize) ![]const u8 {
-    return libs_io.http.getWithClient(client, allocator, url, .{
-        .accept = "application/json",
-        .accept_encoding = "gzip, deflate",
-        .max_bytes = max_bytes,
-        .user_agent = REGISTRY_USER_AGENT,
-        .timeout_sec = 0,
-        .extra_headers = &.{.{ .name = "Sec-Fetch-Dest", .value = "empty" }},
-    });
 }
 
 /// 将 url 指向的资源下载到 dest_path（覆盖已有文件）；经 libs_io.http GET（Zig 路径、一次性 Client），响应体最多 50MB。
