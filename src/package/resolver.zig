@@ -132,6 +132,26 @@ pub fn jsrSpecToScopeName(allocator: std.mem.Allocator, jsr_spec: []const u8) ![
     return allocator.dupe(u8, rest);
 }
 
+/// [Allocates] 将 JSR 的 @scope/name 转为 npm 兼容层包名 @jsr/scope__name（scope 与 name 间 / 换成 __）；供通过 npm.jsr.io 解析与下载时使用。返回的切片由调用方 free。
+pub fn scopeNameToJsrNpmName(allocator: std.mem.Allocator, scope_name: []const u8) ![]const u8 {
+    if (scope_name.len == 0 or scope_name[0] != '@') return error.InvalidJsrSpecifier;
+    const rest = scope_name[1..];
+    const slash = std.mem.indexOf(u8, rest, "/") orelse return error.InvalidJsrSpecifier;
+    const scope = rest[0..slash];
+    const name = rest[slash + 1 ..];
+    return std.fmt.allocPrint(allocator, "@jsr/{s}__{s}", .{ scope, name });
+}
+
+/// [Allocates] 将 npm 兼容层包名 @jsr/scope__name 转回 @scope/name；供解析合并时把 registry 返回的 dependency key 转为 install 使用的包名。返回的切片由调用方 free。
+pub fn jsrNpmNameToScopeName(allocator: std.mem.Allocator, npm_name: []const u8) ![]const u8 {
+    if (!std.mem.startsWith(u8, npm_name, "@jsr/")) return error.InvalidJsrSpecifier;
+    const rest = npm_name["@jsr/".len..];
+    const dbl = std.mem.indexOf(u8, rest, "__") orelse return error.InvalidJsrSpecifier;
+    const scope = rest[0..dbl];
+    const name = rest[dbl + 2 ..];
+    return std.fmt.allocPrint(allocator, "@{s}/{s}", .{ scope, name });
+}
+
 /// 在包目录 pkg_dir 内根据 main/exports 与 subpath 解析出入口文件绝对路径。allocator 用于路径拼接与可能的 export 模式展开；返回路径调用方负责 free（或来自 arena）。
 fn resolvePackageEntry(
     allocator: std.mem.Allocator,
