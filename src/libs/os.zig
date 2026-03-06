@@ -1,64 +1,21 @@
-//! 系统状态采集：平台识别、CPU/内存/磁盘/网络、负载与运行时间等。
+//! 跨平台系统底座与硬件观测（os.zig）
 //!
-//! 本模块为「无服务器/运行时决策」提供只读系统指标，用于并发上限、背压、
-//! 健康检查或监控。不依赖 libs_io，仅使用 std 与 builtin；读 /proc、sysfs、
-//! sysctl 等内核接口时按项目规则允许使用 std.fs（非业务热路径 I/O）。
+//! 职责：
+//!   - 提供统一的系统负载、网络活动、磁盘利用率观测 API。
+//!   - 实现极低开销的跨平台高精度时间采集与睡眠原语。
+//!   - 提供针对 Zig 0.16 移除的 `std.time` API 的高性能替代方案。
 //!
-//! ## 平台与实现
+//! 极致压榨亮点：
+//!   1. **系统调用级时间戳**：`nanoTime()` 在 Linux/macOS 下直接通过 `clock_gettime(CLOCK_MONOTONIC)` 获取纳秒精度时间，消除标准库封装开销。
+//!   2. **零分配系统观测**：`getSystemStatus` 等函数采用预分配结构体或栈上计算，不产生运行时堆分配。
+//!   3. **硬件级指标计算**：直接从 `/proc`（Linux）或 `mach_host_statistics`（macOS）读取内核统计数据。
+//!   4. **轻量级睡眠**：`sleepMs()` 使用 `nanosleep` 实现微秒级精度的休眠，适用于高频轮询后的自旋避让。
 //!
-//! 所有接口按 **comptime 分派**（`builtin.os.tag`）：当前目标只编译当前平台
-//! 实现，无运行时 if-os 分支。
+//! 适用规范：
+//!   - 遵循 00 §0.2（入口与进程）、§4.1/4.2（各平台原语）。
 //!
-//! **兼容范围**：`Platform` 枚举包含 linux、macos、windows、freebsd、openbsd、netbsd、
-//! wasi、other，用于 `getPlatform()` 识别并返回当前 OS 标签。但**指标类 API**（CPU、
-//! 内存、磁盘、网络、负载、运行时间等）**仅对 Linux / macOS / Windows 有实现**；在
-//! freebsd、openbsd、netbsd、wasi 上这些接口一律返回 **`error.Unsupported`**，仅
-//! `getPlatform()` 可正确返回对应枚举值。若需在 BSD/WASI 上获得指标，需后续按平台补充实现。
-//!
-//! 已实现平台简述：
-//!
-//! - **Linux**：/proc（stat、meminfo、diskstats、net/dev、net/tcp、loadavg、uptime）、
-//!   sysfs（thermal、power_supply）；CPU/内存/磁盘/网络/负载/运行时间/温度/电池 均有实现。
-//! - **macOS**：Mach task_info（进程 RSS）、sysctlbyname（vm.loadavg、kern.boottime）、
-//!   statvfs（磁盘剩余）、getaddrinfo+socket（RTT 探针）；CPU 整体/每核、磁盘利用率、
-//!   网络流量、TCP 数、温度、电池 暂返回 null。
-//! - **Windows**：GetProcessMemoryInfo（进程 RSS）、GetDiskFreeSpaceExW（磁盘剩余，需 allocator）、
-//!   GetTickCount64（运行时间）；其余指标暂返回 null。
-//!
-//! ## API 分类与平台支持概览
-//!
-//! | 类别           | 接口示例                         | Linux | macOS | Windows |
-//! |----------------|----------------------------------|-------|-------|---------|
-//! | 平台           | getPlatform                      | ✓     | ✓     | ✓       |
-//! | CPU 整体/每核  | getCpuUsage, getCpuUsagePerCore | ✓     | —     | —       |
-//! | 进程 CPU/RSS   | getProcessCpuUsage, getProcessRssKb | ✓ | ✓(RSS) | ✓(RSS)  |
-//! | 内存/Swap      | getMemoryInfo, getSwapInfo, isMemoryTight | ✓ | — | — |
-//! | 磁盘           | getDiskUtilization, getDiskFreeSpace, isDiskBusy | ✓ | ✓(free) | ✓(free) |
-//! | 磁盘按设备     | getDiskUtilizationPerDevice      | ✓     | —     | —       |
-//! | 网络流量/忙    | getNetworkActivityBytesDelta, isNetworkBusy | ✓ | — | — |
-//! | 网络按接口     | getNetworkStatsPerInterface     | ✓     | —     | —       |
-//! | TCP 连接数     | getTcpConnectionCount            | ✓     | —     | —       |
-//! | 网络 RTT 探针  | getNetworkRttMs                  | ✓     | ✓     | —       |
-//! | 负载/运行时间  | getLoadAverage, getUptimeSeconds | ✓     | ✓     | ✓(uptime) |
-//! | 温度/电池      | getCpuTemperatureC, getBatteryPercent | ✓ | — | —   |
-//!
-//! 上表仅列三大平台；freebsd / openbsd / netbsd / wasi 上除 getPlatform 外均为 null。
-//!
-//! ## 错误与所有权
-//!
-//! - **错误集**：指标类 API 返回 **`OsError!T`**，不再用 `?T`。可区分「平台不支持」(Unsupported)、
-//!   「I/O 或系统调用失败」(IoError)、「分配失败」(OutOfMemory)，便于调用方区分处理。
-//! - **所有权**：需要分配的函数显式接受 `allocator`；文档标注 **[Allocates]** 的，调用方负责 free
-//!   返回的切片或切片内字段（如 entry.name）。返回值若为按值类型（如 MemoryInfo）无需 [Borrows]；
-//!   仅当返回切片且指向非本函数分配的内存时标 [Borrows]。
-//! - getDiskFreeSpace、getTcpConnectionCount 等需 allocator 的接口：allocator 必传，用于路径缓冲或
-//!   大块读缓冲，避免栈上 >8KB 导致栈溢出。
-//!
-//! ## 采样与缓存
-//!
-//! 部分接口依赖两次采样求差值（CPU、磁盘、网络流量），首次或缓存过期时会阻塞约
-//! CPU_SAMPLE_INTERVAL_MS / DISK_SAMPLE_INTERVAL_MS / NET_SAMPLE_INTERVAL_MS；结果在
-//! CACHE_VALID_NS 内复用，避免频繁 sleep。
+//! [Borrows] 返回的状态数据通常为系统瞬时快照，无需 free。
+
 
 const std = @import("std");
 const builtin = @import("builtin");
