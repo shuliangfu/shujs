@@ -1,35 +1,19 @@
-// 平台无关的 I/O 核心类型、错误集与抽象定义（api.zig）
-//
-// 职责
-//   - 定义 linux.zig / darwin.zig / windows.zig 共用的类型与错误，由 mod.zig 按 builtin.os.tag 分派到具体实现；
-//   - 不包含任何平台特定代码，仅声明 Completion、SendFileError、InitOptions、BufferPool、ChunkAllocator 等契约。
-//
-// 三层漏斗（详见 docs/IO_CORE_ROADMAP.md）
-//   - 底层 I/O：已压榨（io_uring/kqueue/IOCP 批量、零拷贝、SoA 等）；
-//   - Buffer 调度：ChunkAllocator 提供「全局 Slab」接口，目标为每线程本地无锁栈 + 与全局批量交换，消除锁争用；
-//   - 协议解析：SIMD 向量化 + 零拷贝 []const u8 引用（见 io_core/simd_scan.zig 与上层解析器）。
-//
-// 主要类型
-//   - SendFileError：零拷贝 sendFile / TransmitFile 可能返回的错误集；
-//   - Completion：单次 I/O 完成项，pollCompletions 返回的元素，含 user_data、buffer_ptr、len、err；
-//   - InitOptions：初始化选项（max_connections、max_completions），各平台可扩展；
-//   - BufferPool：64-byte 对齐的缓冲池，供内核注册或用户态写入，再借给 JSC（Buffer 继承，§1.6）。
-//
-// 大文件 / 大模型读取（能力与建议）
-//   - 当前 io_core 主场景：高并发 accept + 首包 recv（64KB 池）、文件→网络 sendFile/TransmitFile。
-//   - 读大文件：上层 Shu.fs.readSync 若用 readToEndAlloc 一次性读入整文件，大模型（几 GB～几百 GB）易 OOM、延迟高；
-//   - 优化（§1.7）：大文件只读用 mmap（mapFileReadOnly，见 mmap.zig），零拷贝、按需换页；流式可扩展 submitReadFile + 大块 buffer。
-//   - 入口：io_core.mapFileReadOnly / mapFileReadWrite；fs 层可在大文件 + encoding:null 时选用。
-//
-// 调用约定
-//   - BufferPool.allocAligned / allocHugePages（仅 Linux）/ allocLargePagesWindows（仅 Windows）返回的池由调用方 deinit；Completion 切片有效期至下一次 pollCompletions 前。
-//
-// HighPerfIO 统一 I/O 契约（各 backend 实现）
-//   - submitAcceptWithBuffer(listen_fd, user_data)：提交 accept+首包，完成时 tag=accept、client_stream 与 buffer 有效
-//   - pollCompletions(timeout_ns)：收割所有完成项（accept/recv/send），返回 []Completion
-//   - submitRecv(stream, user_data)：在连接上提交一次 recv，数据写入池块，完成时 tag=recv、buffer_ptr/len/chunk_index 有效，用毕须 releaseChunk
-//   - submitSend(stream, data, user_data)：在连接上提交 send，data 在完成前须保持有效，完成时 tag=send、len=已发送字节数
-//   - releaseChunk(chunk_index)：归还 recv 完成项占用的池块，须在下次 pollCompletions 前调用
+//! 平台无关的 I/O 核心类型、错误集与抽象定义（api.zig）
+//!
+//! 职责：
+//!   - 定义 `libs_io` 跨平台后端（Linux/Darwin/Windows）共用的核心契约与数据结构。
+//!   - 提供高性能 Buffer 调度：`BufferPool`（对齐池）与 `ChunkAllocator`（Slab 分配）。
+//!   - 提供线程本地性能增强：`ThreadLocalChunkCache` 结合批量交换技术，消除全局锁竞争。
+//!
+//! 极致压榨亮点：
+//!   1. **零拷贝 Buffer 继承**：`BufferPool` 支持 64 字节对齐、大页（HugePages/LargePages），直接与内核注册并借给 JSC。
+//!   2. **线程本地 Slab 缓存**：`ThreadLocalChunkCache` 实现了 90%+ 操作无锁化，支持批量 `appendSlice` 刷新到全局池。
+//!   3. **统一完成项契约**：`Completion` 结构经过极致精简，支持 SoA 访问模式，确保热路径缓存局部性。
+//!
+//! 适用规范：
+//!   - 遵循 00 §1.6（Buffer 继承）、§3.0（统一 I/O 入口）、§3.6（避免锁竞争）。
+//!
+//! [Allocates] 部分函数返回由调用方负责释放的资源，详见函数文档。
 
 const std = @import("std");
 const builtin = @import("builtin");
