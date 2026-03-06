@@ -1,38 +1,22 @@
-// Windows 平台 I/O 核心（windows.zig）：IOCP + AcceptEx 首包零拷贝入池 + TransmitFile 零拷贝。
-//
-// 职责
-//   - 实现 HighPerfIO：IOCP、AcceptEx 的 lpOutputBuffer 直接指向池块并设 dwReceiveDataLength，accept 完成时首包已在池中，无需再 WSARecv；
-//   - 实现 sendFile：文件→网络零拷贝，SetFilePointerEx + TransmitFile；count 超过 DWORD 时循环直至发完。
-//
-// 规范对应（00-性能规则）
-//   - §4.3：文件→socket 必须 TransmitFile；I/O 模型以 IOCP + Overlapped 为基线。
-//
-// 使用约定
-//   - 调用方须先 registerListenSocket(listen_socket) 再调用 submitAcceptWithBuffer；listen_fd 在本实现中未使用（可传 0）。
-//
-// 内存与释放
-//   - 显式 allocator（§1.5）；槽位 SoA（AcceptFields）在 init 中分配、deinit 中释放。
-//
-// --- 进阶压榨（已做）---
-// 1) Accept 零拷贝：AcceptEx 的 lpOutputBuffer 用池块，dwReceiveDataLength = CHUNK_SIZE - 2*ACCEPT_ADDR_LEN，完成时首包已在池中，省一次 WSARecv。
-// 2) GetQueuedCompletionStatusEx：一次系统调用取回多完成项，高 QPS 下降低内核态空转。
-// 3) 槽位 SoA + completion_key=索引：MultiArrayList(AcceptFields)，key 存 accept_idx，免 64 位指针解引用。
-// 4) TransmitFile：小文件（<4KB）可考虑 TF_USE_DEFAULT_WORKER；短连接可配合 DisconnectEx + TF_REUSE_SOCKET 复用句柄（见 sendFile 注释）。
-//
-// --- 最后 0.1%（已做）---
-// 5) OVERLAPPED 缓存行隔离：每槽 overlapped 独占 64 字节（OverlappedCacheLine），避免多槽共处一 Cache Line 的 False Sharing。
-// 6) TF_REUSE_SOCKET：InitOptions.windows_socket_reuse 为 true 时，handleAcceptCompletion 后不关闭 socket，投递 DisconnectEx(sock, TF_REUSE_SOCKET)，完成时句柄入池，submitAcceptWithBuffer 优先复用，绕过 WSASocketW。
-// 7) NUMA 亲和：setIoThreadIdealProcessor(processor) 在 I/O 线程调用，将当前线程理想处理器设为指定核，利于多路 CPU 下中断与收割同核本地缓存。
-//
-// --- 最后 1 厘米（已做）---
-// 8) AcceptEx 积压：windows_accept_backlog>0 时，ensureAcceptBacklog() 预投递若干 AcceptEx，pollCompletions 后补足，始终保持内核中待命 accept 数量，适合百万级连接。
-// 9) Buffer 池大页：api.BufferPool.allocLargePagesWindows(allocator, size) 使用 VirtualAlloc MEM_LARGE_PAGES，减少 TLB miss；需 SeLockMemoryPrivilege。
-//
-// --- 与 Linux 对应 ---
-// 大页：Linux MAP_HUGETLB / Windows allocLargePagesWindows(MEM_LARGE_PAGES)；Splice/ATTACH_WQ 为 Linux 特性。
-//
-// --- 可选（注释级）---
-// 10) RIO (Registered I/O)：RIORegisterBuffer 将池注册给内核，AcceptEx/WSARecv 可升级为 RIO 路径，进一步压榨内核态；当前已 AcceptEx 零拷贝 + GQCSEx，RIO 为可选进阶，见 docs/IO_CORE_ROADMAP.md §4。
+//! Windows 平台 I/O 核心（windows.zig）
+//!
+//! 职责：
+//!   - 实现 `HighPerfIO` 契约：基于 IOCP（I/O 完成端口）极致性能模型。
+//!   - 实现 zero-copy `sendFile`：基于 Windows `TransmitFile` 系统调用。
+//!   - 提供针对 Windows 服务器环境的底层优化。
+//!
+//! 极致压榨亮点：
+//!   1. **位图快速槽位分配**：使用 `*_bitmap` 配合 `TZCNT` (@ctz) 指令，实现 O(1) 的槽位分配与回收，消除 `ArrayList` 平移开销。
+//!   2. **零系统调用上下文恢复**：通过直接解释 `OVERLAPPED` 指针地址确定完成项类型与索引，消除多次 `CreateIoCompletionPort` 调用。
+//!   3. **批量事件收割**：使用 `GetQueuedCompletionStatusEx` 一次性获取多个完成包，显著减少用户态与内核态切换频率。
+//!   4. **零拷贝文件传输**：`sendFile` 直接利用 `TransmitFile` 并通过 `OVERLAPPED` 指定偏移，省去 `SetFilePointerEx` 系统调用。
+//!   5. **NUMA 亲和性优化**：支持 `SetThreadIdealProcessor`（由调用方结合 Thread-per-Core 使用），确保 I/O 线程与 CPU 核绑定。
+//!   6. **缓存行对齐隔离**：关键上下文结构 `OverlappedCacheLine` 显式对齐缓存行，防止 IOCP 完成时的伪共享。
+//!
+//! 适用规范：
+//!   - 遵循 00 §4.3（Windows 高吞吐与 RIO）、§3.4（零拷贝）。
+//!
+//! [Allocates] `init` 分配的内核句柄与内存由 `deinit` 统一回收。
 
 const std = @import("std");
 const win = std.os.windows;
