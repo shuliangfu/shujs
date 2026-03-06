@@ -135,10 +135,10 @@ fn getFsPromisesExports(ctx: jsc.JSContextRef, allocator: std.mem.Allocator) jsc
     const promises_obj = jsc.JSObjectMake(ctx, null, null);
     // node:fs/promises 与 Node 对齐的异步方法名（与 shu:fs 上命名一致）
     const method_names = [_][]const u8{
-        "readFile", "writeFile", "appendFile", "copyFile", "readdir", "stat", "lstat", "realpath",
-        "mkdir", "access", "unlink", "rmdir", "rename", "copy", "truncate", "symlink", "readlink",
-        "exists", "mkdirRecursive", "rmdirRecursive", "ensureDir", "read", "write",
-        "isEmptyDir", "size", "isFile", "isDirectory", "readdirWithStats", "ensureFile",
+        "readFile", "writeFile", "appendFile",     "copyFile",         "readdir",    "stat", "lstat",    "realpath",
+        "mkdir",    "access",    "unlink",         "rmdir",            "rename",     "copy", "truncate", "symlink",
+        "readlink", "exists",    "mkdirRecursive", "rmdirRecursive",   "ensureDir",  "read", "write",    "isEmptyDir",
+        "size",     "isFile",    "isDirectory",    "readdirWithStats", "ensureFile",
     };
     for (method_names) |name| {
         const name_ref = jsc.JSStringCreateWithUTF8CString(name.ptr);
