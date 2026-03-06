@@ -18,34 +18,44 @@
 const std = @import("std");
 
 /// 缓存行大小，用于 head/tail 填充隔离（§5.3）
-const CACHE_LINE = 64;
+const CACHE_LINE = std.atomic.cache_line;
 
 /// 单生产者单消费者、固定容量、无锁环形缓冲区
 /// T 需为指针或 usize 等单字类型，保证原子读写
-/// head 与 tail 显式 align(64)，各占独立缓存行，避免 False Sharing（00 §5.3）
+/// head 与 tail 显式 align(CACHE_LINE)，各占独立缓存行，避免 False Sharing（00 §5.3）
 pub fn RingBuffer(comptime T: type) type {
     return struct {
-        buffer: []T,
+        /// 只读字段，缓存在各核 (§1.4)
+        buffer: []T align(CACHE_LINE),
         mask: usize,
-        /// 生产者写；独占 cache line，与 tail 隔离
-        head: std.atomic.Value(usize) align(CACHE_LINE),
-        /// 填充使 tail 落在下一 cache line（§5.3）
-        _pad_head_tail: [CACHE_LINE - @sizeOf(std.atomic.Value(usize))]u8 = undefined,
-        /// 消费者写；独占 cache line，与 head 隔离
-        tail: std.atomic.Value(usize) align(CACHE_LINE),
+
+        /// 生产者独占缓存行 (§5.3)
+        _pad_prod: [CACHE_LINE]u8 align(CACHE_LINE) = undefined,
+        /// 生产者写索引
+        tail: std.atomic.Value(usize),
+        /// 消费者 head 的本地副本，减少跨核 .acquire 频率
+        cached_head: usize = 0,
+
+        /// 消费者独占缓存行 (§5.3)
+        _pad_cons: [CACHE_LINE]u8 align(CACHE_LINE) = undefined,
+        /// 消费者读索引
+        head: std.atomic.Value(usize),
+        /// 生产者 tail 的本地副本，减少跨核 .acquire 频率
+        cached_tail: usize = 0,
 
         const Self = @This();
 
         /// 容量必须为 2 的幂，便于用 mask 取模
         pub fn init(allocator: std.mem.Allocator, capacity: usize) !Self {
             const cap = std.math.ceilPowerOfTwo(usize, capacity) catch return error.CapacityTooLarge;
-            const buffer = try allocator.alloc(T, cap);
+            // 极致优化：Buffer 物理对齐缓存行，避免首尾元素与结构体字段 False Sharing
+            const buffer = try allocator.alignedAlloc(T, std.mem.Alignment.fromByteUnits(CACHE_LINE), cap);
             @memset(buffer, @as(T, if (T == usize) 0 else undefined));
             return .{
                 .buffer = buffer,
                 .mask = cap - 1,
-                .head = std.atomic.Value(usize).init(0),
                 .tail = std.atomic.Value(usize).init(0),
+                .head = std.atomic.Value(usize).init(0),
             };
         }
 
@@ -57,21 +67,69 @@ pub fn RingBuffer(comptime T: type) type {
         // Hot-path
         /// 生产者：入队一元素，队满返回 false（§5.2 热路径 inline）
         pub inline fn push(self: *Self, value: T) bool {
-            const tail = self.tail.load(.monotonic);
-            if (tail - self.head.load(.acquire) >= self.buffer.len) return false;
-            self.buffer[tail & self.mask] = value;
-            self.tail.store(tail + 1, .release);
+            @setRuntimeSafety(false);
+            const t = self.tail.load(.monotonic);
+            // 极致压榨：先看本地缓存的 head，减少跨核缓存一致性流量 (§3.6)
+            if (t - self.cached_head >= self.buffer.len) {
+                self.cached_head = self.head.load(.acquire);
+                if (t - self.cached_head >= self.buffer.len) return false;
+            }
+            self.buffer[t & self.mask] = value;
+            self.tail.store(t + 1, .release);
             return true;
         }
 
         // Hot-path
         /// 消费者：出队一元素，队空返回 null（§5.2 热路径 inline）
         pub inline fn pop(self: *Self) ?T {
-            const head = self.head.load(.monotonic);
-            if (head >= self.tail.load(.acquire)) return null;
-            const value = self.buffer[head & self.mask];
-            self.head.store(head + 1, .release);
+            @setRuntimeSafety(false);
+            const h = self.head.load(.monotonic);
+            // 极致压榨：先看本地缓存的 tail
+            if (h >= self.cached_tail) {
+                self.cached_tail = self.tail.load(.acquire);
+                if (h >= self.cached_tail) return null;
+            }
+            const value = self.buffer[h & self.mask];
+            self.head.store(h + 1, .release);
             return value;
+        }
+
+        /// 生产者：批量入队（零拷贝思想 §3.4）
+        pub inline fn pushBatch(self: *Self, items: []const T) usize {
+            @setRuntimeSafety(false);
+            const t = self.tail.load(.monotonic);
+            var available = self.buffer.len - (t - self.cached_head);
+            if (available < items.len) {
+                self.cached_head = self.head.load(.acquire);
+                available = self.buffer.len - (t - self.cached_head);
+            }
+            const n = @min(available, items.len);
+            if (n == 0) return 0;
+
+            for (0..n) |i| {
+                self.buffer[(t + i) & self.mask] = items[i];
+            }
+            self.tail.store(t + n, .release);
+            return n;
+        }
+
+        /// 消费者：批量出队
+        pub inline fn popBatch(self: *Self, out: []T) usize {
+            @setRuntimeSafety(false);
+            const h = self.head.load(.monotonic);
+            var available = self.cached_tail - h;
+            if (available < out.len) {
+                self.cached_tail = self.tail.load(.acquire);
+                available = self.cached_tail - h;
+            }
+            const n = @min(available, out.len);
+            if (n == 0) return 0;
+
+            for (0..n) |i| {
+                out[i] = self.buffer[(h + i) & self.mask];
+            }
+            self.head.store(h + n, .release);
+            return n;
         }
 
         // Hot-path
@@ -79,8 +137,7 @@ pub fn RingBuffer(comptime T: type) type {
         pub inline fn count(self: *const Self) usize {
             const t = self.tail.load(.acquire);
             const h = self.head.load(.acquire);
-            if (t >= h) return t - h;
-            return 0;
+            return t -% h;
         }
     };
 }
