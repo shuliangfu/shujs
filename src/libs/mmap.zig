@@ -1,25 +1,20 @@
-// 文件 mmap 封装（mmap.zig）：只读与可写映射，零拷贝访问文件内容。
-//
-// 职责
-//   - mapFileReadOnly(path)：只读映射，返回 MappedFile，调用方 deinit 释放；
-//   - mapFileReadWrite(path)：可写映射（MAP_SHARED），返回 MappedFileWritable，写入同步到文件；
-//   - MappedFile / MappedFileWritable 提供 slice()、deinit()、prefetchRange(offset, length)（仅 POSIX）。
-//
-// 适用场景
-//   - 任意大小、任意格式文件；大文件（大模型权重、日志、数据集）时优势明显：不预分配整文件内存、按需换页，无「内核→用户缓冲」二次拷贝；
-//   - 格式无关：仅将文件按原始字节映射，由调用方按 slice() 得到的 []u8/[]const u8 自行解析。
-//
-// 平台
-//   - Linux/Darwin：posix mmap；Linux 上使用 MAP_POPULATE 预填页，大映射（≥2MB）时 madvise MADV_HUGEPAGE；
-//   - Windows：CreateFileMappingW + MapViewOfFile；deinit 时 UnmapViewOfFile + CloseHandle(mapping_handle)。
-//
-// 性能优化（规范 §1.7、§4.2）
-//   - 映射后 madvise(..., MADV_SEQUENTIAL)，顺序扫时预取与回收更优；
-//   - prefetchRange(offset, len)：madvise(..., MADV_WILLNEED)，适合稀疏访问；
-//   - Linux：MAP_POPULATE 减少首次访问缺页；MADV_HUGEPAGE 建议 THP，减少 TLB 未命中。
-//
-// 调用约定
-//   - mapFileReadOnly / mapFileReadWrite 返回的句柄由调用方在不再使用时调用 deinit；未 deinit 前 slice() 有效。
+//! 文件 mmap 封装（mmap.zig）
+//!
+//! 职责：
+//!   - 提供高性能只读与可写映射接口，实现零拷贝访问文件内容。
+//!   - 针对不同操作系统内核提供特化的预取与性能提示。
+//!
+//! 极致压榨亮点：
+//!   1. **Windows 预扫描优化**：直接调用 `CreateFileW` 并指定 `FILE_FLAG_SEQUENTIAL_SCAN`，极大提升顺序读取性能。
+//!   2. **Linux NUMA 绑定**：支持 `mbindToCurrentNode` 将映射区域强制分配在当前处理器的本地 NUMA 节点上。
+//!   3. **macOS 激进预读**：利用 macOS 特有的 `F_RDAHEAD` 与 `MADV_WILLNEED` 实现大文件的异步背景预加载。
+//!   4. **大页提示**：在 Linux 上检测到映射大于 2MB 时自动触发 `MADV_HUGEPAGE`，减少 TLB 未命中开销。
+//!   5. **窄化错误集**：针对映射路径精选 `MmapError` 错误集，优化编译器生成的跳转表性能。
+//!
+//! 适用规范：
+//!   - 遵循 00 §1.7（大文件与 mmap）、§4.2（Linux NUMA 与内存池）。
+//!
+//! [Allocates] 返回的句柄须由调用方显式执行 `deinit`。
 
 const std = @import("std");
 const builtin = @import("builtin");
