@@ -1,19 +1,20 @@
-// 无锁单生产者单消费者环形队列（RingBuffer），平台无关。
-//
-// 职责
-//   - 在 Thread-per-Core 架构下，用于线程间传递任务或描述符（如 fd、user_data 等）；
-//   - 单生产者单消费者（SPSC）、固定容量、无锁，T 需为指针或 usize 等单字类型以保证原子读写。
-//
-// 约束与约定
-//   - 容量在 init 时取不小于 capacity 的最小 2 的幂，便于用 mask 取模；
-//   - 多生产者场景需改用 MPSC 或 per-core 队列，本实现不保证正确性。
-//
-// 性能与规范
-//   - §5.3 假共享防护：head 与 tail 之间插入缓存行填充，使两原子变量不在同一 64 字节缓存行，避免 False Sharing；
-//   - §5.2 热路径：push、pop、count 为 inline fn，减少调用开销。
-//
-// 内存
-//   - init(allocator, capacity) 使用传入的 allocator 分配 buffer；deinit(allocator) 由调用方调用，负责 free。
+//! 高性能无锁环形缓冲区（ring_buffer.zig）
+//!
+//! 职责：
+//!   - 提供单生产者单消费者（SPSC）无锁队列实现，用于高性能线程间通信。
+//!   - 实现硬件级的伪共享（False Sharing）防御。
+//!
+//! 极致压榨亮点：
+//!   1. **缓存行对齐隔离**：`head` 与 `tail` 严格按 `std.atomic.cache_line` 对齐并隔离，消除核间缓存一致性风暴。
+//!   2. **本地索引缓存**：在 `push`/`pop` 过程中优先使用 `cached_head`/`cached_tail`，显著减少昂贵的原子指令执行频率。
+//!   3. **批量操作优化**：提供 `pushBatch` 与 `popBatch` 接口，仅需一次原子操作即可传输整块数据，压榨内存带宽。
+//!   4. **对齐内存分配**：底层数据区采用缓存行对齐分配，确保 SIMD 盲读与 DMA 操作的硬件友好性。
+//!   5. **内存顺序细化**：精细控制 `.monotonic` 与 `.release` 屏障，在保证正确性的前提下提供最高吞吐量。
+//!
+//! 适用规范：
+//!   - 遵循 00 §3.5（无锁环形缓冲区）、§5.3（伪共享防御）。
+//!
+//! [Allocates] 缓冲区由 `init` 分配，调用方负责 `deinit`。
 
 const std = @import("std");
 
