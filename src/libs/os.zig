@@ -207,22 +207,124 @@ pub fn getCpuCount() u32 {
 }
 
 /// 获取系统整体 CPU 利用率（0..100）。需两次采样，首次或缓存过期时会阻塞约 CPU_SAMPLE_INTERVAL_MS。
-/// Linux 读 /proc/stat 首行 "cpu " 的 user+nice+system+idle+... 求 delta，(total-idle)/total*100。
+/// Linux 读 /proc/stat；macOS 用 host_statistics(HOST_CPU_LOAD_INFO)；Windows 用 GetSystemTimes。
 pub fn getCpuUsage() OsError!u32 {
     return switch (builtin.os.tag) {
         .linux => getCpuUsageLinux() orelse return error.IoError,
+        .macos => getCpuUsageMacos() orelse return error.IoError,
+        .windows => getCpuUsageWindows() orelse return error.IoError,
         else => error.Unsupported,
     };
 }
 
+fn nanoTime() u64 {
+    if (builtin.os.tag == .windows) {
+        var ft: win.FILETIME = undefined;
+        win.kernel32.GetSystemTimeAsFileTime(&ft);
+        const intervals = (@as(u64, ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+        return intervals * 100;
+    } else {
+        var ts: posix.timespec = undefined;
+        if (builtin.os.tag == .linux) {
+            _ = std.os.linux.clock_gettime(posix.CLOCK.MONOTONIC, &ts);
+        } else {
+            if (std.posix.system.clock_gettime(posix.CLOCK.MONOTONIC, &ts) != 0) return 0;
+        }
+        return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec);
+    }
+}
+
+fn sleepMs(ms: u32) void {
+    if (builtin.os.tag == .windows) {
+        win.kernel32.Sleep(ms);
+    } else {
+        const ts = posix.timespec{
+            .sec = @intCast(ms / 1000),
+            .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
+        };
+        _ = std.posix.system.nanosleep(&ts, null);
+    }
+}
+
+fn getCpuUsageMacos() ?u32 {
+    const c = @cImport({
+        @cInclude("mach/mach.h");
+    });
+    const now_u = nanoTime();
+    if (now_u < cpu_cache_ts_ns + CACHE_VALID_NS and cpu_cache_ts_ns != 0) {
+        return cpu_usage_cache_percent;
+    }
+    
+    var count: c.mach_msg_type_number_t = c.HOST_CPU_LOAD_INFO_COUNT;
+    var cpu0: c.host_cpu_load_info_data_t = undefined;
+    if (c.host_statistics(c.mach_host_self(), c.HOST_CPU_LOAD_INFO, @ptrCast(&cpu0), &count) != c.KERN_SUCCESS) return null;
+    
+    sleepMs(CPU_SAMPLE_INTERVAL_MS);
+    
+    var cpu1: c.host_cpu_load_info_data_t = undefined;
+    if (c.host_statistics(c.mach_host_self(), c.HOST_CPU_LOAD_INFO, @ptrCast(&cpu1), &count) != c.KERN_SUCCESS) return null;
+    
+    var total0: u64 = 0;
+    var total1: u64 = 0;
+    for (0..c.CPU_STATE_MAX) |i| {
+        total0 += cpu0.cpu_ticks[i];
+        total1 += cpu1.cpu_ticks[i];
+    }
+    const idle0 = cpu0.cpu_ticks[c.CPU_STATE_IDLE];
+    const idle1 = cpu1.cpu_ticks[c.CPU_STATE_IDLE];
+    
+    const total_d = if (total1 > total0) total1 - total0 else 0;
+    const idle_d = if (idle1 > idle0) idle1 - idle0 else 0;
+    if (total_d == 0) return 0;
+    const percent = @min(100, @as(u32, @intCast((total_d - idle_d) * 100 / total_d)));
+    cpu_usage_cache_percent = percent;
+    cpu_cache_ts_ns = now_u;
+    return percent;
+}
+
+fn getCpuUsageWindows() ?u32 {
+    const now_u = nanoTime();
+    if (now_u < cpu_cache_ts_ns + CACHE_VALID_NS and cpu_cache_ts_ns != 0) {
+        return cpu_usage_cache_percent;
+    }
+
+    var idle0: win.FILETIME = undefined;
+    var kernel0: win.FILETIME = undefined;
+    var user0: win.FILETIME = undefined;
+    if (win.kernel32.GetSystemTimes(&idle0, &kernel0, &user0) == 0) return null;
+
+    sleepMs(CPU_SAMPLE_INTERVAL_MS);
+
+    var idle1: win.FILETIME = undefined;
+    var kernel1: win.FILETIME = undefined;
+    var user1: win.FILETIME = undefined;
+    if (win.kernel32.GetSystemTimes(&idle1, &kernel1, &user1) == 0) return null;
+
+    const idle_v0 = (@as(u64, idle0.dwHighDateTime) << 32) | idle0.dwLowDateTime;
+    const kernel_v0 = (@as(u64, kernel0.dwHighDateTime) << 32) | kernel0.dwLowDateTime;
+    const user_v0 = (@as(u64, user0.dwHighDateTime) << 32) | user0.dwLowDateTime;
+    const idle_v1 = (@as(u64, idle1.dwHighDateTime) << 32) | idle1.dwLowDateTime;
+    const kernel_v1 = (@as(u64, kernel1.dwHighDateTime) << 32) | kernel1.dwLowDateTime;
+    const user_v1 = (@as(u64, user1.dwHighDateTime) << 32) | user1.dwLowDateTime;
+
+    const idle_d = idle_v1 - idle_v0;
+    const kernel_d = kernel_v1 - kernel_v0;
+    const user_d = user_v1 - user_v0;
+    const total_d = kernel_d + user_d;
+    if (total_d == 0) return 0;
+    const percent = @min(100, @as(u32, @intCast((total_d - idle_d) * 100 / total_d)));
+    cpu_usage_cache_percent = percent;
+    cpu_cache_ts_ns = now_u;
+    return percent;
+}
+
 fn getCpuUsageLinux() ?u32 {
-    const now_ns = std.time.nanoTimestamp();
-    const now_u = if (now_ns < 0) 0 else @as(u64, @intCast(now_ns));
+    const now_u = nanoTime();
     if (now_u < cpu_cache_ts_ns + CACHE_VALID_NS and cpu_cache_ts_ns != 0) {
         return cpu_usage_cache_percent;
     }
     const s0 = readProcStatCpuLine() orelse return null;
-    std.time.sleep(CPU_SAMPLE_INTERVAL_MS * std.time.ns_per_ms);
+    sleepMs(CPU_SAMPLE_INTERVAL_MS);
     const s1 = readProcStatCpuLine() orelse return null;
     const total_delta = if (s1.total > s0.total) s1.total - s0.total else 0;
     const idle_delta = if (s1.idle > s0.idle) s1.idle - s0.idle else 0;
@@ -356,11 +458,48 @@ var net_cache_ts_ns: u64 = 0;
 // 内存（各平台可扩展）
 // -----------------------------------------------------------------------------
 
-/// 获取系统内存信息。Linux 读 /proc/meminfo 的 MemTotal、MemAvailable（无则用 MemFree）。不分配内存。
+/// 获取系统内存信息。Linux 读 /proc/meminfo；macOS 用 host_statistics(HOST_VM_INFO)；Windows 用 GlobalMemoryStatusEx。
 pub fn getMemoryInfo() OsError!MemoryInfo {
     return switch (builtin.os.tag) {
         .linux => getMemoryInfoLinux() orelse return error.IoError,
+        .macos => getMemoryInfoMacos() orelse return error.IoError,
+        .windows => getMemoryInfoWindows() orelse return error.IoError,
         else => error.Unsupported,
+    };
+}
+
+fn getMemoryInfoMacos() ?MemoryInfo {
+    const c = @cImport({
+        @cInclude("mach/mach.h");
+        @cInclude("sys/sysctl.h");
+    });
+    var stats: c.vm_statistics64_data_t = undefined;
+    var count: c.mach_msg_type_number_t = c.HOST_VM_INFO64_COUNT;
+    if (c.host_statistics64(c.mach_host_self(), c.HOST_VM_INFO64, @ptrCast(&stats), &count) != c.KERN_SUCCESS) return null;
+    
+    var page_size: c.vm_size_t = 0;
+    if (c.host_page_size(c.mach_host_self(), &page_size) != c.KERN_SUCCESS) page_size = 4096;
+    
+    var total_bytes: u64 = 0;
+    var size: usize = @sizeOf(u64);
+    if (c.sysctlbyname("hw.memsize", &total_bytes, &size, null, 0) != 0) return null;
+    
+    const free_pages = @as(u64, stats.free_count) + @as(u64, stats.inactive_count);
+    const available_kb = (free_pages * page_size) / 1024;
+    
+    return .{
+        .total_kb = total_bytes / 1024,
+        .available_kb = available_kb,
+    };
+}
+
+fn getMemoryInfoWindows() ?MemoryInfo {
+    var status: win.MEMORYSTATUSEX = undefined;
+    status.dwLength = @sizeOf(win.MEMORYSTATUSEX);
+    if (win.kernel32.GlobalMemoryStatusEx(&status) == 0) return null;
+    return .{
+        .total_kb = status.ullTotalPhys / 1024,
+        .available_kb = status.ullAvailPhys / 1024,
     };
 }
 
@@ -503,7 +642,7 @@ pub fn getProcessCpuUsage() OsError!u32 {
 
 fn getProcessCpuUsageLinux() ?u32 {
     const t0 = readProcSelfStatUtimeStime() orelse return null;
-    std.time.sleep(CPU_SAMPLE_INTERVAL_MS * std.time.ns_per_ms);
+    sleepMs(CPU_SAMPLE_INTERVAL_MS);
     const t1 = readProcSelfStatUtimeStime() orelse return null;
     const interval_ticks = CLK_TCK * CPU_SAMPLE_INTERVAL_MS / 1000;
     if (interval_ticks == 0) return 0;
@@ -545,7 +684,7 @@ pub fn getCpuUsagePerCore(allocator: std.mem.Allocator) OsError![]u32 {
 fn getCpuUsagePerCoreLinux(allocator: std.mem.Allocator) ?[]u32 {
     const t0 = readProcStatAllCpuLines(allocator) orelse return null;
     defer allocator.free(t0);
-    std.time.sleep(CPU_SAMPLE_INTERVAL_MS * std.time.ns_per_ms);
+    sleepMs(CPU_SAMPLE_INTERVAL_MS);
     const t1 = readProcStatAllCpuLines(allocator) orelse return null;
     defer allocator.free(t1);
     if (t0.len != t1.len or t0.len == 0) return null;
@@ -611,13 +750,12 @@ pub fn getDiskUtilization() OsError!u32 {
 }
 
 fn getDiskUtilizationLinux() ?u32 {
-    const now_ns = std.time.nanoTimestamp();
-    const now_u = if (now_ns < 0) 0 else @as(u64, @intCast(now_ns));
+    const now_u = nanoTime();
     if (now_u < disk_cache_ts_ns + CACHE_VALID_NS and disk_cache_ts_ns != 0) {
         return disk_utilization_cache_percent;
     }
     const t0 = readDiskstatsIoTicks() orelse return null;
-    std.time.sleep(DISK_SAMPLE_INTERVAL_MS * std.time.ns_per_ms);
+    sleepMs(DISK_SAMPLE_INTERVAL_MS);
     const t1 = readDiskstatsIoTicks() orelse return null;
     const delta_ms = if (t1 > t0) t1 - t0 else 0;
     const percent = diskDeltaToPercent(delta_ms);
@@ -674,7 +812,7 @@ pub fn getDiskUtilizationPerDevice(allocator: std.mem.Allocator) OsError![]DiskD
 fn getDiskUtilizationPerDeviceLinux(allocator: std.mem.Allocator) ?[]DiskDeviceUtil {
     const t0 = readDiskstatsPerDevice(allocator) orelse return null;
     defer freeDiskstatsPerDevice(allocator, t0);
-    std.time.sleep(DISK_SAMPLE_INTERVAL_MS * std.time.ns_per_ms);
+    sleepMs(DISK_SAMPLE_INTERVAL_MS);
     const t1 = readDiskstatsPerDevice(allocator) orelse return null;
     defer freeDiskstatsPerDevice(allocator, t1);
     if (t0.len != t1.len) {
@@ -790,13 +928,12 @@ pub fn getNetworkActivityBytesDelta() OsError!u64 {
 }
 
 fn getNetworkActivityLinux() ?u64 {
-    const now_ns = std.time.nanoTimestamp();
-    const now_u = if (now_ns < 0) 0 else @as(u64, @intCast(now_ns));
+    const now_u = nanoTime();
     if (now_u < net_cache_ts_ns + CACHE_VALID_NS and net_cache_ts_ns != 0) {
         return net_bytes_delta_cache;
     }
     const t0 = readNetDevTotalBytes() orelse return null;
-    std.time.sleep(NET_SAMPLE_INTERVAL_MS * std.time.ns_per_ms);
+    sleepMs(NET_SAMPLE_INTERVAL_MS);
     const t1 = readNetDevTotalBytes() orelse return null;
     const delta = if (t1 > t0) t1 - t0 else 0;
     net_bytes_delta_cache = delta;
