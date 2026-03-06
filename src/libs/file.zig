@@ -506,26 +506,33 @@ const AsyncFileIODarwin = struct {
     /// 已完成项列表（01 §1.2 Unmanaged）
     done_list: std.ArrayListUnmanaged(api.Completion) = undefined,
     cond: std.Io.Condition = std.Io.Condition.init,
-    worker: ?std.Thread = null,
+    workers: []std.Thread = &.{},
     shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn init(allocator: std.mem.Allocator) !AsyncFileIODarwin {
         const done_list = std.ArrayListUnmanaged(api.Completion).initCapacity(allocator, MAX_FILE_PENDING_DARWIN) catch return error.OutOfMemory;
         const completion_buffer = try allocator.alloc(api.Completion, MAX_FILE_PENDING_DARWIN);
+        const cpu_count = std.Thread.getCpuCount() catch 1;
+        const worker_count = @max(1, @min(cpu_count, 4)); // 限制最多 4 个线程避免 context switch 损耗
+        const workers = try allocator.alloc(std.Thread, worker_count);
         var self = AsyncFileIODarwin{
             .allocator = allocator,
             .completion_buffer = completion_buffer,
             .completion_count = 0,
             .done_list = done_list,
+            .workers = workers,
         };
-        self.worker = try std.Thread.spawn(.{}, workerRunDarwin, .{&self});
+        for (0..worker_count) |i| {
+            self.workers[i] = try std.Thread.spawn(.{}, workerRunDarwin, .{&self});
+        }
         return self;
     }
 
     pub fn deinit(self: *AsyncFileIODarwin) void {
         self.shutdown.store(true, .seq_cst);
-        if (libs_process.getProcessIo()) |io| self.cond.signal(io);
-        if (self.worker) |t| t.join();
+        if (libs_process.getProcessIo()) |io| self.cond.broadcast(io);
+        for (self.workers) |t| t.join();
+        self.allocator.free(self.workers);
         self.done_list.deinit(self.allocator);
         self.allocator.free(self.completion_buffer);
         self.* = undefined;
@@ -643,9 +650,8 @@ const AsyncFileIODarwin = struct {
         const n = @min(self.done_list.items.len, self.completion_buffer.len);
         if (n > 0) {
             std.mem.copyForwards(api.Completion, self.completion_buffer[0..n], self.done_list.items[0..n]);
-            var i: usize = n;
-            while (i < self.done_list.items.len) : (i += 1) {
-                self.done_list.items[i - n] = self.done_list.items[i];
+            if (n < self.done_list.items.len) {
+                std.mem.copyForwards(api.Completion, self.done_list.items[0 .. self.done_list.items.len - n], self.done_list.items[n..]);
             }
             self.done_list.shrinkRetainingCapacity(self.done_list.items.len - n);
         }
@@ -681,26 +687,33 @@ const AsyncFileIOWindows = struct {
     /// 已完成项列表（01 §1.2 Unmanaged）
     done_list: std.ArrayListUnmanaged(api.Completion) = undefined,
     cond: std.Io.Condition = std.Io.Condition.init,
-    worker: ?std.Thread = null,
+    workers: []std.Thread = &.{},
     shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn init(allocator: std.mem.Allocator) !AsyncFileIOWindows {
         const done_list = std.ArrayListUnmanaged(api.Completion).initCapacity(allocator, MAX_FILE_PENDING_WIN) catch return error.OutOfMemory;
         const completion_buffer = try allocator.alloc(api.Completion, MAX_FILE_PENDING_WIN);
+        const cpu_count = std.Thread.getCpuCount() catch 1;
+        const worker_count = @max(1, @min(cpu_count, 4));
+        const workers = try allocator.alloc(std.Thread, worker_count);
         var self = AsyncFileIOWindows{
             .allocator = allocator,
             .completion_buffer = completion_buffer,
             .completion_count = 0,
             .done_list = done_list,
+            .workers = workers,
         };
-        self.worker = try std.Thread.spawn(.{}, workerRunWin, .{&self});
+        for (0..worker_count) |i| {
+            self.workers[i] = try std.Thread.spawn(.{}, workerRunWin, .{&self});
+        }
         return self;
     }
 
     pub fn deinit(self: *AsyncFileIOWindows) void {
         self.shutdown.store(true, .seq_cst);
-        if (libs_process.getProcessIo()) |io| self.cond.signal(io);
-        if (self.worker) |t| t.join();
+        if (libs_process.getProcessIo()) |io| self.cond.broadcast(io);
+        for (self.workers) |t| t.join();
+        self.allocator.free(self.workers);
         self.done_list.deinit(self.allocator);
         self.allocator.free(self.completion_buffer);
         self.* = undefined;
@@ -720,32 +733,40 @@ const AsyncFileIOWindows = struct {
                 comp.chunk_index = null;
                 if (j.op == .read) {
                     var bytes_read: win.DWORD = 0;
-                    const move: win.LARGE_INTEGER = @intCast(j.offset);
-                    if (kernel32.SetFilePointerEx(j.handle, move, null, FILE_BEGIN_WIN) == 0) {
-                        comp.buffer_ptr = j.buffer_ptr;
-                        comp.len = 0;
-                        comp.tag = .file_read;
-                        comp.file_err = error.FileRead;
-                    } else if (kernel32.ReadFile(j.handle, j.buffer_ptr, @intCast(j.len), &bytes_read, null) != 0) {
+                    var ov = win.OVERLAPPED{
+                        .Internal = 0,
+                        .InternalHigh = 0,
+                        .Union = .{ .Offset = @intCast(j.offset & 0xFFFFFFFF), .OffsetHigh = @intCast(j.offset >> 32) },
+                        .hEvent = null,
+                    };
+                    if (kernel32.ReadFile(j.handle, j.buffer_ptr, @intCast(j.len), &bytes_read, &ov) != 0) {
                         comp.buffer_ptr = j.buffer_ptr;
                         comp.len = bytes_read;
                         comp.tag = .file_read;
                         comp.file_err = null;
                     } else {
-                        comp.buffer_ptr = j.buffer_ptr;
-                        comp.len = 0;
-                        comp.tag = .file_read;
-                        comp.file_err = error.FileRead;
+                        const err = win.kernel32.GetLastError();
+                        if (err == win.win32_error.HANDLE_EOF) {
+                            comp.buffer_ptr = j.buffer_ptr;
+                            comp.len = 0;
+                            comp.tag = .file_read;
+                            comp.file_err = null;
+                        } else {
+                            comp.buffer_ptr = j.buffer_ptr;
+                            comp.len = 0;
+                            comp.tag = .file_read;
+                            comp.file_err = error.FileRead;
+                        }
                     }
                 } else {
                     var bytes_written: win.DWORD = 0;
-                    const move: win.LARGE_INTEGER = @intCast(j.offset);
-                    if (kernel32.SetFilePointerEx(j.handle, move, null, FILE_BEGIN_WIN) == 0) {
-                        comp.buffer_ptr = @ptrCast(&[_]u8{});
-                        comp.len = 0;
-                        comp.tag = .file_write;
-                        comp.file_err = error.FileWrite;
-                    } else if (kernel32.WriteFile(j.handle, j.data_ptr, @intCast(j.len), &bytes_written, null) != 0) {
+                    var ov = win.OVERLAPPED{
+                        .Internal = 0,
+                        .InternalHigh = 0,
+                        .Union = .{ .Offset = @intCast(j.offset & 0xFFFFFFFF), .OffsetHigh = @intCast(j.offset >> 32) },
+                        .hEvent = null,
+                    };
+                    if (kernel32.WriteFile(j.handle, j.data_ptr, @intCast(j.len), &bytes_written, &ov) != 0) {
                         comp.buffer_ptr = @ptrCast(&[_]u8{});
                         comp.len = bytes_written;
                         comp.tag = .file_write;
@@ -824,9 +845,8 @@ const AsyncFileIOWindows = struct {
         const n = @min(self.done_list.items.len, self.completion_buffer.len);
         if (n > 0) {
             std.mem.copyForwards(api.Completion, self.completion_buffer[0..n], self.done_list.items[0..n]);
-            var i: usize = n;
-            while (i < self.done_list.items.len) : (i += 1) {
-                self.done_list.items[i - n] = self.done_list.items[i];
+            if (n < self.done_list.items.len) {
+                std.mem.copyForwards(api.Completion, self.done_list.items[0 .. self.done_list.items.len - n], self.done_list.items[n..]);
             }
             self.done_list.shrinkRetainingCapacity(self.done_list.items.len - n);
         }
