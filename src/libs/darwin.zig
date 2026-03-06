@@ -243,7 +243,7 @@ pub const HighPerfIO = struct {
             gop.value_ptr.* = PendingAcceptQueue.init(self.allocator, self.max_connections) catch return;
         }
         if (!gop.value_ptr.push(user_data)) return;
-        
+
         var found = false;
         for (self.listen_fds[0..self.listen_count]) |fd| {
             if (fd == listen_fd) {
@@ -365,7 +365,7 @@ pub const HighPerfIO = struct {
             }
             // Darwin 优化：如果监听器是非阻塞的，accept 返回的 socket 会继承该标志，
             // 从而在此热路径中省掉每连接一次的 fcntl 及其内部 2 次系统调用。
-            
+
             const slot_index = self.popFreeSlot() orelse {
                 _ = std.c.close(client_fd);
                 self.chunk_cache.release(chunk_index);
