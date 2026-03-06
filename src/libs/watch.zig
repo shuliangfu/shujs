@@ -10,7 +10,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 /// 缓存行宽度，用于跨线程原子/锁的隔离（00 §5.3 False Sharing 防御）
-const CACHE_LINE_BYTES = 64;
+const CACHE_LINE = std.atomic.cache_line;
 
 /// 事件类型：与 Node.js fs.watch 的 eventType 一致
 pub const WatchEventType = enum { change, rename };
@@ -49,111 +49,134 @@ pub const WatchHandle = struct {
 };
 
 // ---------- Linux：inotify 实现 ----------
-/// 无 io 场景下的自旋锁（与 fetch 一致）；Zig 0.16 无 std.Thread.Mutex 时使用
-const Spinlock = struct {
-    state: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    fn lock(self: *Spinlock) void {
-        while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) == null) {
-            std.Thread.yield() catch {};
-        }
-    }
-    fn unlock(self: *Spinlock) void {
-        self.state.store(0, .release);
-    }
-};
-
-/// 通用事件队列：无锁环形队列替代 ArrayList.orderedRemove(0) 以压榨 drain 性能（00 §3.5、§5.3）
-/// 由于 WatchEvent 含有切片，不适合 RingBuffer(T)，故用 Mutex 保护的循环队列
-fn WatchEventRing(comptime CAP: usize) type {
+/// 极速单生产者单消费者（SPSC）无锁环形队列；容量必须为 2 的幂（00 §3.5、§5.3）
+/// head 与 tail 分别对齐缓存行，避免 False Sharing；
+fn WatchEventQueue(comptime T: type, comptime CAP: usize) type {
+    const mask = CAP - 1;
+    std.debug.assert(std.math.isPowerOfTwo(CAP));
     return struct {
-        buf: [CAP]WatchEvent = undefined,
-        head: usize = 0,
-        len: usize = 0,
+        buffer: [CAP]T = undefined,
+        _pad_prod: [CACHE_LINE]u8 align(CACHE_LINE) = undefined,
+        tail: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        cached_head: usize = 0,
 
-        fn readItem(self: *@This()) ?WatchEvent {
-            if (self.len == 0) return null;
-            const i = self.head;
-            self.head = (self.head + 1) % CAP;
-            self.len -= 1;
-            return self.buf[i];
-        }
-        fn writeItem(self: *@This(), item: WatchEvent) bool {
-            if (self.len >= CAP) return false;
-            const tail = (self.head + self.len) % CAP;
-            self.buf[tail] = item;
-            self.len += 1;
+        _pad_cons: [CACHE_LINE]u8 align(CACHE_LINE) = undefined,
+        head: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        cached_tail: usize = 0,
+
+        const Self = @This();
+
+        /// 生产者：入队
+        pub fn push(self: *Self, value: T) bool {
+            @setRuntimeSafety(false);
+            const t = self.tail.load(.monotonic);
+            if (t - self.cached_head >= CAP) {
+                self.cached_head = self.head.load(.acquire);
+                if (t - self.cached_head >= CAP) return false;
+            }
+            self.buffer[t & mask] = value;
+            self.tail.store(t + 1, .release);
             return true;
+        }
+
+        /// 消费者：出队
+        pub fn pop(self: *Self) ?T {
+            @setRuntimeSafety(false);
+            const h = self.head.load(.monotonic);
+            if (h >= self.cached_tail) {
+                self.cached_tail = self.tail.load(.acquire);
+                if (h >= self.cached_tail) return null;
+            }
+            const value = self.buffer[h & mask];
+            self.head.store(h + 1, .release);
+            return value;
+        }
+
+        /// 消费者：批量出队（减少跨核缓存一致性流量）
+        pub fn popBatch(self: *Self, out: []WatchEvent) usize {
+            @setRuntimeSafety(false);
+            const h = self.head.load(.monotonic);
+            var available = self.cached_tail - h;
+            if (available < out.len) {
+                self.cached_tail = self.tail.load(.acquire);
+                available = self.cached_tail - h;
+            }
+            const n = @min(available, out.len);
+            if (n == 0) return 0;
+            for (0..n) |i| {
+                out[i] = self.buffer[(h + i) & mask];
+            }
+            self.head.store(h + n, .release);
+            return n;
         }
     };
 }
 
-const WATCH_EVENT_CAP = 256;
+const WATCH_EVENT_CAP = 4096;
 
-/// Linux inotify 句柄；closed 与 event_mutex 缓存行隔离，减少主/工作线程 false sharing（00 §5.3）
+/// Linux inotify 句柄；closed 与 event_queue 分别对齐，极致减少缓存抖动（00 §5.3）
 const WatchHandleLinux = struct {
-    closed: std.atomic.Value(bool),
-    /// 填充至 64 字节，使 event_mutex 从下一缓存行开始
-    _pad: [CACHE_LINE_BYTES - @sizeOf(std.atomic.Value(bool))]u8 = undefined,
+    closed: std.atomic.Value(bool) align(CACHE_LINE),
     fd: std.posix.fd_t,
     wd: i32,
     allocator: std.mem.Allocator,
-    event_ring: WatchEventRing(WATCH_EVENT_CAP) = .{},
-    event_mutex: Spinlock = .{},
+    event_queue: WatchEventQueue(WatchEvent, WATCH_EVENT_CAP) align(CACHE_LINE) = .{},
     thread: std.Thread = undefined,
     thread_started: bool = false,
 
-    const INOTIFY_BUF_LEN = 4096;
+    const INOTIFY_BUF_LEN = 64 * 1024; // 64KB 缓冲区，支持大量瞬时并发事件
 
-    /// 工作线程入口：读 inotify 事件，映射为 change/rename，入队；不触碰 JSC
+    /// 工作线程入口：阻塞读 inotify 事件，映射并入队；关闭 fd 会唤醒此循环
     fn runThread(self: *WatchHandleLinux) void {
+        @setRuntimeSafety(false);
         var buf: [INOTIFY_BUF_LEN]u8 align(@alignOf(std.posix.linux.inotify_event)) = undefined;
         while (true) {
             if (self.closed.load(.acquire)) break;
-            const n = std.posix.read(self.fd, &buf) catch continue;
-            if (n <= 0) continue;
+            // 使用阻塞读以压榨 CPU 效率（00 §3.3 虽推荐非阻塞，但此为专用线程且读操作低频高瞬发）
+            const n = std.posix.read(self.fd, &buf) catch break;
+            if (n <= 0) break;
             var off: usize = 0;
             while (off + @sizeOf(std.posix.linux.inotify_event) <= n) {
                 const ev = @as(*const std.posix.linux.inotify_event, @ptrCast(&buf[off]));
                 off += @sizeOf(std.posix.linux.inotify_event);
                 const name_len = ev.len;
-                const name_slice: []const u8 = if (name_len > 0 and off + name_len <= n)
-                    buf[off..][0..name_len]
-                else
-                    "";
+                const name_slice: []const u8 = if (name_len > 0 and off + name_len <= n) blk: {
+                    const s = buf[off..][0..name_len];
+                    const actual_len = std.mem.indexOfScalar(u8, s, 0) orelse s.len;
+                    break :blk s[0..actual_len];
+                } else "";
                 off += name_len;
 
-                const event_type: WatchEventType = blk: {
-                    const m = ev.mask;
-                    if (m & (std.posix.linux.IN.MOVED_FROM | std.posix.linux.IN.MOVED_TO | std.posix.linux.IN.CREATE | std.posix.linux.IN.DELETE | std.posix.linux.IN.DELETE_SELF | std.posix.linux.IN.MOVE_SELF) != 0)
-                        break :blk .rename;
-                    break :blk .change;
-                };
-                const filename_owned = if (name_slice.len > 0)
-                    self.allocator.dupe(u8, name_slice) catch continue
+                // 映射事件类型 (rename/change)
+                const event_type: WatchEventType = if (ev.mask & (std.posix.linux.IN.MOVED_FROM | std.posix.linux.IN.MOVED_TO | std.posix.linux.IN.CREATE | std.posix.linux.IN.DELETE | std.posix.linux.IN.DELETE_SELF | std.posix.linux.IN.MOVE_SELF) != 0)
+                    .rename
                 else
-                    self.allocator.dupe(u8, &.{}) catch continue;
+                    .change;
 
-                self.event_mutex.lock();
-                defer self.event_mutex.unlock();
-                if (!self.event_ring.writeItem(.{ .event_type = event_type, .filename = filename_owned })) {
+                // [Allocates] 为 JS 侧提供堆分配名称 (01 §1.3)
+                const filename_owned = self.allocator.dupe(u8, name_slice) catch continue;
+
+                if (!self.event_queue.push(.{ .event_type = event_type, .filename = filename_owned })) {
+                    // 队列溢出，丢弃事件，释放内存 (01 §1.1)
                     self.allocator.free(filename_owned);
                 }
             }
         }
     }
 
-    /// 置 closed、移除 watch、join 线程、释放 event_ring 及其中 filename；idempotent
+    /// 置 closed、销毁 watch、join 线程、清理队列 (idempotent)
     fn deinit(self: *WatchHandleLinux) void {
         self.closed.store(true, .release);
         if (self.fd != std.posix.INVALID_FD) {
             _ = std.posix.linux.inotify_rm_watch(self.fd, @intCast(self.wd));
+            // 关闭 fd 会唤醒 read 阻塞，终止 runThread
             std.posix.close(self.fd);
             self.fd = std.posix.INVALID_FD;
         }
         if (self.thread_started) self.thread.join();
-        self.event_mutex.lock();
-        defer self.event_mutex.unlock();
-        while (self.event_ring.readItem()) |e| {
+        
+        // 清理未被 drain 的残留内存
+        while (self.event_queue.pop()) |e| {
             if (e.filename.len > 0) self.allocator.free(e.filename);
         }
     }
@@ -169,20 +192,19 @@ const NOTE_EXTEND: u32 = 0x0008;
 const NOTE_ATTRIB: u32 = 0x0010;
 const NOTE_RENAME: u32 = 0x0020;
 
-/// Darwin/BSD kqueue 句柄；closed 与 event_mutex 缓存行隔离（00 §5.3）
+/// Darwin/BSD kqueue 句柄；对齐并隔离，消除跨核 CPU 缓存争用（00 §3.5、§5.3）
 const WatchHandleDarwin = struct {
-    closed: std.atomic.Value(bool),
-    _pad: [CACHE_LINE_BYTES - @sizeOf(std.atomic.Value(bool))]u8 = undefined,
+    closed: std.atomic.Value(bool) align(CACHE_LINE),
     path_fd: posix.fd_t,
     kq_fd: posix.fd_t,
     allocator: std.mem.Allocator,
-    event_ring: WatchEventRing(WATCH_EVENT_CAP) = .{},
-    event_mutex: Spinlock = .{},
+    event_queue: WatchEventQueue(WatchEvent, WATCH_EVENT_CAP) align(CACHE_LINE) = .{},
     thread: std.Thread = undefined,
     thread_started: bool = false,
 
-    /// 工作线程入口：kevent 取 EVFILT_VNODE，入队；不触碰 JSC
+    /// 工作线程入口：kevent 阻塞等待 EVFILT_VNODE 事件
     fn runThread(self: *WatchHandleDarwin) void {
+        @setRuntimeSafety(false);
         var ev_list: [1]posix.Kevent = undefined;
         const changelist = [_]posix.Kevent{.{
             .ident = @intCast(self.path_fd),
@@ -197,33 +219,33 @@ const WatchHandleDarwin = struct {
         while (true) {
             if (self.closed.load(.acquire)) break;
             const n = std.c.kevent(self.kq_fd, dummy_changelist[0..].ptr, 0, ev_list[0..].ptr, 1, null);
-            if (n <= 0) continue;
+            if (n <= 0) break;
+            
             const fflags = ev_list[0].fflags;
-            const ev_type = if (fflags & (NOTE_DELETE | NOTE_RENAME) != 0) WatchEventType.rename else WatchEventType.change;
+            const ev_type: WatchEventType = if (fflags & (NOTE_DELETE | NOTE_RENAME) != 0) .rename else .change;
+            
+            // Darwin vnode 监视不直接返回文件名，由 JS 层按需读取或全量扫描 (TODO: 目录监视增强)
             const filename_empty = self.allocator.dupe(u8, &.{}) catch continue;
-            self.event_mutex.lock();
-            defer self.event_mutex.unlock();
-            if (!self.event_ring.writeItem(.{ .event_type = ev_type, .filename = filename_empty })) {
+            if (!self.event_queue.push(.{ .event_type = ev_type, .filename = filename_empty })) {
                 self.allocator.free(filename_empty);
             }
         }
     }
 
-    /// 置 closed、关闭 path_fd/kq_fd、join 线程、释放 event_ring 及其中 filename；idempotent
+    /// 停止监视并 join 线程 (idempotent)
     fn deinit(self: *WatchHandleDarwin) void {
         self.closed.store(true, .release);
+        if (self.kq_fd != -1) {
+            // 关闭 kq_fd 会唤醒阻塞中的 kevent
+            _ = std.c.close(self.kq_fd);
+            self.kq_fd = -1;
+        }
         if (self.path_fd != -1) {
             _ = std.c.close(self.path_fd);
             self.path_fd = -1;
         }
-        if (self.kq_fd != -1) {
-            _ = std.c.close(self.kq_fd);
-            self.kq_fd = -1;
-        }
         if (self.thread_started) self.thread.join();
-        self.event_mutex.lock();
-        defer self.event_mutex.unlock();
-        while (self.event_ring.readItem()) |e| {
+        while (self.event_queue.pop()) |e| {
             if (e.filename.len > 0) self.allocator.free(e.filename);
         }
     }
@@ -261,12 +283,10 @@ fn startWatchDarwin(allocator: std.mem.Allocator, path_abs: []const u8) WatchErr
     };
     inner.* = .{
         .closed = std.atomic.Value(bool).init(false),
-        ._pad = undefined,
         .path_fd = path_fd,
         .kq_fd = kq_fd,
         .allocator = allocator,
-        .event_ring = .{},
-        .event_mutex = .{},
+        .event_queue = .{},
         .thread = undefined,
         .thread_started = false,
     };
@@ -282,56 +302,61 @@ fn startWatchDarwin(allocator: std.mem.Allocator, path_abs: []const u8) WatchErr
 }
 
 // ---------- Windows：ReadDirectoryChangesW 实现 ----------
-/// Windows 句柄；closed 与 event_mutex 缓存行隔离（00 §5.3）
+/// Windows 句柄；对齐并隔离，支撑高并发文件变更（00 §3.5、§5.3）
 const WatchHandleWindows = struct {
-    closed: std.atomic.Value(bool),
-    _pad: [CACHE_LINE_BYTES - @sizeOf(std.atomic.Value(bool))]u8 = undefined,
+    closed: std.atomic.Value(bool) align(CACHE_LINE),
     dir_handle: std.os.windows.HANDLE,
     allocator: std.mem.Allocator,
-    event_ring: WatchEventRing(WATCH_EVENT_CAP) = .{},
-    event_mutex: Spinlock = .{},
+    event_queue: WatchEventQueue(WatchEvent, WATCH_EVENT_CAP) align(CACHE_LINE) = .{},
     thread: std.Thread = undefined,
     thread_started: bool = false,
 
-    /// 工作线程入口：ReadDirectoryChangesW 取变更，转 UTF-8 入队；不触碰 JSC
+    const WIN_WATCH_BUF_LEN = 64 * 1024; // 64KB 缓冲区，ReadDirectoryChangesW 的推荐上限
+
+    /// 工作线程入口：阻塞读目录变更并转码
     fn runThread(self: *WatchHandleWindows) void {
+        @setRuntimeSafety(false);
         const win = std.os.windows;
         const kernel32 = win.kernel32;
-        var buf: [4096]u8 align(@alignOf(win.FILE_NOTIFY_INFORMATION)) = undefined;
+        var buf: [WIN_WATCH_BUF_LEN]u8 align(@alignOf(win.FILE_NOTIFY_INFORMATION)) = undefined;
         var bytes_read: win.DWORD = 0;
         while (true) {
             if (self.closed.load(.acquire)) break;
             bytes_read = 0;
+            // 阻塞读；关闭 dir_handle 将唤醒并返回错误
             const ok = kernel32.ReadDirectoryChangesW(
                 self.dir_handle,
                 &buf,
                 @intCast(buf.len),
-                0, // watch subtree = false
+                0,
                 win.FILE_NOTIFY_CHANGE_FILE_NAME | win.FILE_NOTIFY_CHANGE_DIR_NAME | win.FILE_NOTIFY_CHANGE_ATTRIBUTES | win.FILE_NOTIFY_CHANGE_SIZE | win.FILE_NOTIFY_CHANGE_LAST_WRITE,
                 &bytes_read,
                 null,
                 null,
             );
-            if (ok == 0) break;
+            if (ok == 0 or bytes_read == 0) break;
+            
             var off: usize = 0;
             while (off + @sizeOf(win.FILE_NOTIFY_INFORMATION) <= bytes_read) {
                 const info = @as(*const win.FILE_NOTIFY_INFORMATION, @ptrCast(&buf[off]));
                 const name_len = info.FileNameLength;
                 const action = info.Action;
                 const event_type: WatchEventType = if (action == win.FILE_ACTION_RENAMED_OLD_NAME or action == win.FILE_ACTION_RENAMED_NEW_NAME or action == win.FILE_ACTION_REMOVED or action == win.FILE_ACTION_ADDED) .rename else .change;
+                
                 const name_utf16 = if (name_len > 0 and off + @sizeOf(win.FILE_NOTIFY_INFORMATION) + name_len <= bytes_read)
                     @as([*]const u16, @ptrCast(&buf[off + @sizeOf(win.FILE_NOTIFY_INFORMATION)]))[0 .. name_len / 2]
                 else
                     &[_]u16{};
+                
+                // 将 UTF-16 转换为 UTF-8
                 const filename_owned = if (name_utf16.len > 0) blk: {
                     const utf8_len = std.unicode.utf16CountUtf8Bytes(name_utf16) catch break :blk self.allocator.dupe(u8, &.{}) catch continue;
                     const out = self.allocator.alloc(u8, utf8_len) catch break :blk self.allocator.dupe(u8, &.{}) catch continue;
                     _ = std.unicode.utf16ToUtf8(name_utf16, out);
                     break :blk out;
                 } else self.allocator.dupe(u8, &.{}) catch continue;
-                self.event_mutex.lock();
-                defer self.event_mutex.unlock();
-                if (!self.event_ring.writeItem(.{ .event_type = event_type, .filename = filename_owned })) {
+                
+                if (!self.event_queue.push(.{ .event_type = event_type, .filename = filename_owned })) {
                     self.allocator.free(filename_owned);
                 }
                 if (info.NextEntryOffset == 0) break;
@@ -340,17 +365,16 @@ const WatchHandleWindows = struct {
         }
     }
 
-    /// 置 closed、CloseHandle(dir_handle)、join 线程、释放 event_ring 及其中 filename；idempotent
+    /// 停止监视 (idempotent)
     fn deinit(self: *WatchHandleWindows) void {
         self.closed.store(true, .release);
         if (self.dir_handle != std.os.windows.INVALID_HANDLE_VALUE) {
+            // 关闭句柄唤醒 ReadDirectoryChangesW
             std.os.windows.kernel32.CloseHandle(self.dir_handle);
             self.dir_handle = std.os.windows.INVALID_HANDLE_VALUE;
         }
         if (self.thread_started) self.thread.join();
-        self.event_mutex.lock();
-        defer self.event_mutex.unlock();
-        while (self.event_ring.readItem()) |e| {
+        while (self.event_queue.pop()) |e| {
             if (e.filename.len > 0) self.allocator.free(e.filename);
         }
     }
@@ -385,11 +409,9 @@ fn startWatchWindows(allocator: std.mem.Allocator, path_abs: []const u8) WatchEr
     };
     inner.* = .{
         .closed = std.atomic.Value(bool).init(false),
-        ._pad = undefined,
         .dir_handle = dir_handle,
         .allocator = allocator,
-        .event_ring = .{},
-        .event_mutex = .{},
+        .event_queue = .{},
         .thread = undefined,
         .thread_started = false,
     };
@@ -456,12 +478,10 @@ fn startWatchLinux(allocator: std.mem.Allocator, path_abs: []const u8) WatchErro
     };
     inner.* = .{
         .closed = std.atomic.Value(bool).init(false),
-        ._pad = undefined,
         .fd = fd,
         .wd = wd,
         .allocator = allocator,
-        .event_ring = .{},
-        .event_mutex = .{},
+        .event_queue = .{},
         .thread = undefined,
         .thread_started = false,
     };
@@ -480,24 +500,38 @@ fn startWatchLinux(allocator: std.mem.Allocator, path_abs: []const u8) WatchErro
 /// [Allocates] 返回的 WatchEvent.filename 由内部分配，调用方须用与 startWatch 相同的 allocator free（空切片可不 free）（01 §1.3）。
 pub fn drainWatchEvents(handle: *WatchHandle) ?WatchEvent {
     return switch (builtin.os.tag) {
-        .linux => blk: {
+        .linux => {
             const inner = @as(*WatchHandleLinux, @ptrCast(@alignCast(handle)));
-            inner.event_mutex.lock();
-            defer inner.event_mutex.unlock();
-            break :blk inner.event_ring.readItem();
+            return inner.event_queue.pop();
         },
-        .macos, .freebsd, .netbsd, .openbsd => blk: {
+        .macos, .freebsd, .netbsd, .openbsd => {
             const inner = @as(*WatchHandleDarwin, @ptrCast(@alignCast(handle)));
-            inner.event_mutex.lock();
-            defer inner.event_mutex.unlock();
-            break :blk inner.event_ring.readItem();
+            return inner.event_queue.pop();
         },
-        .windows => blk: {
+        .windows => {
             const inner = @as(*WatchHandleWindows, @ptrCast(@alignCast(handle)));
-            inner.event_mutex.lock();
-            defer inner.event_mutex.unlock();
-            break :blk inner.event_ring.readItem();
+            return inner.event_queue.pop();
         },
         else => null,
+    };
+}
+
+/// 批量取出待处理事件；返回实际取出的数量。
+/// [Allocates] 返回的 WatchEvent.filename 由内部分配，调用方须用与 startWatch 相同的 allocator free。
+pub fn drainWatchEventsBatch(handle: *WatchHandle, out: []WatchEvent) usize {
+    return switch (builtin.os.tag) {
+        .linux => {
+            const inner = @as(*WatchHandleLinux, @ptrCast(@alignCast(handle)));
+            return inner.event_queue.popBatch(out);
+        },
+        .macos, .freebsd, .netbsd, .openbsd => {
+            const inner = @as(*WatchHandleDarwin, @ptrCast(@alignCast(handle)));
+            return inner.event_queue.popBatch(out);
+        },
+        .windows => {
+            const inner = @as(*WatchHandleWindows, @ptrCast(@alignCast(handle)));
+            return inner.event_queue.popBatch(out);
+        },
+        else => 0,
     };
 }
