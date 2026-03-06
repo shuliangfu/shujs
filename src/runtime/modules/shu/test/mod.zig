@@ -1137,12 +1137,11 @@ fn writeCoveragePlaceholderIfRequested(state: *RunState) void {
         dir
     else if (state.test_cwd) |cwd|
         libs_io.pathJoin(state.allocator, &.{ cwd, dir }) catch return
-    else
-        blk: {
-            var path_buf: [libs_io.max_path_bytes]u8 = undefined;
-            const cwd = libs_io.realpath(".", &path_buf) catch return;
-            break :blk libs_io.pathJoin(state.allocator, &.{ cwd, dir }) catch return;
-        };
+    else blk: {
+        var path_buf: [libs_io.max_path_bytes]u8 = undefined;
+        const cwd = libs_io.realpath(".", &path_buf) catch return;
+        break :blk libs_io.pathJoin(state.allocator, &.{ cwd, dir }) catch return;
+    };
     defer if (!libs_io.pathIsAbsolute(dir)) state.allocator.free(path_abs);
     libs_io.makePathAbsolute(path_abs) catch return;
     const lcov_path = libs_io.pathJoin(state.allocator, &.{ path_abs, "lcov.info" }) catch return;
@@ -1253,12 +1252,11 @@ fn saveSnapshotToFile(state: *RunState) void {
         path
     else if (state.test_cwd) |cwd|
         libs_io.pathJoin(allocator, &.{ cwd, path }) catch return
-    else
-        blk: {
-            var path_buf: [libs_io.max_path_bytes]u8 = undefined;
-            const cwd = libs_io.realpath(".", &path_buf) catch return;
-            break :blk libs_io.pathJoin(allocator, &.{ cwd, path }) catch return;
-        };
+    else blk: {
+        var path_buf: [libs_io.max_path_bytes]u8 = undefined;
+        const cwd = libs_io.realpath(".", &path_buf) catch return;
+        break :blk libs_io.pathJoin(allocator, &.{ cwd, path }) catch return;
+    };
     defer if (!libs_io.pathIsAbsolute(path)) allocator.free(path_abs);
     const parent = libs_io.pathDirname(path_abs) orelse return;
     libs_io.makePathAbsolute(parent) catch {};
@@ -1426,12 +1424,11 @@ fn writeJUnitIfRequested(state: *RunState) void {
     out.appendSlice(state.allocator, "</testsuite>\n</testsuites>\n") catch return;
     const path_abs = if (libs_io.pathIsAbsolute(outfile))
         outfile
-    else
-        blk: {
-            var path_buf: [libs_io.max_path_bytes]u8 = undefined;
-            const cwd = libs_io.realpath(".", &path_buf) catch return;
-            break :blk libs_io.pathJoin(state.allocator, &.{ cwd, outfile }) catch return;
-        };
+    else blk: {
+        var path_buf: [libs_io.max_path_bytes]u8 = undefined;
+        const cwd = libs_io.realpath(".", &path_buf) catch return;
+        break :blk libs_io.pathJoin(state.allocator, &.{ cwd, outfile }) catch return;
+    };
     defer if (!libs_io.pathIsAbsolute(outfile)) state.allocator.free(path_abs);
     var file = libs_io.createFileAbsolute(path_abs, .{}) catch return;
     defer file.close(io);
