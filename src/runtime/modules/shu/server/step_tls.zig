@@ -82,7 +82,7 @@ const stepTlsConnBody = if (build_options.have_tls) struct {
                 const head_slice: []const u8 = blk: {
                     if (conn.read_len + 64 <= conn.read_buf.len) {
                         @memset(conn.read_buf[conn.read_len..][0..64], 0);
-                        break :blk @as([*]const u8, @ptrCast(conn.read_buf.ptr))[0..conn.read_len + 64];
+                        break :blk @as([*]const u8, @ptrCast(conn.read_buf.ptr))[0 .. conn.read_len + 64];
                     }
                     break :blk @as([*]const u8, @ptrCast(conn.read_buf.ptr))[0..conn.read_len];
                 };
