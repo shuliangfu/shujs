@@ -1180,13 +1180,13 @@ fn printTestFileResult(io: std.Io, run_path: []const u8, passed: bool, elapsed_m
 fn printTestSummaryCases(io: std.Io, passed: u64, failed: u64, skipped: u64, total_files: usize, total_ms: u64) !void {
     if (std.c.isatty(1) != 0) {
         try printToStdout(io, "\nTest cases: {s}{d}{s} passed, {s}{d}{s} failed, {s}{d}{s} skipped.\n", .{
-            c_green, passed, c_reset,
-            c_red, failed, c_reset,
+            c_green,  passed,  c_reset,
+            c_red,    failed,  c_reset,
             c_yellow, skipped, c_reset,
         });
         try printToStdout(io, "{s}{d}{s} test files, {s}{d}{s}ms total.\n\n", .{
             c_cyan, total_files, c_reset,
-            c_cyan, total_ms, c_reset,
+            c_cyan, total_ms,    c_reset,
         });
     } else {
         try printToStdout(io, "\nTest cases: {d} passed, {d} failed, {d} skipped.\n", .{ passed, failed, skipped });
