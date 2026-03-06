@@ -24,12 +24,29 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+/// 映射相关的窄化错误集，减少热路径分支压力 (§2.1)
+pub const MmapError = error{
+    FileNotFound,
+    AccessDenied,
+    NotAFile,
+    FileRead,
+    SystemResources,
+    Unsupported,
+    NameTooLong,
+    OutOfMemory,
+};
+
 /// 顺序访问提示（Linux/Darwin 通用）；用于 madvise，加强预取
 const MADV_SEQUENTIAL = 2;
 /// 即将访问提示；对区间调用后内核可预取页（按需 MADV_WILLNEED）
 const MADV_WILLNEED = 3;
 /// Linux 大页提示（§4.2 THP）；大映射时建议内核使用大页，减少 TLB 未命中
 const MADV_HUGEPAGE: c_int = 14;
+
+/// macOS 特有 fcntl 标志
+const F_RDAHEAD = 45; // 开启激进预读
+const F_NOCACHE = 48; // 绕过内核缓存（防止污染）
+
 extern "c" fn madvise(addr: *anyopaque, length: usize, advice: c_int) c_int;
 
 /// 只读映射文件的句柄；调用方负责在不再使用时调用 deinit 以 unmap
@@ -56,11 +73,11 @@ pub const MappedFile = struct {
         return self.ptr[0..self.len];
     }
 
-    /// 按需预取：提示内核即将访问 [offset..offset+length]，可提前读入页（MADV_WILLNEED）；仅 POSIX
+    /// 按需预取：提示内核即将访问 [offset..offset+length]，可提前读入页（MADV_WILLNEED）
     pub fn prefetchRange(self: *const MappedFile, offset: usize, length: usize) void {
         if (builtin.os.tag != .windows and length > 0 and offset < self.len) {
             const safe_len = @min(length, self.len - offset);
-            _ = madvise(@ptrCast(self.ptr + offset), safe_len, MADV_WILLNEED);
+            _ = madvise(@constCast(@ptrCast(self.ptr + offset)), safe_len, MADV_WILLNEED);
         }
     }
 };
@@ -100,7 +117,7 @@ pub const MappedFileWritable = struct {
 
 /// [Allocates] 将路径对应的文件以只读方式映射进进程地址空间；调用方负责 deinit。
 /// 任意大小、任意格式均可；大文件时可避免 readToEndAlloc 的整文件分配与多次拷贝（§1.7）
-pub fn mapFileReadOnly(path: []const u8) !MappedFile {
+pub fn mapFileReadOnly(path: []const u8) MmapError!MappedFile {
     return switch (builtin.os.tag) {
         .linux, .macos, .freebsd, .netbsd, .openbsd => mapFileReadOnlyPosix(path),
         .windows => mapFileReadOnlyWindows(path),
@@ -110,7 +127,7 @@ pub fn mapFileReadOnly(path: []const u8) !MappedFile {
 
 /// [Allocates] 将路径对应的文件以可读可写方式映射进进程地址空间；调用方负责 deinit。
 /// 任意格式；使用 MAP_SHARED，写入会同步到文件；适用于已存在且非空文件
-pub fn mapFileReadWrite(path: []const u8) !MappedFileWritable {
+pub fn mapFileReadWrite(path: []const u8) MmapError!MappedFileWritable {
     return switch (builtin.os.tag) {
         .linux, .macos, .freebsd, .netbsd, .openbsd => mapFileReadWritePosix(path),
         .windows => mapFileReadWriteWindows(path),
@@ -121,7 +138,7 @@ pub fn mapFileReadWrite(path: []const u8) !MappedFileWritable {
 const posix = std.posix;
 
 /// Zig 0.16：std.fs.openFileAbsolute 已迁移，此处用 posix.openat 取得 fd 供 mmap。Darwin 上 posix.O 来自 std.c 无 RDONLY 成员，用数值。
-fn mapFileReadOnlyPosix(path: []const u8) !MappedFile {
+fn mapFileReadOnlyPosix(path: []const u8) MmapError!MappedFile {
     if (path.len >= std.Io.Dir.max_path_bytes) return error.NameTooLong;
     var path_z: [std.Io.Dir.max_path_bytes]u8 = undefined;
     @memcpy(path_z[0..path.len], path);
@@ -133,9 +150,15 @@ fn mapFileReadOnlyPosix(path: []const u8) !MappedFile {
     const fd = posix.openat(posix.AT.FDCWD, path_z[0..path.len], o_rdonly, 0) catch |e| switch (e) {
         error.FileNotFound => return error.FileNotFound,
         error.AccessDenied => return error.AccessDenied,
-        else => return e,
+        else => return error.FileRead,
     };
     defer _ = std.c.close(fd);
+
+    if (builtin.os.tag == .macos) {
+        // macOS 极致优化：开启激进异步预读
+        _ = std.c.fcntl(fd, F_RDAHEAD, @as(c_int, 1));
+    }
+
     var stat: std.c.Stat = undefined;
     if (std.c.fstat(fd, &stat) != 0) return error.FileRead;
     const mode = if (builtin.os.tag == .linux) stat.st_mode else stat.mode;
@@ -150,23 +173,34 @@ fn mapFileReadOnlyPosix(path: []const u8) !MappedFile {
     const ptr = if (builtin.os.tag == .linux)
         try mapFileLinux(fd, len, false)
     else
-        try posix.mmap(
+        posix.mmap(
             null,
             len,
             prot_read,
             .{ .TYPE = .PRIVATE },
             fd,
             0,
-        );
+        ) catch return error.SystemResources;
+
     adviseSequential(@ptrCast(ptr.ptr), ptr.len);
-    if (builtin.os.tag == .linux and len >= 2 * 1024 * 1024) {
-        _ = madvise(@ptrCast(ptr.ptr), ptr.len, MADV_HUGEPAGE);
+    if (builtin.os.tag == .macos) {
+        // macOS 对于大文件的异步加载提示
+        if (len >= 1024 * 1024) {
+            _ = madvise(@ptrCast(ptr.ptr), ptr.len, MADV_WILLNEED);
+        }
+    }
+    if (builtin.os.tag == .linux) {
+        if (len >= 2 * 1024 * 1024) {
+            _ = madvise(@ptrCast(ptr.ptr), ptr.len, MADV_HUGEPAGE);
+        }
+        // 极致优化：将映射内存绑定到当前线程所在的 NUMA 节点 (§3.1, §4.2)
+        mbindToCurrentNode(@ptrCast(ptr.ptr), ptr.len);
     }
     return .{ .ptr = @ptrCast(ptr.ptr), .len = ptr.len, .mapping_handle = null };
 }
 
 /// 可写映射：PROT_READ | PROT_WRITE + MAP_SHARED，写入会持久化到文件。Zig 0.16 用 posix.openat；Darwin 用数值 O_RDWR。
-fn mapFileReadWritePosix(path: []const u8) !MappedFileWritable {
+fn mapFileReadWritePosix(path: []const u8) MmapError!MappedFileWritable {
     if (path.len >= std.Io.Dir.max_path_bytes) return error.NameTooLong;
     var path_z: [std.Io.Dir.max_path_bytes]u8 = undefined;
     @memcpy(path_z[0..path.len], path);
@@ -178,9 +212,14 @@ fn mapFileReadWritePosix(path: []const u8) !MappedFileWritable {
     const fd = posix.openat(posix.AT.FDCWD, path_z[0..path.len], o_rdwr, 0) catch |e| switch (e) {
         error.FileNotFound => return error.FileNotFound,
         error.AccessDenied => return error.AccessDenied,
-        else => return e,
+        else => return error.FileRead,
     };
     defer _ = std.c.close(fd);
+
+    if (builtin.os.tag == .macos) {
+        _ = std.c.fcntl(fd, F_RDAHEAD, @as(c_int, 1));
+    }
+
     var stat: std.c.Stat = undefined;
     if (std.c.fstat(fd, &stat) != 0) return error.FileRead;
     const mode_rw = if (builtin.os.tag == .linux) stat.st_mode else stat.mode;
@@ -195,29 +234,54 @@ fn mapFileReadWritePosix(path: []const u8) !MappedFileWritable {
     const ptr = if (builtin.os.tag == .linux)
         try mapFileLinux(fd, len, true)
     else
-        try posix.mmap(
+        posix.mmap(
             null,
             len,
             prot_rw,
             .{ .TYPE = .SHARED },
             fd,
             0,
-        );
+        ) catch return error.SystemResources;
+
     adviseSequential(@ptrCast(ptr.ptr), ptr.len);
-    if (builtin.os.tag == .linux and len >= 2 * 1024 * 1024) {
-        _ = madvise(@ptrCast(ptr.ptr), ptr.len, MADV_HUGEPAGE);
+    if (builtin.os.tag == .macos) {
+        if (len >= 1024 * 1024) {
+            _ = madvise(@ptrCast(ptr.ptr), ptr.len, MADV_WILLNEED);
+        }
+    }
+    if (builtin.os.tag == .linux) {
+        if (len >= 2 * 1024 * 1024) {
+            _ = madvise(@ptrCast(ptr.ptr), ptr.len, MADV_HUGEPAGE);
+        }
+        mbindToCurrentNode(@ptrCast(ptr.ptr), ptr.len);
     }
     return .{ .ptr = ptr.ptr, .len = ptr.len, .mapping_handle = null };
 }
 
 /// Linux 专用：MAP_POPULATE 预填页，减少首次访问缺页；read_only 为 false 时用 MAP_SHARED
-fn mapFileLinux(fd: std.posix.fd_t, len: usize, writable: bool) ![]align(std.heap.page_size_min) u8 {
+fn mapFileLinux(fd: std.posix.fd_t, len: usize, writable: bool) MmapError![]align(std.heap.page_size_min) u8 {
     const linux = std.os.linux;
     const flags_read = linux.MAP.PRIVATE | linux.MAP.POPULATE;
     const flags_rw = linux.MAP.SHARED | linux.MAP.POPULATE;
     const prot = if (writable) linux.PROT.READ | linux.PROT.WRITE else linux.PROT.READ;
     const flags = if (writable) flags_rw else flags_read;
-    return linux.mmap(null, len, prot, flags, fd, 0);
+    return linux.mmap(null, len, prot, flags, fd, 0) catch return error.SystemResources;
+}
+
+/// 极致优化：将映射内存绑定到当前线程所在的 NUMA 节点 (§3.1, §4.2)
+fn mbindToCurrentNode(ptr: [*]const u8, len: usize) void {
+    if (builtin.os.tag != .linux) return;
+    const linux = std.os.linux;
+    var cpu: c_uint = 0;
+    var node: c_uint = 0;
+    // 获取当前 CPU 和所在的 NUMA 节点
+    if (linux.getcpu(&cpu, &node, null) == 0) {
+        const nodemask: usize = @as(usize, 1) << @as(u6, @intCast(node & 63));
+        const MPOL_PREFERRED = 1;
+        const MPOL_F_RELATIVE_NODES = (1 << 14);
+        // mbind 系统调用：将内存范围绑定到指定的 NUMA 节点
+        _ = linux.syscall6(.mbind, @intFromPtr(ptr), len, MPOL_PREFERRED | MPOL_F_RELATIVE_NODES, @intFromPtr(&nodemask), @sizeOf(usize) * 8, 0);
+    }
 }
 
 /// 提示内核该区域将顺序访问，利于预取与回收（忽略返回值，内核可忽略提示）
@@ -237,24 +301,39 @@ const PAGE_READWRITE: win.DWORD = 0x04;
 const FILE_MAP_READ: win.DWORD = 0x0004;
 const FILE_MAP_WRITE: win.DWORD = 0x0002;
 
-fn mapFileReadOnlyWindows(path: []const u8) !MappedFile {
-    const file = std.fs.openFileAbsolute(path, .{ .mode = .read_only }) catch |e| switch (e) {
-        error.FileNotFound => return error.FileNotFound,
-        error.AccessDenied => return error.AccessDenied,
-        else => return e,
-    };
-    defer file.close();
-    const stat = file.stat() catch return error.FileRead;
-    if (stat.kind != .file) return error.NotAFile;
-    const size = stat.size;
-    if (size == 0) {
+fn mapFileReadOnlyWindows(path: []const u8) MmapError!MappedFile {
+    const path_w = std.os.windows.sliceToPrefixedFileDecoded(path) catch return error.NameTooLong;
+    // 极致优化：直接使用 CreateFileW 并指定 FILE_FLAG_SEQUENTIAL_SCAN 提示内核预取 (§4.3)
+    const file_handle = kernel32.CreateFileW(
+        path_w.span().ptr,
+        win.GENERIC_READ,
+        win.FILE_SHARE_READ,
+        null,
+        win.OPEN_EXISTING,
+        win.FILE_ATTRIBUTE_NORMAL | win.FILE_FLAG_SEQUENTIAL_SCAN,
+        null,
+    );
+    if (file_handle == win.INVALID_HANDLE_VALUE) {
+        return switch (kernel32.GetLastError()) {
+            .FILE_NOT_FOUND => error.FileNotFound,
+            .ACCESS_DENIED => error.AccessDenied,
+            else => error.FileRead,
+        };
+    }
+    defer _ = kernel32.CloseHandle(file_handle);
+
+    var size: win.LARGE_INTEGER = undefined;
+    if (kernel32.GetFileSizeEx(file_handle, &size) == 0) return error.FileRead;
+    const fsize = @as(u64, @bitCast(size));
+    if (fsize == 0) {
         const empty: [0]u8 = .{};
         return .{ .ptr = @alignCast(empty[0..].ptr), .len = 0, .mapping_handle = null };
     }
-    const size_lo = @as(win.DWORD, @intCast(size & 0xFFFFFFFF));
-    const size_hi = @as(win.DWORD, @intCast(size >> 32));
+
+    const size_lo = @as(win.DWORD, @intCast(fsize & 0xFFFFFFFF));
+    const size_hi = @as(win.DWORD, @intCast(fsize >> 32));
     const mapping = kernel32.CreateFileMappingW(
-        file.handle,
+        file_handle,
         null,
         PAGE_READONLY,
         size_hi,
@@ -262,35 +341,50 @@ fn mapFileReadOnlyWindows(path: []const u8) !MappedFile {
         null,
     ) orelse return error.AccessDenied;
     errdefer _ = kernel32.CloseHandle(mapping);
+
     const view = kernel32.MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0) orelse {
         _ = kernel32.CloseHandle(mapping);
         return error.AccessDenied;
     };
     return .{
         .ptr = @ptrCast(view),
-        .len = @as(usize, @intCast(size)),
+        .len = @as(usize, @intCast(fsize)),
         .mapping_handle = mapping,
     };
 }
 
-fn mapFileReadWriteWindows(path: []const u8) !MappedFileWritable {
-    const file = std.fs.openFileAbsolute(path, .{ .mode = .read_write }) catch |e| switch (e) {
-        error.FileNotFound => return error.FileNotFound,
-        error.AccessDenied => return error.AccessDenied,
-        else => return e,
-    };
-    defer file.close();
-    const stat = file.stat() catch return error.FileRead;
-    if (stat.kind != .file) return error.NotAFile;
-    const size = stat.size;
-    if (size == 0) {
+fn mapFileReadWriteWindows(path: []const u8) MmapError!MappedFileWritable {
+    const path_w = std.os.windows.sliceToPrefixedFileDecoded(path) catch return error.NameTooLong;
+    const file_handle = kernel32.CreateFileW(
+        path_w.span().ptr,
+        win.GENERIC_READ | win.GENERIC_WRITE,
+        win.FILE_SHARE_READ | win.FILE_SHARE_WRITE,
+        null,
+        win.OPEN_EXISTING,
+        win.FILE_ATTRIBUTE_NORMAL | win.FILE_FLAG_SEQUENTIAL_SCAN,
+        null,
+    );
+    if (file_handle == win.INVALID_HANDLE_VALUE) {
+        return switch (kernel32.GetLastError()) {
+            .FILE_NOT_FOUND => error.FileNotFound,
+            .ACCESS_DENIED => error.AccessDenied,
+            else => error.FileRead,
+        };
+    }
+    defer _ = kernel32.CloseHandle(file_handle);
+
+    var size: win.LARGE_INTEGER = undefined;
+    if (kernel32.GetFileSizeEx(file_handle, &size) == 0) return error.FileRead;
+    const fsize = @as(u64, @bitCast(size));
+    if (fsize == 0) {
         var empty: [0]u8 = .{};
         return .{ .ptr = @alignCast(empty[0..].ptr), .len = 0, .mapping_handle = null };
     }
-    const size_lo = @as(win.DWORD, @intCast(size & 0xFFFFFFFF));
-    const size_hi = @as(win.DWORD, @intCast(size >> 32));
+
+    const size_lo = @as(win.DWORD, @intCast(fsize & 0xFFFFFFFF));
+    const size_hi = @as(win.DWORD, @intCast(fsize >> 32));
     const mapping = kernel32.CreateFileMappingW(
-        file.handle,
+        file_handle,
         null,
         PAGE_READWRITE,
         size_hi,
@@ -298,13 +392,14 @@ fn mapFileReadWriteWindows(path: []const u8) !MappedFileWritable {
         null,
     ) orelse return error.AccessDenied;
     errdefer _ = kernel32.CloseHandle(mapping);
+
     const view = kernel32.MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, 0) orelse {
         _ = kernel32.CloseHandle(mapping);
         return error.AccessDenied;
     };
     return .{
         .ptr = @ptrCast(view),
-        .len = @as(usize, @intCast(size)),
+        .len = @as(usize, @intCast(fsize)),
         .mapping_handle = mapping,
     };
 }
