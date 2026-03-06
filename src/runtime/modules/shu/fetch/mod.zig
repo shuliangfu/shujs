@@ -188,7 +188,7 @@ pub fn register(ctx: jsc.JSGlobalContextRef, allocator: ?std.mem.Allocator) void
 
 /// createWithExecutor 的 Zig 回调：将 resolve/reject 存入 pending[id] 并 Protect
 fn fetchOnExecutor(ctx: jsc.JSContextRef, resolve: jsc.JSValueRef, reject: jsc.JSValueRef, user_data: ?*anyopaque) void {
-    const p = @as(*const struct { id: u32, state: *FetchState }, @alignCast(@ptrCast(user_data orelse return)));
+    const p = @as(*const struct { id: u32, state: *FetchState }, @ptrCast(@alignCast(user_data orelse return)));
     jsc.JSValueProtect(@ptrCast(ctx), resolve);
     jsc.JSValueProtect(@ptrCast(ctx), reject);
     p.state.mutex.lock();
