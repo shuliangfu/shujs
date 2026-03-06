@@ -3,11 +3,16 @@
   "version": "0.1.0",
   "type": "module",
   "dependencies": {
-    "preact": "^10.28.4"
+    "postcss": "8.4.39",
+    "tailwindcss": "4.1.18",
+    "@tailwindcss/postcss": "4.1.18"
   },
   "imports": {
-    "@dreamer/view": "jsr:@dreamer/view@^1.1.2",
-    "@dreamer/dweb": "jsr:@dreamer/dweb@^3.0.95"
+    "@dreamer/dweb": "jsr:@dreamer/dweb@^3.0.95",
+    "@dreamer/render": "jsr:@dreamer/render@^1.0.41",
+    "@dreamer/router": "jsr:@dreamer/router@^1.0.15",
+    "@dreamer/plugins": "jsr:@dreamer/plugins@^1.0.8",
+    "@dreamer/view": "jsr:@dreamer/view@^1.1.2"
   },
   "test": {
     "include": [
