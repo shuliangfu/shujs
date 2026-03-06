@@ -16,7 +16,6 @@
 //!
 //! [Borrows] 返回的状态数据通常为系统瞬时快照，无需 free。
 
-
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
@@ -211,16 +210,16 @@ fn getCpuUsageMacos() ?u32 {
     if (now_u < cpu_cache_ts_ns + CACHE_VALID_NS and cpu_cache_ts_ns != 0) {
         return cpu_usage_cache_percent;
     }
-    
+
     var count: c.mach_msg_type_number_t = c.HOST_CPU_LOAD_INFO_COUNT;
     var cpu0: c.host_cpu_load_info_data_t = undefined;
     if (c.host_statistics(c.mach_host_self(), c.HOST_CPU_LOAD_INFO, @ptrCast(&cpu0), &count) != c.KERN_SUCCESS) return null;
-    
+
     sleepMs(CPU_SAMPLE_INTERVAL_MS);
-    
+
     var cpu1: c.host_cpu_load_info_data_t = undefined;
     if (c.host_statistics(c.mach_host_self(), c.HOST_CPU_LOAD_INFO, @ptrCast(&cpu1), &count) != c.KERN_SUCCESS) return null;
-    
+
     var total0: u64 = 0;
     var total1: u64 = 0;
     for (0..c.CPU_STATE_MAX) |i| {
@@ -229,7 +228,7 @@ fn getCpuUsageMacos() ?u32 {
     }
     const idle0 = cpu0.cpu_ticks[c.CPU_STATE_IDLE];
     const idle1 = cpu1.cpu_ticks[c.CPU_STATE_IDLE];
-    
+
     const total_d = if (total1 > total0) total1 - total0 else 0;
     const idle_d = if (idle1 > idle0) idle1 - idle0 else 0;
     if (total_d == 0) return 0;
@@ -433,17 +432,17 @@ fn getMemoryInfoMacos() ?MemoryInfo {
     var stats: c.vm_statistics64_data_t = undefined;
     var count: c.mach_msg_type_number_t = c.HOST_VM_INFO64_COUNT;
     if (c.host_statistics64(c.mach_host_self(), c.HOST_VM_INFO64, @ptrCast(&stats), &count) != c.KERN_SUCCESS) return null;
-    
+
     var page_size: c.vm_size_t = 0;
     if (c.host_page_size(c.mach_host_self(), &page_size) != c.KERN_SUCCESS) page_size = 4096;
-    
+
     var total_bytes: u64 = 0;
     var size: usize = @sizeOf(u64);
     if (c.sysctlbyname("hw.memsize", &total_bytes, &size, null, 0) != 0) return null;
-    
+
     const free_pages = @as(u64, stats.free_count) + @as(u64, stats.inactive_count);
     const available_kb = (free_pages * page_size) / 1024;
-    
+
     return .{
         .total_kb = total_bytes / 1024,
         .available_kb = available_kb,
