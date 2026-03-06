@@ -15,28 +15,7 @@ const globals = @import("../../../globals.zig");
 
 /// 内嵌 REPL 启动脚本：从 globalThis.__replStartOptions 读配置，require readline/vm，创建 REPLServer 并返回
 const REPL_BOOTSTRAP_SCRIPT =
-    "(function(){ var opts=globalThis.__replStartOptions; if(opts==null||typeof opts!=='object')opts={}; "
-    ++ "var req=globalThis.require; if(typeof req!=='function')throw new Error('repl.start() requires require (CJS context)'); "
-    ++ "var rl=require('node:readline'), vm=require('node:vm'), process=globalThis.process; "
-    ++ "var input=opts.input!==undefined?opts.input:(process&&process.stdin), output=opts.output!==undefined?opts.output:(process&&process.stdout); "
-    ++ "if(!input||!output)throw new Error('repl.start() requires input and output streams'); "
-    ++ "var prompt=opts.prompt!==undefined?opts.prompt:'> ', ctxObj=opts.context!==undefined?opts.context:{}, context=vm.createContext(ctxObj); "
-    ++ "var iface=rl.createInterface({input:input,output:output}); iface.setPrompt(prompt); "
-    ++ "var util;(function(){try{util=require('node:util');}catch(_){util=null;}})(); "
-    ++ "var writer=opts.writer!==undefined?opts.writer:(function(v){if(util&&typeof util.inspect==='function')return util.inspect(v); return String(v);}); "
-    ++ "var defaultEval=function(code,ctx,file,cb){try{var r=vm.runInContext(code,ctx,{filename:file||'repl'}); cb(null,r);}catch(e){cb(e,undefined);}}; "
-    ++ "var evalFn=opts.eval!==undefined?opts.eval:defaultEval; "
-    ++ "var s={context:context,input:input,output:output,_events:{},_commands:{}}; "
-    ++ "s.on=function(n,f){if(!this._events[n])this._events[n]=[]; this._events[n].push(f); return this;}; "
-    ++ "s.emit=function(n){var L=this._events[n]; if(L)for(var i=0;i<L.length;i++)L[i].apply(this,Array.prototype.slice.call(arguments,1)); return this;}; "
-    ++ "s.close=function(){iface.close(); return this;}; s.displayPrompt=function(preserve){iface.prompt(preserve); return this;}; "
-    ++ "s.write=function(data){if(output&&typeof output.write==='function')output.write(data); return this;}; "
-    ++ "s.defineCommand=function(name,cmd){this._commands[name]=typeof cmd==='function'?cmd:function(){}; return this;}; "
-    ++ "iface.on('line',function(line){var t=line.trim(); "
-    ++ "if(t.length>0&&t[0]==='.'){var rest=t.slice(1), nm=rest.split(/\\s/)[0]||rest, c=s._commands[nm]; "
-    ++ "if(c)c(rest.slice(nm.length).trim()); else s.write('Unknown command.\\n'); s.displayPrompt(); return;} "
-    ++ "evalFn(t,context,'repl',function(err,result){if(err)s.write(writer(err)+'\\n'); else if(result!==undefined)s.write(writer(result)+'\\n'); s.displayPrompt();});}); "
-    ++ "iface.on('close',function(){s.emit('exit');}); s.displayPrompt(); return s; })();";
+    "(function(){ var opts=globalThis.__replStartOptions; if(opts==null||typeof opts!=='object')opts={}; " ++ "var req=globalThis.require; if(typeof req!=='function')throw new Error('repl.start() requires require (CJS context)'); " ++ "var rl=require('node:readline'), vm=require('node:vm'), process=globalThis.process; " ++ "var input=opts.input!==undefined?opts.input:(process&&process.stdin), output=opts.output!==undefined?opts.output:(process&&process.stdout); " ++ "if(!input||!output)throw new Error('repl.start() requires input and output streams'); " ++ "var prompt=opts.prompt!==undefined?opts.prompt:'> ', ctxObj=opts.context!==undefined?opts.context:{}, context=vm.createContext(ctxObj); " ++ "var iface=rl.createInterface({input:input,output:output}); iface.setPrompt(prompt); " ++ "var util;(function(){try{util=require('node:util');}catch(_){util=null;}})(); " ++ "var writer=opts.writer!==undefined?opts.writer:(function(v){if(util&&typeof util.inspect==='function')return util.inspect(v); return String(v);}); " ++ "var defaultEval=function(code,ctx,file,cb){try{var r=vm.runInContext(code,ctx,{filename:file||'repl'}); cb(null,r);}catch(e){cb(e,undefined);}}; " ++ "var evalFn=opts.eval!==undefined?opts.eval:defaultEval; " ++ "var s={context:context,input:input,output:output,_events:{},_commands:{}}; " ++ "s.on=function(n,f){if(!this._events[n])this._events[n]=[]; this._events[n].push(f); return this;}; " ++ "s.emit=function(n){var L=this._events[n]; if(L)for(var i=0;i<L.length;i++)L[i].apply(this,Array.prototype.slice.call(arguments,1)); return this;}; " ++ "s.close=function(){iface.close(); return this;}; s.displayPrompt=function(preserve){iface.prompt(preserve); return this;}; " ++ "s.write=function(data){if(output&&typeof output.write==='function')output.write(data); return this;}; " ++ "s.defineCommand=function(name,cmd){this._commands[name]=typeof cmd==='function'?cmd:function(){}; return this;}; " ++ "iface.on('line',function(line){var t=line.trim(); " ++ "if(t.length>0&&t[0]==='.'){var rest=t.slice(1), nm=rest.split(/\\s/)[0]||rest, c=s._commands[nm]; " ++ "if(c)c(rest.slice(nm.length).trim()); else s.write('Unknown command.\\n'); s.displayPrompt(); return;} " ++ "evalFn(t,context,'repl',function(err,result){if(err)s.write(writer(err)+'\\n'); else if(result!==undefined)s.write(writer(result)+'\\n'); s.displayPrompt();});}); " ++ "iface.on('close',function(){s.emit('exit');}); s.displayPrompt(); return s; })();";
 
 /// repl.start(options) 或 repl.start(promptString)：设置 __replStartOptions 后执行内嵌脚本，返回 REPLServer
 fn startCallback(
