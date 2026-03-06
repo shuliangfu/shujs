@@ -72,7 +72,7 @@ pub const MappedFile = struct {
     pub fn prefetchRange(self: *const MappedFile, offset: usize, length: usize) void {
         if (builtin.os.tag != .windows and length > 0 and offset < self.len) {
             const safe_len = @min(length, self.len - offset);
-            _ = madvise(@constCast(@ptrCast(self.ptr + offset)), safe_len, MADV_WILLNEED);
+            _ = madvise(@ptrCast(@constCast(self.ptr + offset)), safe_len, MADV_WILLNEED);
         }
     }
 };
