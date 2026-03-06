@@ -333,7 +333,7 @@ fn progressDisabled() bool {
     return std.c.getenv("SHU_NO_PROGRESS") != null;
 }
 
-/// 解析阶段进度线程：每 80ms 轮询 resolving_progress（与 Installing 轮询间隔一致），重绘两行进度；worker 每完成一个包即更新 count/name，此处固定间隔刷新实现平滑推进。
+/// 解析阶段进度线程：每 50ms 轮询 resolving_progress 并重绘两行进度，比 Installing 的 80ms 更密，使解析进度条更顺滑；worker 每完成一个包即更新 count/name，合并阶段主线程会持续更新 total。
 fn resolvingProgressLoop(progress: *pkg_install.ResolvingProgress, state: *ProgressState) void {
     if (progressDisabled()) return;
     const io = state.io;
@@ -347,7 +347,7 @@ fn resolvingProgressLoop(progress: *pkg_install.ResolvingProgress, state: *Progr
         progress.name_mutex.unlock(io);
         const name_slice = if (len > 0) name_buf[0..len] else "...";
         drawResolvingTwoLines(io, count, total, name_slice, state.use_color, &state.resolving_first);
-        std.Io.sleep(io, std.Io.Duration.fromNanoseconds(80_000_000), .awake) catch {};
+        std.Io.sleep(io, std.Io.Duration.fromNanoseconds(50_000_000), .awake) catch {};
     }
     const total = progress.total.load(.monotonic);
     const count = progress.count.load(.monotonic);

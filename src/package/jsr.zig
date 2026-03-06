@@ -562,8 +562,9 @@ const JsrFileTask = struct { url: []const u8, dest_path: []const u8 };
 /// - 读缓存：cache_root/content/jsr/<scope>/<name>/<version> 存在且含 deno.json 或 package.json → 视为命中，dest_dir 软链到该目录后返回。
 /// - 写缓存：未命中时拉 _meta.json、并行下载所有文件到上述缓存目录，再 dest_dir 软链到该目录。
 /// pool 非 null 时使用传入的池；fetch_io 非 null 时用其拉取 _meta，避免多线程共享 process Io 导致 EISCONN。
+/// meta_client 非 null 时用其拉取 _meta.json 并复用连接（同 host jsr.io），调用方在多次调用间持有同一 client 即可实现多包 _meta 连接复用；为 null 时本函数内部创建临时 client，仅单次请求。
 /// 不在入口创建 dest_dir，避免「先建目录再删再建链」在 worker 线程中删除失败导致 PathAlreadyExists；仅在建链前确保父目录存在。
-pub fn downloadPackageToDir(allocator: std.mem.Allocator, pool: ?*JsrDownloadPool, scope_name: []const u8, version: []const u8, dest_dir: []const u8, fetch_io: ?std.Io) !void {
+pub fn downloadPackageToDir(allocator: std.mem.Allocator, pool: ?*JsrDownloadPool, scope_name: []const u8, version: []const u8, dest_dir: []const u8, fetch_io: ?std.Io, meta_client: ?*std.http.Client) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -585,9 +586,14 @@ pub fn downloadPackageToDir(allocator: std.mem.Allocator, pool: ?*JsrDownloadPoo
 
     const version_meta_url = try std.fmt.allocPrint(a, "{s}/@{s}/{s}/{s}_meta.json", .{ JSR_META_BASE, sn.scope, sn.name, version });
     const io = fetch_io orelse libs_process.getProcessIo() orelse return error.ProcessIoNotSet;
-    var zig_client = std.http.Client{ .allocator = a, .io = io };
-    defer zig_client.deinit();
-    const body = registry.fetchUrlForJsrMetaWithClient(&zig_client, a, version_meta_url, JSR_FETCH_MAX_BYTES) catch |e| return e;
+    // 复用调用方传入的 client（安装 worker 每 worker 一个 client，多包 _meta 同连接）；未传入则本调用内建临时 client。
+    const body = if (meta_client) |c|
+        registry.fetchUrlForJsrMetaWithClient(c, a, version_meta_url, JSR_FETCH_MAX_BYTES) catch |e| return e
+    else blk: {
+        var zig_client = std.http.Client{ .allocator = a, .io = io };
+        defer zig_client.deinit();
+        break :blk registry.fetchUrlForJsrMetaWithClient(&zig_client, a, version_meta_url, JSR_FETCH_MAX_BYTES) catch |e| return e;
+    };
     const trimmed = std.mem.trim(u8, body, " \t\r\n");
     const json_start = std.mem.indexOfScalar(u8, trimmed, '{') orelse {
         debugLogJsrResponse(version_meta_url, trimmed);
