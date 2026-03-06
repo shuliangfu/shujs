@@ -77,7 +77,7 @@ fn inspectCallback(
 
 /// promise.createWithExecutor 的 Zig 回调：将 resolve/reject 写入 holder 后调用 fn.apply(that, args_with_cb)
 fn promisifyOnExecutor(ctx: jsc.JSContextRef, resolve_val: jsc.JSValueRef, reject_val: jsc.JSValueRef, user_data: ?*anyopaque) void {
-    const holder_ptr = @as(*jsc.JSObjectRef, @alignCast(@ptrCast(user_data orelse return)));
+    const holder_ptr = @as(*jsc.JSObjectRef, @ptrCast(@alignCast(user_data orelse return)));
     const holder = holder_ptr.*;
     ensureUtilStrings();
     _ = jsc.JSObjectSetProperty(ctx, holder, k_resolve, resolve_val, jsc.kJSPropertyAttributeNone, null);
