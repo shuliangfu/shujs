@@ -304,9 +304,9 @@ pub const ThreadLocalChunkCache = struct {
     fn flush(self: *ThreadLocalChunkCache) void {
         const n = @min(CHUNK_CACHE_BATCH, self.len);
         if (n == 0) return;
-        
+
         self.global.appendSlice(self.allocator, self.stack[0..n]) catch {};
-        
+
         if (n < self.len) {
             std.mem.copyForwards(usize, self.stack[0 .. self.len - n], self.stack[n..self.len]);
         }
