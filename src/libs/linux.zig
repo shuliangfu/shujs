@@ -62,9 +62,11 @@ const MAX_BUFFER_GROUPS = 4;
 const RECV_USER_DATA_TAG: u64 = 1 << 63;
 /// send CQE 的 user_data 高位标记
 const SEND_USER_DATA_TAG: u64 = 1 << 62;
+/// splice CQE 的 user_data 高位标记
+const SPLICE_USER_DATA_TAG: u64 = 1 << 61;
 
-/// 槽位 tag：free / accept 进行中 / recv 首包（accept 后）/ conn_recv（submitRecv）/ conn_send（submitSend）
-const SlotTag = enum { free, accept, recv, conn_recv, conn_send };
+/// 槽位 tag：free / accept 进行中 / recv 首包（accept 后）/ conn_recv（submitRecv）/ conn_send（submitSend）/ conn_splice（submitSplice）
+const SlotTag = enum { free, accept, recv, conn_recv, conn_send, conn_splice };
 
 /// 线程本地槽位缓存：与 Darwin/Windows 的 ThreadLocalChunkCache 等价，Linux 管理的是 slot 索引（非 chunk）；take/release 绝大多数命中本地栈，空/满时与 free_bitmap 批量交换
 const SLOT_CACHE_STACK_SIZE = 128;
@@ -96,16 +98,16 @@ const ThreadLocalSlotCache = struct {
     }
 
     fn refill(self: *ThreadLocalSlotCache) void {
-        const batch = self.io.popFreeSlotBatch(self.stack[self.len..][0..SLOT_CACHE_BATCH]);
+        const batch = self.io.popFreeSlotBatch(self.stack[self.len..][0 .. @min(SLOT_CACHE_BATCH, SLOT_CACHE_STACK_SIZE - self.len)]);
         self.len += batch;
     }
 
     fn flush(self: *ThreadLocalSlotCache) void {
         const n = @min(SLOT_CACHE_BATCH, self.len);
+        if (n == 0) return;
         self.io.pushFreeSlotBatch(self.stack[0..n]);
-        var j = n;
-        while (j < self.len) : (j += 1) {
-            self.stack[j - n] = self.stack[j];
+        if (n < self.len) {
+            std.mem.copyForwards(usize, self.stack[0 .. self.len - n], self.stack[n..self.len]);
         }
         self.len -= n;
     }
@@ -143,6 +145,8 @@ pub const HighPerfIO = struct {
     slot_data: std.MultiArrayList(SlotFields),
     /// 空闲槽位位图：每 bit 对应一槽位，1=空闲 0=占用；用 @ctz 快速找空闲索引（TZCNT）
     free_bitmap: []u64,
+    /// 扫描提示，记录上次扫描到的位置，减少下次扫描开销
+    free_scan_hint: usize = 0,
     /// 当前空闲槽位数量
     free_count: usize,
 
@@ -151,6 +155,15 @@ pub const HighPerfIO = struct {
 
     /// 已注册的 buffer 组（PROVIDE_BUFFERS）；group_id 0 为默认 64KB，可 registerBufferGroup 注册多组
     groups: [MAX_BUFFER_GROUPS]BufferGroupInfo = .{.{}} ** MAX_BUFFER_GROUPS,
+
+    /// 已注册的固定缓冲区（IORING_REGISTER_BUFFERS）；用于极速 I/O（减少内核映射开销）
+    registered_buffers: []posix.iovec = &.{},
+
+    /// 已注册的文件描述符数组（IORING_REGISTER_FILES）；用于极速 fd 查找（0 syscall + 内核索引）
+    /// 索引 0..31 预留给监听 socket，32..max_connections+31 给连接 socket
+    registered_fds: []i32,
+    registered_fds_count: usize = 0,
+    used_sqpoll: bool = false,
 
     /// SQPOLL 核预留（00 §3.1）：将当前线程 CPU 亲和性设为除 sq_cpu 外的所有核，避免与 io_sqp 争抢；best-effort，失败静默返回
     fn applySqpollCoreReservation(sq_cpu: u32) void {
@@ -171,23 +184,40 @@ pub const HighPerfIO = struct {
     /// 初始化 Linux I/O 子系统：优先尝试 SQPOLL（0 syscall），无权限时优雅降级为标准轮询并打 performance-hint
     pub fn init(allocator: std.mem.Allocator, options: api.InitOptions) !HighPerfIO {
         const entries: u16 = @intCast(std.math.min(options.max_connections * 2, 4096));
+        
+        // 性能增强标志（00 §3.1）：
+        // - IORING_SETUP_SQPOLL: 内核线程轮询，减少 syscall
+        // - IORING_SETUP_SINGLE_ISSUER: 限制单线程提交，减少内核锁（适合 Thread-per-Core）
+        // - IORING_SETUP_COOP_TASKRUN: 协同任务运行，降低中断开销（5.19+）
+        // - IORING_SETUP_TASKRUN_FLAG: 配合 COOP_TASKRUN 使用（5.19+）
+        // - IORING_SETUP_DEFER_TASKRUN: 推迟任务运行至 enter，极大降低高并发下处理开销（6.1+）
+        const IORING_SETUP_DEFER_TASKRUN: u32 = 1 << 13;
+        const perf_flags = linux.IORING_SETUP_SQPOLL | 
+                           linux.IORING_SETUP_SINGLE_ISSUER |
+                           linux.IORING_SETUP_COOP_TASKRUN |
+                           linux.IORING_SETUP_TASKRUN_FLAG |
+                           IORING_SETUP_DEFER_TASKRUN;
+
         var params = std.mem.zeroInit(linux.io_uring_params, .{
-            .flags = linux.IORING_SETUP_SQPOLL | (if (options.linux_sq_thread_cpu != null) linux.IORING_SETUP_SQ_AFF else 0),
+            .flags = perf_flags | 
+                     (if (options.linux_sq_thread_cpu != null) linux.IORING_SETUP_SQ_AFF else 0) |
+                     (if (options.linux_attach_wq_fd != null) linux.IORING_SETUP_ATTACH_WQ else 0),
             .sq_thread_idle = 1000,
             .sq_thread_cpu = options.linux_sq_thread_cpu orelse 0,
+            .wq_fd = @intCast(options.linux_attach_wq_fd orelse 0),
         });
         var used_sqpoll = true;
-        var ring = linux.IoUring.init_params(entries, &params) catch |err| switch (err) {
-            error.SystemOutdated => return error.Unsupported,
-            error.PermissionDenied => blk: {
-                used_sqpoll = false;
-                std.debug.print("[io_core] performance-hint: IORING_SETUP_SQPOLL failed (EPERM), falling back to standard io_uring; run with sufficient privileges for 0-syscall submit.\n", .{});
+        var ring = linux.IoUring.init_params(entries, &params) catch |err| blk: {
+            // 若高性能标志组合失败，尝试降级
+            used_sqpoll = false;
+            if (err == error.PermissionDenied or err == error.SystemOutdated or err == error.InvalidArgument) {
+                std.debug.print("[io_core] performance-hint: advanced io_uring flags failed ({s}), falling back to basic.\n", .{@errorName(err)});
                 break :blk linux.IoUring.init(entries, 0) catch |e| switch (e) {
                     error.SystemOutdated, error.PermissionDenied => return error.Unsupported,
                     else => return e,
                 };
-            },
-            else => return err,
+            }
+            return err;
         };
         errdefer ring.deinit();
 
@@ -210,6 +240,24 @@ pub const HighPerfIO = struct {
             free_bitmap[last_word] &= (1 << @as(u6, @intCast(options.max_connections % 64))) - 1;
         }
 
+        // 预注册文件描述符表（00 §4.2）：
+        // 大小为 max_connections + 32（前 32 位给监听 fd）。
+        // 使用 IOSQE_FIXED_FILE 绕过内核 fd 表锁，在高并发 accept/close 时极致压榨。
+        const reg_fds_size = options.max_connections + 32;
+        const registered_fds = try allocator.alloc(i32, reg_fds_size);
+        errdefer allocator.free(registered_fds);
+        @memset(registered_fds, -1);
+        const ret_reg = linux.syscall4(
+            linux.SYS.io_uring_register,
+            @as(usize, @intCast(ring.fd)),
+            linux.IORING_REGISTER_FILES,
+            @intFromPtr(registered_fds.ptr),
+            reg_fds_size,
+        );
+        if (ret_reg != 0) {
+            std.debug.print("[io_core] performance-hint: io_uring register files failed, using standard fds.\n", .{});
+        }
+
         // SQPOLL 核预留（00 §3.1）：若 SQPOLL 生效且指定了 sq_thread_cpu，将当前线程亲和性设为「排除该核」，避免与 io_sqp 争抢 L1/L2
         if (used_sqpoll and options.linux_sq_thread_cpu != null) {
             applySqpollCoreReservation(options.linux_sq_thread_cpu.?);
@@ -224,11 +272,21 @@ pub const HighPerfIO = struct {
             .slot_data = slot_data,
             .free_bitmap = free_bitmap,
             .free_count = options.max_connections,
+            .registered_fds = if (ret_reg == 0) registered_fds else &.{},
+            .used_sqpoll = used_sqpoll,
         };
     }
 
     /// 释放 io_uring、所有堆内存（§1.5 显式 allocator 释放）
     pub fn deinit(self: *HighPerfIO) void {
+        if (self.registered_buffers.len > 0) {
+            _ = linux.syscall4(linux.SYS.io_uring_register, @as(usize, @intCast(self.ring.fd)), linux.IORING_UNREGISTER_BUFFERS, 0, 0);
+            self.allocator.free(self.registered_buffers);
+        }
+        if (self.registered_fds.len > 0) {
+            _ = linux.syscall4(linux.SYS.io_uring_register, @as(usize, @intCast(self.ring.fd)), linux.IORING_REGISTER_FILES_UPDATE, 0, 0); // Not strictly necessary on deinit, but good practice
+            self.allocator.free(self.registered_fds);
+        }
         self.ring.deinit();
         self.allocator.free(self.completion_buffer);
         self.slot_data.deinit(self.allocator);
@@ -236,15 +294,56 @@ pub const HighPerfIO = struct {
         self.* = undefined;
     }
 
+    /// [仅 Linux] 注册一组固定缓冲区（IORING_REGISTER_BUFFERS）；之后 read_fixed/write_fixed 可省去内核页映射开销
+    pub fn registerBuffers(self: *HighPerfIO, buffers: []const []u8) !void {
+        if (self.registered_buffers.len > 0) return error.AlreadyRegistered;
+        const iovecs = try self.allocator.alloc(posix.iovec, buffers.len);
+        errdefer self.allocator.free(iovecs);
+        for (buffers, 0..) |buf, i| {
+            iovecs[i] = .{ .base = buf.ptr, .len = buf.len };
+        }
+
+        const ret = linux.io_uring_register(
+            @intCast(self.ring.fd),
+            .REGISTER_BUFFERS,
+            iovecs.ptr,
+            @intCast(iovecs.len),
+        );
+        if (linux.errno(ret) != .SUCCESS) return error.RegisterBuffersFailed;
+        self.registered_buffers = iovecs;
+    }
+
+    /// [仅 Linux] 注册一组文件描述符（IORING_REGISTER_FILES）；之后 submitAcceptWithBuffer 等可利用内核索引加速
+    /// 返回的索引数组由 HighPerfIO 持有，deinit 时释放。
+    pub fn registerFiles(self: *HighPerfIO, fds: []const i32) !void {
+        if (self.registered_fds.len > 0) return error.AlreadyRegistered;
+        const reg_fds = try self.allocator.dupe(i32, fds);
+        errdefer self.allocator.free(reg_fds);
+        
+        const ret = linux.syscall4(
+            linux.SYS.io_uring_register,
+            @as(usize, @intCast(self.ring.fd)),
+            linux.IORING_REGISTER_FILES,
+            @intFromPtr(reg_fds.ptr),
+            reg_fds.len,
+        );
+        if (ret != 0) return error.RegisterFilesFailed;
+        self.registered_fds = reg_fds;
+    }
+
     /// 从位图中弹出一个空闲槽位索引；1=空闲，用 @ctz 找最低位（TZCNT），比栈 pop 更省内存访问
     inline fn popFreeSlot(self: *HighPerfIO) ?usize {
         if (self.free_count == 0) return null;
-        for (self.free_bitmap, 0..) |*word, word_i| {
+        const start = self.free_scan_hint;
+        for (0..self.free_bitmap.len) |i| {
+            const word_i = (start + i) % self.free_bitmap.len;
+            const word = &self.free_bitmap[word_i];
             if (word.* != 0) {
                 const bit_idx = @ctz(word.*);
                 const slot = word_i * 64 + bit_idx;
                 word.* &= ~(@as(u64, 1) << bit_idx);
                 self.free_count -= 1;
+                self.free_scan_hint = word_i;
                 return slot;
             }
         }
@@ -257,22 +356,26 @@ pub const HighPerfIO = struct {
         const bit = @as(u64, 1) << @as(u6, @intCast(slot % 64));
         self.free_bitmap[word_i] |= bit;
         self.free_count += 1;
+        // 归还时更新扫描提示，以便下次能快速取到
+        if (word_i < self.free_scan_hint) self.free_scan_hint = word_i;
     }
 
     /// 从位图批量弹出空闲槽位索引，写入 out[0..]，返回实际数量；供线程本地槽位缓存 refill
     fn popFreeSlotBatch(self: *HighPerfIO, out: []usize) usize {
         var n: usize = 0;
-        while (n < out.len and self.free_count > 0) {
-            for (self.free_bitmap, 0..) |*word, word_i| {
-                if (word.* != 0) {
-                    const bit_idx = @ctz(word.*);
-                    const slot = word_i * 64 + bit_idx;
-                    word.* &= ~(@as(u64, 1) << bit_idx);
-                    self.free_count -= 1;
-                    out[n] = slot;
-                    n += 1;
-                    if (n >= out.len) break;
-                }
+        const start = self.free_scan_hint;
+        outer: for (0..self.free_bitmap.len) |i| {
+            const word_i = (start + i) % self.free_bitmap.len;
+            const word = &self.free_bitmap[word_i];
+            while (word.* != 0) {
+                const bit_idx = @ctz(word.*);
+                const slot = word_i * 64 + bit_idx;
+                word.* &= ~(@as(u64, 1) << bit_idx);
+                self.free_count -= 1;
+                out[n] = slot;
+                n += 1;
+                self.free_scan_hint = word_i;
+                if (n >= out.len or self.free_count == 0) break :outer;
             }
         }
         return n;
@@ -317,22 +420,63 @@ pub const HighPerfIO = struct {
         };
     }
 
-    /// 提交「在 listen_fd 上接受一连接并将首包读入池中 buffer」请求；user_data 在完成时原样带回；group_id 指定 buffer 组（默认 0=64KB，可 registerBufferGroup 注册多组）；每次调用后立即 ring.submit()（SQPOLL 下几乎零开销，降级模式下为一次系统调用）
+    /// 注册监听 socket 到固定文件表（00 §4.2）；前 32 位预留给监听 fd
+    pub fn registerListenSocket(self: *HighPerfIO, fd: i32) void {
+        if (self.registered_fds.len == 0) return;
+        var i: usize = 0;
+        while (i < 32) : (i += 1) {
+            if (self.registered_fds[i] == fd) return;
+            if (self.registered_fds[i] == -1) {
+                self.registered_fds[i] = fd;
+                _ = linux.syscall4(
+                    linux.SYS.io_uring_register,
+                    @as(usize, @intCast(self.ring.fd)),
+                    linux.IORING_REGISTER_FILES_UPDATE,
+                    @intFromPtr(&self.registered_fds[i]),
+                    1,
+                );
+                return;
+            }
+        }
+    }
+
+    /// 提交「在 listen_fd 上接受一连接并将首包读入池中 buffer」请求；
+    /// 极致优化：使用 IORING_ACCEPT_FIXED_FILE 直接接受到预注册的文件槽位，绕过用户态 fd 创建（00 §4.2）
     pub fn submitAcceptWithBuffer(self: *HighPerfIO, listen_fd: i32, user_data: usize, group_id: u16) void {
         const gid = if (group_id < MAX_BUFFER_GROUPS) group_id else BUFFER_GROUP_ID_DEFAULT;
         const idx = self.slot_cache.take() orelse return;
         self.slot_data.set(idx, .{ .tag = .accept, .listen_fd = listen_fd, .caller_user_data = user_data, .accept_group_id = gid });
-        _ = self.ring.accept(@intCast(idx), listen_fd, null, null, posix.SOCK.NONBLOCK) catch {
+        
+        const sqe = self.ring.get_sqe() catch {
             @branchHint(.cold);
             self.slot_data.set(idx, .{ .tag = .free });
             self.slot_cache.release(idx);
             return;
         };
-        _ = self.ring.submit() catch {
-            @branchHint(.cold);
-            self.slot_data.set(idx, .{ .tag = .free });
-            self.slot_cache.release(idx);
-        };
+        
+        // IORING_OP_ACCEPT
+        sqe.opcode = .ACCEPT;
+        sqe.user_data = @intCast(idx);
+        sqe.addr = 0;
+        sqe.off = 0;
+        sqe.len = 0;
+        sqe.accept_flags = posix.SOCK.NONBLOCK;
+        
+        // 若 listen_fd 已在固定表（0..31），使用 IOSQE_FIXED_FILE
+        if (self.findRegisteredFileIndex(listen_fd)) |reg_idx| {
+            sqe.fd = @intCast(reg_idx);
+            sqe.flags |= linux.IOSQE_FIXED_FILE;
+        } else {
+            sqe.fd = listen_fd;
+        }
+
+        // 极致压榨：直接 accept 到固定文件表的 32+idx 槽位
+        if (self.registered_fds.len > 0) {
+            const fixed_idx = 32 + @as(u32, @intCast(idx));
+            sqe.__union_4.file_index = fixed_idx + 1; // io_uring accept file_index 是 1-based (0=not fixed)
+        }
+
+        self.submitSqueezed();
     }
 
     /// 与 submitAcceptWithBuffer 相同，但不调用 ring.submit()。用于批量提交：循环调用本函数 N 次后，再调用一次 flushSubmits()，将 N 个 accept 合并为一次系统调用（降级无 SQPOLL 时有效；SQPOLL 下 flushSubmits 几乎无额外成本）
@@ -340,12 +484,32 @@ pub const HighPerfIO = struct {
         const gid = if (group_id < MAX_BUFFER_GROUPS) group_id else BUFFER_GROUP_ID_DEFAULT;
         const idx = self.slot_cache.take() orelse return;
         self.slot_data.set(idx, .{ .tag = .accept, .listen_fd = listen_fd, .caller_user_data = user_data, .accept_group_id = gid });
-        _ = self.ring.accept(@intCast(idx), listen_fd, null, null, posix.SOCK.NONBLOCK) catch {
+        
+        const sqe = self.ring.get_sqe() catch {
             @branchHint(.cold);
             self.slot_data.set(idx, .{ .tag = .free });
             self.slot_cache.release(idx);
             return;
         };
+        
+        sqe.opcode = .ACCEPT;
+        sqe.user_data = @intCast(idx);
+        sqe.addr = 0;
+        sqe.off = 0;
+        sqe.len = 0;
+        sqe.accept_flags = posix.SOCK.NONBLOCK;
+        
+        if (self.findRegisteredFileIndex(listen_fd)) |reg_idx| {
+            sqe.fd = @intCast(reg_idx);
+            sqe.flags |= linux.IOSQE_FIXED_FILE;
+        } else {
+            sqe.fd = listen_fd;
+        }
+
+        if (self.registered_fds.len > 0) {
+            const fixed_idx = 32 + @as(u32, @intCast(idx));
+            sqe.__union_4.file_index = fixed_idx + 1;
+        }
     }
 
     /// 将此前通过 submitAcceptWithBufferDeferred 入队的 SQE 一次性提交给内核；批量提交后必须调用一次，否则 accept 不会生效
@@ -353,13 +517,29 @@ pub const HighPerfIO = struct {
         _ = self.ring.submit() catch {};
     }
 
+    // Hot-path
+    /// 提交 SQE 的极致压榨版本：SQPOLL 模式下，仅在内核线程睡眠（NEED_WAKEUP）时才调用 enter 系统调用（00 §3.1）
+    /// 降级模式下退化为标准 submit()。
+    fn submitSqueezed(self: *HighPerfIO) void {
+        if (self.ring.sq.flags.* & linux.IORING_SQ_NEED_WAKEUP != 0) {
+            _ = self.ring.submit() catch {};
+        } else if (self.ring.sq.head.* == self.ring.sq.tail.*) {
+            // 若 SQ 为空且非 SQPOLL（或 SQPOLL 未激活），由调用方保证提交逻辑；
+            // 实际上对于非 SQPOLL，必须调用 enter。
+            // 这里我们假定 init 时已处理好 used_sqpoll 状态。
+            _ = self.ring.submit() catch {};
+        }
+    }
+
     // Hot-path（01 §3.3）：修改时检查汇编无意外 call/逃逸
     /// 收割已完成项：copy_cqes，区分 accept CQE（内部提交 recv）与 recv CQE（填 completion_buffer）；返回切片有效至下次 poll。
     /// 循环前预取 slot 各字段切片为局部变量并传入 handle*，使 ptr+len 更易常驻寄存器（寄存器传参优化）。
     pub fn pollCompletions(self: *HighPerfIO, timeout_ns: i64) []api.Completion {
         self.completion_count = 0;
-        const wait_nr: u32 = if (timeout_ns < 0) 1 else @intCast(@min(timeout_ns / std.time.ns_per_ms, std.math.maxInt(u32)));
-        var cqes: [64]linux.io_uring_cqe = undefined;
+        // wait_nr 是等待的最少完成项数。timeout_ns < 0 表示阻塞（等 1 个），>= 0 表示不阻塞或有界阻塞（peek）。
+        // 注意：Zig 0.16 的 copy_cqes 不带 timeout，若需精准 timeout 需 IORING_OP_TIMEOUT；此处暂用 peek (wait_nr=0) 满足高性能非阻塞需求。
+        const wait_nr: u32 = if (timeout_ns < 0) 1 else 0;
+        var cqes: [128]linux.io_uring_cqe = undefined; // 增加批量处理容量
         const n = self.ring.copy_cqes(&cqes, wait_nr) catch {
             @branchHint(.cold);
             return self.completion_buffer[0..self.completion_count];
@@ -378,6 +558,8 @@ pub const HighPerfIO = struct {
                 self.handleRecvCqe(tags, caller_ud_arr, client_fd_arr, recv_group_id_arr, user_data & ~RECV_USER_DATA_TAG, cqe);
             } else if (user_data & SEND_USER_DATA_TAG != 0) {
                 self.handleSendCqe(tags, caller_ud_arr, user_data & ~SEND_USER_DATA_TAG, cqe);
+            } else if (user_data & SPLICE_USER_DATA_TAG != 0) {
+                self.handleSpliceCqe(tags, caller_ud_arr, user_data & ~SPLICE_USER_DATA_TAG, cqe);
             } else if (user_data < self.max_connections) {
                 self.handleAcceptCqe(tags, caller_ud_arr, accept_group_id_arr, @intCast(user_data), cqe);
             }
@@ -403,20 +585,34 @@ pub const HighPerfIO = struct {
         const grp = &self.groups[gid];
         self.slot_data.set(idx, .{ .tag = .free });
         self.slot_cache.release(idx);
-        const client_fd = cqe.res;
-        if (client_fd <= 0) {
+        
+        const res = cqe.res;
+        if (res < 0) {
             @branchHint(.cold);
             return;
         }
+
         const recv_idx = self.slot_cache.take() orelse {
             @branchHint(.cold);
-            posix.close(@intCast(client_fd));
+            // 若使用了固定文件表，需异步或同步关闭固定槽位（此处暂用标准 fd 处理逻辑，需优化）
             return;
         };
+
         const chunk_len = if (grp.chunk_count > 0) grp.chunk_size else CHUNK_SIZE;
         const recv_gid = if (grp.chunk_count > 0) gid else BUFFER_GROUP_ID_DEFAULT;
-        self.slot_data.set(recv_idx, .{ .tag = .recv, .client_fd = @intCast(client_fd), .caller_user_data = caller_ud, .recv_group_id = recv_gid });
-        _ = self.ring.recv(
+        
+        // 如果使用了固定槽位，res 往往是 0（或者 fd）；我们记录该 client 的固定索引
+        const client_is_fixed = (self.registered_fds.len > 0);
+        const client_fd: i32 = if (client_is_fixed) @intCast(32 + idx) else res;
+
+        self.slot_data.set(recv_idx, .{ 
+            .tag = .recv, 
+            .client_fd = client_fd, 
+            .caller_user_data = caller_ud, 
+            .recv_group_id = recv_gid 
+        });
+
+        const sqe = self.ring.recv(
             RECV_USER_DATA_TAG | @as(u64, recv_idx),
             @intCast(client_fd),
             .{ .buffer_selection = .{ .group_id = recv_gid, .len = chunk_len } },
@@ -425,15 +621,14 @@ pub const HighPerfIO = struct {
             @branchHint(.cold);
             self.slot_data.set(recv_idx, .{ .tag = .free });
             self.slot_cache.release(recv_idx);
-            posix.close(@intCast(client_fd));
             return;
         };
-        _ = self.ring.submit() catch {
-            @branchHint(.cold);
-            self.slot_data.set(recv_idx, .{ .tag = .free });
-            self.slot_cache.release(recv_idx);
-            posix.close(@intCast(client_fd));
-        };
+
+        if (client_is_fixed) {
+            sqe.flags |= linux.IOSQE_FIXED_FILE;
+        }
+
+        self.submitSqueezed();
     }
 
     /// 处理 recv CQE：.recv=accept 首包（推 client_stream），.conn_recv=submitRecv（推 tag=recv、chunk_index）
@@ -515,6 +710,35 @@ pub const HighPerfIO = struct {
         self.pushCompletionSend(caller_ud, len);
     }
 
+    /// 处理 splice CQE：推 tag=splice、len=已拼接字节
+    fn handleSpliceCqe(
+        self: *HighPerfIO,
+        tags: []const SlotTag,
+        caller_ud_arr: []const usize,
+        splice_idx: usize,
+        cqe: *linux.io_uring_cqe,
+    ) void {
+        if (splice_idx >= self.max_connections) {
+            @branchHint(.cold);
+            return;
+        }
+        if (tags[splice_idx] != .conn_splice) {
+            @branchHint(.cold);
+            return;
+        }
+        const caller_ud = caller_ud_arr[splice_idx];
+        self.slot_data.set(splice_idx, .{ .tag = .free });
+        self.slot_cache.release(splice_idx);
+        const res = cqe.res;
+        if (res < 0) {
+            @branchHint(.cold);
+            self.pushCompletionSplice(caller_ud, 0, error.SendfileFailed);
+            return;
+        }
+        const len = @as(usize, @intCast(res));
+        self.pushCompletionSplice(caller_ud, len, null);
+    }
+
     inline fn pushCompletion(self: *HighPerfIO, user_data: usize, buffer_ptr: ?[*]const u8, len: usize, err: ?api.SendFileError, client_stream: ?std.Io.net.Stream) void {
         if (self.completion_count >= self.completion_buffer.len) return;
         self.completion_buffer[self.completion_count] = .{
@@ -557,6 +781,20 @@ pub const HighPerfIO = struct {
         self.completion_count += 1;
     }
 
+    inline fn pushCompletionSplice(self: *HighPerfIO, user_data: usize, len: usize, err: ?api.SendFileError) void {
+        if (self.completion_count >= self.completion_buffer.len) return;
+        self.completion_buffer[self.completion_count] = .{
+            .user_data = user_data,
+            .buffer_ptr = @ptrCast(&[_]u8{}),
+            .len = len,
+            .err = err,
+            .client_stream = null,
+            .tag = .splice,
+            .chunk_index = null,
+        };
+        self.completion_count += 1;
+    }
+
     // Hot-path
     /// 在连接上提交一次 recv；数据由内核写入 provide_buffers 池，完成时 tag=recv、chunk_index 为 buffer_id（releaseChunk 在 Linux 为 no-op）
     pub fn submitRecv(self: *HighPerfIO, stream: std.Io.net.Stream, user_data: usize) void {
@@ -565,7 +803,8 @@ pub const HighPerfIO = struct {
         const grp = &self.groups[gid];
         const chunk_len = if (grp.chunk_count > 0) grp.chunk_size else CHUNK_SIZE;
         self.slot_data.set(idx, .{ .tag = .conn_recv, .listen_fd = 0, .client_fd = @intCast(stream.handle), .caller_user_data = user_data, .accept_group_id = 0, .recv_group_id = gid });
-        _ = self.ring.recv(
+        
+        const sqe = self.ring.recv(
             RECV_USER_DATA_TAG | @as(u64, idx),
             @intCast(stream.handle),
             .{ .buffer_selection = .{ .group_id = gid, .len = chunk_len } },
@@ -576,11 +815,14 @@ pub const HighPerfIO = struct {
             self.slot_cache.release(idx);
             return;
         };
-        _ = self.ring.submit() catch {
-            @branchHint(.cold);
-            self.slot_data.set(idx, .{ .tag = .free });
-            self.slot_cache.release(idx);
-        };
+
+        // 若 fd 在预注册表（0..31 或 32..），使用 IOSQE_FIXED_FILE
+        if (self.findRegisteredFileIndex(stream.handle)) |reg_idx| {
+            sqe.fd = @intCast(reg_idx);
+            sqe.flags |= linux.IOSQE_FIXED_FILE;
+        }
+
+        self.submitSqueezed();
     }
 
     // Hot-path
@@ -595,7 +837,34 @@ pub const HighPerfIO = struct {
         if (data.len == 0) return;
         const idx = self.slot_cache.take() orelse return;
         self.slot_data.set(idx, .{ .tag = .conn_send, .listen_fd = 0, .client_fd = @intCast(stream.handle), .caller_user_data = user_data, .accept_group_id = 0, .recv_group_id = 0 });
-        _ = self.ring.send(SEND_USER_DATA_TAG | @as(u64, idx), @intCast(stream.handle), data, 0) catch {
+        
+        const sqe = self.ring.send(SEND_USER_DATA_TAG | @as(u64, idx), @intCast(stream.handle), data, 0) catch {
+            @branchHint(.cold);
+            self.slot_data.set(idx, .{ .tag = .free });
+            self.slot_cache.release(idx);
+            return;
+        };
+
+        if (self.findRegisteredFileIndex(stream.handle)) |reg_idx| {
+            sqe.fd = @intCast(reg_idx);
+            sqe.flags |= linux.IOSQE_FIXED_FILE;
+        }
+
+        self.submitSqueezed();
+    }
+
+    // Hot-path
+    /// 在连接上提交一次 read_fixed；使用已注册的缓冲区索引 buf_index（§3.1）
+    pub fn submitReadFixed(self: *HighPerfIO, fd: i32, buf_index: u32, offset: u64, user_data: usize) void {
+        const idx = self.slot_cache.take() orelse return;
+        self.slot_data.set(idx, .{ .tag = .conn_recv, .client_fd = fd, .caller_user_data = user_data });
+        _ = self.ring.read_fixed(
+            RECV_USER_DATA_TAG | @as(u64, idx),
+            fd,
+            &self.registered_buffers[buf_index],
+            offset,
+            @intCast(buf_index),
+        ) catch {
             @branchHint(.cold);
             self.slot_data.set(idx, .{ .tag = .free });
             self.slot_cache.release(idx);
@@ -606,6 +875,64 @@ pub const HighPerfIO = struct {
             self.slot_data.set(idx, .{ .tag = .free });
             self.slot_cache.release(idx);
         };
+    }
+
+    // Hot-path
+    /// 在连接上提交一次 write_fixed；使用已注册的缓冲区索引 buf_index（§3.1）
+    pub fn submitWriteFixed(self: *HighPerfIO, fd: i32, buf_index: u32, offset: u64, user_data: usize) void {
+        const idx = self.slot_cache.take() orelse return;
+        self.slot_data.set(idx, .{ .tag = .conn_send, .client_fd = fd, .caller_user_data = user_data });
+        _ = self.ring.write_fixed(
+            SEND_USER_DATA_TAG | @as(u64, idx),
+            fd,
+            &self.registered_buffers[buf_index],
+            offset,
+            @intCast(buf_index),
+        ) catch {
+            @branchHint(.cold);
+            self.slot_data.set(idx, .{ .tag = .free });
+            self.slot_cache.release(idx);
+            return;
+        };
+        _ = self.ring.submit() catch {
+            @branchHint(.cold);
+            self.slot_data.set(idx, .{ .tag = .free });
+            self.slot_cache.release(idx);
+        };
+    }
+
+    // Hot-path
+    /// 在两个文件描述符间提交 splice（零拷贝）；in/out 至少一个必须是 pipe；flags 为 linux.SPLICE.F.*
+    pub fn submitSplice(self: *HighPerfIO, fd_in: i32, off_in: i64, fd_out: i32, off_out: i64, len: u32, flags: u32, user_data: usize) void {
+        const idx = self.slot_cache.take() orelse return;
+        self.slot_data.set(idx, .{ .tag = .conn_splice, .listen_fd = 0, .client_fd = fd_out, .caller_user_data = user_data, .accept_group_id = 0, .recv_group_id = 0 });
+        _ = self.ring.splice(SPLICE_USER_DATA_TAG | @as(u64, idx), fd_in, off_in, fd_out, off_out, len, flags) catch {
+            @branchHint(.cold);
+            self.slot_data.set(idx, .{ .tag = .free });
+            self.slot_cache.release(idx);
+            return;
+        };
+        _ = self.ring.submit() catch {
+            @branchHint(.cold);
+            self.slot_data.set(idx, .{ .tag = .free });
+            self.slot_cache.release(idx);
+        };
+    }
+
+    fn findRegisteredFileIndex(self: *HighPerfIO, fd: i32) ?u32 {
+        if (self.registered_fds.len == 0) return null;
+        // 1) 优先检查监听 fd（索引 0..31）
+        var i: usize = 0;
+        while (i < 32) : (i += 1) {
+            if (self.registered_fds[i] == fd) return @intCast(i);
+        }
+        // 2) 对于连接 fd，若其值落在 32..max_connections+31 范围内，
+        // 且我们开启了固定文件表优化，则它本身就是固定索引。
+        const u_fd = @as(u32, @intCast(fd));
+        if (u_fd >= 32 and u_fd < 32 + self.max_connections) {
+            return u_fd;
+        }
+        return null;
     }
 };
 
