@@ -23,6 +23,7 @@ const strip_types = @import("../transpiler/strip_types.zig");
 const jsx = @import("../transpiler/jsx.zig");
 const run_options = @import("../runtime/run_options.zig");
 const vm = @import("../runtime/vm.zig");
+const engine_globals = @import("../runtime/globals.zig");
 const pkg_install = @import("../package/install.zig");
 
 /// 执行 shu run [entry] 或 shu run <script>
@@ -106,6 +107,9 @@ pub fn run(allocator: std.mem.Allocator, parsed: args_mod.ParsedArgs, positional
     var runtime = vm.VM.init(allocator, &options) catch return;
     defer runtime.deinit();
     try runtime.run(source, entry_path_abs);
+    if (engine_globals.pending_process_exit) |code| {
+        std.process.exit(code);
+    }
 }
 
 /// 当前目录是否存在任意 manifest：package.json 或 package.jsonc、deno.json 或 deno.jsonc 任一存在即返回 true。Zig 0.16：用 libs_io.openDirAbsolute，Dir/File 操作需 io。
