@@ -1,7 +1,7 @@
 // setImmediate 每轮 tick 的完整实现（从 mod.zig 拆出）
 //
 // 职责：stop/restart/signal、cluster worker 监控、io_core 明文/TLS、poll/iocp fallback、runLoop 节流、setImmediate 续驱。
-// 依赖：state、conn_state、constants、mux、step_plain、step_tls、connection、options、iocp、http2、errors、jsc、globals、timer_state、tls。
+// 依赖：state、conn_state、constants、mux、step_plain、step_tls、connection、options、iocp、errors、jsc、globals、timer_state、tls。
 
 const std = @import("std");
 const jsc = @import("jsc");
@@ -14,7 +14,6 @@ const options = @import("options.zig");
 const iocp = @import("iocp.zig");
 const builtin = @import("builtin");
 const tls = @import("tls");
-const http2 = @import("http2.zig");
 
 const state_mod = @import("state.zig");
 const types = @import("types.zig");
