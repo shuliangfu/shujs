@@ -107,8 +107,8 @@ fn mockMethodCallback(
 /// 每次调用 mock 函数时执行：记录参数到 .calls、递增 .callCount，若有实现则调用并返回其返回值
 fn mockInstanceCallback(
     ctx: jsc.JSContextRef,
+    function_obj: jsc.JSObjectRef,
     thisObject: jsc.JSObjectRef,
-    callee: jsc.JSObjectRef,
     argumentCount: usize,
     arguments: [*]const jsc.JSValueRef,
     exception: [*]jsc.JSValueRef,
@@ -121,9 +121,9 @@ fn mockInstanceCallback(
     defer jsc.JSStringRelease(k_impl_js);
     const k_callCount_pub_js = jsc.JSStringCreateWithUTF8CString(k_callCount_pub);
     defer jsc.JSStringRelease(k_callCount_pub_js);
-    const calls_val = jsc.JSObjectGetProperty(ctx, callee, k_calls_js, null);
+    const calls_val = jsc.JSObjectGetProperty(ctx, function_obj, k_calls_js, null);
     const calls_obj = jsc.JSValueToObject(ctx, calls_val, null) orelse return jsc.JSValueMakeUndefined(ctx);
-    const count_val = jsc.JSObjectGetProperty(ctx, callee, k_count_js, null);
+    const count_val = jsc.JSObjectGetProperty(ctx, function_obj, k_count_js, null);
     const current_count_f = jsc.JSValueToNumber(ctx, count_val, null);
     const current_count: usize = if (current_count_f >= 0 and std.math.isFinite(current_count_f)) @intFromFloat(current_count_f) else 0;
     const args_arr = if (argumentCount == 0) blk: {
@@ -132,9 +132,9 @@ fn mockInstanceCallback(
     } else jsc.JSObjectMakeArray(ctx, argumentCount, arguments, null);
     arrayAppend(ctx, calls_obj, current_count, args_arr);
     const new_count = current_count + 1;
-    _ = jsc.JSObjectSetProperty(ctx, callee, k_count_js, jsc.JSValueMakeNumber(ctx, @floatFromInt(new_count)), jsc.kJSPropertyAttributeNone, null);
-    _ = jsc.JSObjectSetProperty(ctx, callee, k_callCount_pub_js, jsc.JSValueMakeNumber(ctx, @floatFromInt(new_count)), jsc.kJSPropertyAttributeNone, null);
-    const impl_val = jsc.JSObjectGetProperty(ctx, callee, k_impl_js, null);
+    _ = jsc.JSObjectSetProperty(ctx, function_obj, k_count_js, jsc.JSValueMakeNumber(ctx, @floatFromInt(new_count)), jsc.kJSPropertyAttributeNone, null);
+    _ = jsc.JSObjectSetProperty(ctx, function_obj, k_callCount_pub_js, jsc.JSValueMakeNumber(ctx, @floatFromInt(new_count)), jsc.kJSPropertyAttributeNone, null);
+    const impl_val = jsc.JSObjectGetProperty(ctx, function_obj, k_impl_js, null);
     if (jsc.JSValueIsUndefined(ctx, impl_val)) return jsc.JSValueMakeUndefined(ctx);
     const impl_fn = jsc.JSValueToObject(ctx, impl_val, null) orelse return jsc.JSValueMakeUndefined(ctx);
     return jsc.JSObjectCallAsFunction(ctx, impl_fn, thisObject, argumentCount, arguments, exception);
