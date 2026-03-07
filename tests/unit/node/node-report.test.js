@@ -12,10 +12,15 @@ describe("node:report exports", () => {
 });
 
 describe("node:report getReport", () => {
-  it("getReport() returns string or object", () => {
+  it("getReport() returns report object with header", () => {
     const r = report.getReport();
     assert.ok(r != null);
-    assert.ok(typeof r === "string" || typeof r === "object");
+    assert.strictEqual(typeof r, "object");
+    assert.ok(r.header && typeof r.header === "object");
+    assert.ok(typeof r.header.event === "string");
+    assert.strictEqual(r.header.cwd, ".");
+    assert.ok(typeof r.header.entryPoint === "string");
+    assert.strictEqual(r.header.entryPoint.startsWith("/"), false);
   });
 });
 
