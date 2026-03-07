@@ -323,7 +323,9 @@ fn listenTlsCallback(
     const k_listener = jsc.JSStringCreateWithUTF8CString("_requestListener");
     defer jsc.JSStringRelease(k_listener);
     const listener_val = jsc.JSObjectGetProperty(ctx, this, k_listener, null);
-    if (!jsc.JSObjectIsFunction(ctx, @ptrCast(listener_val))) return jsc.JSValueMakeUndefined(ctx);
+    // 先把 JSValue 转成 JSObject，再做函数判断；直接 ptrCast 可能导致非法指针访问。
+    const listener_obj = jsc.JSValueToObject(ctx, listener_val, null);
+    if (listener_obj == null or !jsc.JSObjectIsFunction(ctx, listener_obj.?)) return jsc.JSValueMakeUndefined(ctx);
     const port_n = jsc.JSValueToNumber(ctx, arguments[0], null);
     if (port_n != port_n or port_n < 1 or port_n > 65535) return jsc.JSValueMakeUndefined(ctx);
     const port = @as(u16, @intFromFloat(port_n));
@@ -335,7 +337,8 @@ fn listenTlsCallback(
     const create_fn = jsc.JSValueToObject(ctx, create_val, null) orelse return jsc.JSValueMakeUndefined(ctx);
     var listener_args = [_]jsc.JSValueRef{listener_val};
     const fetch_val = jsc.JSObjectCallAsFunction(ctx, create_fn, null, 1, &listener_args, null);
-    if (!jsc.JSObjectIsFunction(ctx, @ptrCast(fetch_val))) return jsc.JSValueMakeUndefined(ctx);
+    const fetch_obj = jsc.JSValueToObject(ctx, fetch_val, null);
+    if (fetch_obj == null or !jsc.JSObjectIsFunction(ctx, fetch_obj.?)) return jsc.JSValueMakeUndefined(ctx);
     var host_buf: [256]u8 = undefined;
     const host_slice: []const u8 = blk: {
         if (argumentCount < 2 or jsc.JSValueIsUndefined(ctx, arguments[1])) break :blk "0.0.0.0";
