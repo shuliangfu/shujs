@@ -55,6 +55,7 @@ const shu_stream = @import("stream/mod.zig");
 const shu_server = @import("server/mod.zig");
 const shu_http = @import("http/mod.zig");
 const shu_https = @import("https/mod.zig");
+const shu_http2 = @import("http2/mod.zig");
 const shu_net = @import("net/mod.zig");
 const shu_tls = @import("tls/mod.zig");
 const shu_dgram = @import("dgram/mod.zig");
@@ -124,6 +125,7 @@ const ShuBuiltinTag = enum {
     server,
     http,
     https,
+    http2,
     net,
     tls,
     dgram,
@@ -159,7 +161,7 @@ const ShuBuiltinTag = enum {
 /// (len, u64 前缀) -> tag 表，comptime 生成；运行时一次整型比较匹配（00 §2.1）
 const SPEC_TABLE = blk: {
     const Entry = struct { len: usize, prefix: u64, tag: ShuBuiltinTag };
-    var list: [52]Entry = undefined;
+    var list: [53]Entry = undefined;
     const specs = .{
         .{ "shu:fs", .fs },
         .{ "shu:path", .path },
@@ -183,6 +185,7 @@ const SPEC_TABLE = blk: {
         .{ "shu:server", .server },
         .{ "shu:http", .http },
         .{ "shu:https", .https },
+        .{ "shu:http2", .http2 },
         .{ "shu:net", .net },
         .{ "shu:tls", .tls },
         .{ "shu:dgram", .dgram },
@@ -245,6 +248,7 @@ fn getExportsByTag(tag: ShuBuiltinTag, ctx: jsc.JSContextRef, allocator: std.mem
         .server => shu_server.getExports(ctx, allocator),
         .http => shu_http.getExports(ctx, allocator),
         .https => shu_https.getExports(ctx, allocator),
+        .http2 => shu_http2.getExports(ctx, allocator),
         .net => shu_net.getExports(ctx, allocator),
         .tls => shu_tls.getExports(ctx, allocator),
         .dgram => shu_dgram.getExports(ctx, allocator),
@@ -301,6 +305,7 @@ pub const SUPPORTED: []const []const u8 = &.{
     "shu:stream",
     "shu:http",
     "shu:https",
+    "shu:http2",
     "shu:net",
     "shu:tls",
     "shu:dgram",
