@@ -105,28 +105,28 @@ pub fn build(b: *std.Build) void {
     errors_module.addImport("libs_process", libs_process_module);
     root_module.addImport("errors", errors_module);
 
-    // TLS 模块：-Dtls 时提供 TlsContext/TlsStream，供 server/net/tls 使用；实现位于 shu/lib/tls
-    const shu_lib_tls = "src/runtime/modules/shu/lib/tls";
+    // TLS 模块：-Dtls 时提供 TlsContext/TlsStream，供 server/net/tls 使用；实现位于 libs/tls
+    const libs_tls = "src/libs/tls";
     const tls_module = b.createModule(.{
-        .root_source_file = b.path(shu_lib_tls ++ "/tls.zig"),
+        .root_source_file = b.path(libs_tls ++ "/tls.zig"),
         .target = target,
         .optimize = optimize,
     });
     tls_module.addImport("build_options", build_options_module);
     if (have_tls) {
-        // tls.zig 内 @cImport("tls.h") 需能找到 lib/tls/tls.h
-        tls_module.addIncludePath(.{ .cwd_relative = shu_lib_tls });
+        // tls.zig 内 @cImport("tls.h") 需能找到 libs/tls/tls.h
+        tls_module.addIncludePath(.{ .cwd_relative = libs_tls });
     }
     root_module.addImport("tls", tls_module);
 
-    // HTTP/2：帧解析与 HPACK，供 TLS ALPN h2 时使用
+    // HTTP/2：帧解析与 HPACK，位于 libs，供 server（TLS ALPN h2）与 http2_client 共用
     const http2_module = b.createModule(.{
-        .root_source_file = b.path("src/runtime/modules/shu/server/http2.zig"),
+        .root_source_file = b.path("src/libs/http/http2.zig"),
         .target = target,
         .optimize = optimize,
     });
     const hpack_huffman_module = b.createModule(.{
-        .root_source_file = b.path("src/runtime/modules/shu/server/hpack_huffman.zig"),
+        .root_source_file = b.path("src/libs/http/hpack_huffman.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -144,6 +144,19 @@ pub fn build(b: *std.Build) void {
     iocp_module.addImport("build_options", build_options_module);
     root_module.addImport("iocp", iocp_module);
 
+    // HTTP/2 客户端：have_tls 时用完整实现（TLS ALPN + 帧），否则用 stub（直接返回 Http2NotAvailable）
+    const http2_client_src = if (have_tls) b.path("src/libs/http/http2_client.zig") else b.path("src/libs/http/http2_client_stub.zig");
+    const http2_client_module = b.createModule(.{
+        .root_source_file = http2_client_src,
+        .target = target,
+        .optimize = optimize,
+    });
+    if (have_tls) {
+        http2_client_module.addImport("tls", tls_module);
+        http2_client_module.addImport("http2", http2_module);
+        http2_client_module.addImport("libs_process", libs_process_module);
+    }
+
     // 高性能 I/O 核心：统一 API，按平台分派；实现已迁至 libs/io.zig（原 io_core/mod.zig）
     const io_core_module = b.createModule(.{
         .root_source_file = b.path("src/libs/io.zig"),
@@ -151,6 +164,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     io_core_module.addImport("libs_process", libs_process_module);
+    io_core_module.addImport("http2_client", http2_client_module);
     root_module.addImport("libs_io", io_core_module);
 
     // 仅解压 API（gzip/deflate/br），无 jsc 依赖，供 io_core/http raw_body 自动解压与 package/registry 等使用；根为 zlib/decode.zig
@@ -189,10 +203,10 @@ pub fn build(b: *std.Build) void {
     // 发布时去掉调试符号以减小体积（ReleaseSmall 时效果明显）；Debug 时保留以便堆栈
     exe.root_module.strip = (optimize != .Debug);
 
-    // TLS：-Dtls 时加入 lib/tls/tls.c 并链接 OpenSSL；tls.c 需能找到 tls.h
+    // TLS：-Dtls 时加入 libs/tls/tls.c 并链接 OpenSSL；tls.c 需能找到 tls.h
     if (have_tls) {
-        exe.root_module.addCSourceFiles(.{ .files = &[_][]const u8{"src/runtime/modules/shu/lib/tls/tls.c"}, .flags = &.{} });
-        exe.root_module.addIncludePath(.{ .cwd_relative = "src/runtime/modules/shu/lib/tls" });
+        exe.root_module.addCSourceFiles(.{ .files = &[_][]const u8{"src/libs/tls/tls.c"}, .flags = &.{} });
+        exe.root_module.addIncludePath(.{ .cwd_relative = "src/libs/tls" });
         exe.root_module.linkSystemLibrary("ssl", .{});
         exe.root_module.linkSystemLibrary("crypto", .{});
     }
@@ -273,13 +287,14 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run shu CLI");
     run_step.dependOn(&run_cmd.step);
 
-    // 单元测试：入口为 src/test_runner.zig，模块根为 src/；拉入 server/http2.zig 时需能解析 hpack_huffman
+    // 单元测试：入口为 src/test_runner.zig，模块根为 src/；拉入 libs/http2 时需能解析 hpack_huffman
     const test_module = b.createModule(.{
         .root_source_file = b.path("src/test_runner.zig"),
         .target = target,
         .optimize = optimize,
     });
     test_module.addImport("hpack_huffman", hpack_huffman_module);
+    test_module.addImport("http2", http2_module);
     test_module.addImport("libs_io", io_core_module);
     test_module.addImport("errors", errors_module);
     test_module.addImport("libs_process", libs_process_module);
