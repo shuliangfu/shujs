@@ -86,7 +86,7 @@ pub const readReaderUpTo = file.readReaderUpTo;
 pub const AsyncFileIO = file.AsyncFileIO;
 
 /// 统一 HTTP 客户端：request(任意方法)/get(GET 便捷)，供 package/registry、shu:fetch 使用；仅 Zig 路径（std.http.Client）
-pub const http = @import("http.zig");
+pub const http = @import("http/http.zig");
 
 /// 文件/目录监视：startWatch、drainWatchEvents、WatchHandle、WatchEvent；Linux inotify，其他平台占位
 const watch_mod = @import("watch.zig");
