@@ -9,6 +9,12 @@ const libs_io = @import("libs_io");
 
 /// 当前执行的 RunOptions（权限、cwd 等）
 pub threadlocal var current_run_options: ?*const run_options_mod.RunOptions = null;
+/// process.exit(code) 请求的退出码；run 命令在 VM.run 返回后若非 null 则应以该码退出进程
+pub threadlocal var pending_process_exit: ?u8 = null;
+/// 进程启动时间（纳秒，用于 process.uptime()）；register 时由 std.Io.Clock 写入，无 io 时为 0
+pub threadlocal var process_start_time_ns: u64 = 0;
+/// process.chdir() 覆盖的当前工作目录；由 process 模块分配与释放，cwd() 优先返回此值
+pub threadlocal var process_cwd_override: ?[]const u8 = null;
 /// 当前分配的 Allocator
 pub threadlocal var current_allocator: ?std.mem.Allocator = null;
 /// 当前定时器状态，供 setTimeout/setInterval 入队
