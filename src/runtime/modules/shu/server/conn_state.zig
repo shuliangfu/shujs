@@ -8,7 +8,7 @@ const build_options = @import("build_options");
 const errors = @import("errors");
 const libs_process = @import("libs_process");
 const tls = @import("tls");
-const http2 = @import("http2.zig");
+const http2 = @import("http2");
 const types = @import("types.zig");
 const constants = @import("constants.zig");
 
