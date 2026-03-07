@@ -1,5 +1,5 @@
 //! HPACK Huffman 单元测试：encodeHuffmanToBuffer、decodeHuffman 及往返
-//! 被测模块：通过 build 提供的 hpack_huffman 模块（src/runtime/modules/shu/server/hpack_huffman.zig）
+//! 被测模块：通过 build 提供的 hpack_huffman 模块（src/libs/http/hpack_huffman.zig）
 
 const std = @import("std");
 const hpack_huffman = @import("hpack_huffman");
