@@ -849,8 +849,13 @@ fn getDiskFreeSpacePosix(allocator: std.mem.Allocator, path: []const u8) OsError
     defer allocator.free(path_z);
     var stat: posix_statvfs.statvfs_t = undefined;
     if (posix_statvfs.statvfs(path_z.ptr, &stat) != 0) return error.IoError;
-    const total = @as(u64, stat.f_blocks) * @as(u64, stat.f_frsize);
-    const free = @as(u64, stat.f_bavail) * @as(u64, stat.f_frsize);
+    // statvfs 的字段在不同平台位宽不同，直接乘法在 Debug 下可能触发整数溢出 panic。
+    // 这里使用显式溢出检查：若溢出则饱和到 u64 最大值，保证运行时不崩溃。
+    const block_count = @as(u64, stat.f_blocks);
+    const block_size = @as(u64, stat.f_frsize);
+    const avail_blocks = @as(u64, stat.f_bavail);
+    const total = std.math.mul(u64, block_count, block_size) catch std.math.maxInt(u64);
+    const free = std.math.mul(u64, avail_blocks, block_size) catch std.math.maxInt(u64);
     return .{ .total_bytes = total, .free_bytes = free };
 }
 
