@@ -27,6 +27,7 @@
 // | node:stream        | shu:stream     | ✅ 已实现 |
 // | node:http          | shu:http       | ✅ 已实现 |
 // | node:https         | shu:https      | ✅ 已实现 |
+// | node:http2         | shu:http2      | ✅ 导出对齐（connect、createServer、createSecureServer、constants、getDefaultSettings、getPackedSettings、session.close）；request 为 callback 形态，listen 暂 not implemented） |
 // | node:net           | shu:net        | ✅ 已实现 |
 // | node:tls           | shu:tls        | ✅ 已实现 |
 // | node:dgram         | shu:dgram      | ✅ 已实现 |
@@ -88,6 +89,7 @@ pub const NODE_BUILTIN_NAMES: []const []const u8 = &.{
     "node:stream",
     "node:http",
     "node:https",
+    "node:http2",
     "node:net",
     "node:tls",
     "node:dgram",
@@ -176,6 +178,7 @@ pub fn getNodeBuiltin(ctx: jsc.JSContextRef, allocator: std.mem.Allocator, speci
     if (std.mem.eql(u8, specifier, "node:stream")) return shu_builtin.getShuBuiltin(ctx, allocator, "shu:stream");
     if (std.mem.eql(u8, specifier, "node:http")) return shu_builtin.getShuBuiltin(ctx, allocator, "shu:http");
     if (std.mem.eql(u8, specifier, "node:https")) return shu_builtin.getShuBuiltin(ctx, allocator, "shu:https");
+    if (std.mem.eql(u8, specifier, "node:http2")) return shu_builtin.getShuBuiltin(ctx, allocator, "shu:http2");
     if (std.mem.eql(u8, specifier, "node:net")) return shu_builtin.getShuBuiltin(ctx, allocator, "shu:net");
     if (std.mem.eql(u8, specifier, "node:tls")) return shu_builtin.getShuBuiltin(ctx, allocator, "shu:tls");
     if (std.mem.eql(u8, specifier, "node:dgram")) return shu_builtin.getShuBuiltin(ctx, allocator, "shu:dgram");
