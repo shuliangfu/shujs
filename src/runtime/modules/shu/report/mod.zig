@@ -1,12 +1,12 @@
 // shu:report — 与 node:report API 兼容，纯 Zig 实现
-// 所有权：getReport/writeReport 为 JS API，返回值 JSC 持有；buildReportString [Allocates] 返回切片由调用方 free。
+// 所有权：getReport/writeReport 为 JS API，返回值 JSC 持有；stringifyReportObjectToUtf8 [Allocates] 返回切片由调用方 free。
 //
 // ========== API 兼容情况 ==========
 //
 // | API | 兼容 | 说明 |
 // |-----|------|------|
-// | getReport([err]) | ✅ 已实现 | 返回诊断报告字符串（头部、进程信息、无真实堆栈时占位） |
-// | writeReport([filename][, err]) | ✅ 已实现 | 将 getReport 写入指定文件或 stdout；无 filename 时写 stdout |
+// | getReport([err]) | ✅ 已实现 | 返回诊断报告对象（Node 风格 JSON 对象） |
+// | writeReport([filename][, err]) | ✅ 已实现 | 将报告对象序列化为 JSON 文本写入指定文件或 stdout |
 //
 
 const std = @import("std");
@@ -20,38 +20,130 @@ const globals = @import("../../../globals.zig");
 /// 超过此长度写文件时用 libs_io.mapFileReadWrite，减少大报告时的多次 write 与拷贝
 const REPORT_MAP_THRESHOLD = 64 * 1024;
 
-/// [Allocates] 生成简单诊断报告字符串（不含真实堆栈；与 Node report 格式近似）；返回的切片由调用方 free。Zig 0.16：用 bufPrint + appendSlice 替代 writer.print。
-fn buildReportString(allocator: std.mem.Allocator) []const u8 {
-    var list = std.ArrayList(u8).initCapacity(allocator, 2048) catch return "";
-    var buf: [512]u8 = undefined;
-    list.appendSlice(allocator, "--- Shu diagnostic report ---\n") catch return "";
-    const t: i64 = if (libs_process.getProcessIo()) |io| blk: {
-        const now = std.Io.Clock.Timestamp.now(io, .real);
-        break :blk @as(i64, @intCast(@divTrunc(now.raw.nanoseconds, 1_000_000_000)));
-    } else 0;
-    const s1 = std.fmt.bufPrint(&buf, "Time: {d}\n", .{t}) catch return "";
-    list.appendSlice(allocator, s1) catch return "";
-    if (globals.current_run_options) |opts| {
-        const s2 = std.fmt.bufPrint(&buf, "Entry: {s}\nCwd: {s}\n", .{ opts.entry_path, opts.cwd }) catch return "";
-        list.appendSlice(allocator, s2) catch return "";
-        const s3 = std.fmt.bufPrint(&buf, "Permissions: read={} write={} net={} env={} run={} hrtime={} ffi={}\n", .{
-            opts.permissions.allow_read,
-            opts.permissions.allow_write,
-            opts.permissions.allow_net,
-            opts.permissions.allow_env,
-            opts.permissions.allow_run,
-            opts.permissions.allow_hrtime,
-            opts.permissions.allow_ffi,
-        }) catch return "";
-        list.appendSlice(allocator, s3) catch return "";
-    } else {
-        list.appendSlice(allocator, "(no run context)\n") catch return "";
-    }
-    list.appendSlice(allocator, "--- End report ---\n") catch return "";
-    return list.toOwnedSlice(allocator) catch "";
+/// 返回当前 Unix 时间（秒）；无 process io 时返回 0。
+fn nowUnixSeconds() i64 {
+    const io = libs_process.getProcessIo() orelse return 0;
+    const now = std.Io.Clock.Timestamp.now(io, .real);
+    return @as(i64, @intCast(@divTrunc(now.raw.nanoseconds, 1_000_000_000)));
 }
 
-/// getReport([err])：返回报告字符串；err 暂未用于定制堆栈
+/// [Allocates] 将 UTF-8 切片转为 JS 字符串值；失败时返回 undefined。
+fn makeJsStringValue(ctx: jsc.JSContextRef, allocator: std.mem.Allocator, value: []const u8) jsc.JSValueRef {
+    const z = allocator.dupeZ(u8, value) catch return jsc.JSValueMakeUndefined(ctx);
+    defer allocator.free(z);
+    const s = jsc.JSStringCreateWithUTF8CString(z.ptr);
+    defer jsc.JSStringRelease(s);
+    return jsc.JSValueMakeString(ctx, s);
+}
+
+/// 在对象上设置字符串属性；value 为 UTF-8。
+fn setStringProperty(ctx: jsc.JSContextRef, allocator: std.mem.Allocator, obj: jsc.JSObjectRef, key: [*:0]const u8, value: []const u8) void {
+    const k = jsc.JSStringCreateWithUTF8CString(key);
+    defer jsc.JSStringRelease(k);
+    _ = jsc.JSObjectSetProperty(ctx, obj, k, makeJsStringValue(ctx, allocator, value), jsc.kJSPropertyAttributeNone, null);
+}
+
+/// 在对象上设置数值属性。
+fn setNumberProperty(ctx: jsc.JSContextRef, obj: jsc.JSObjectRef, key: [*:0]const u8, value: f64) void {
+    const k = jsc.JSStringCreateWithUTF8CString(key);
+    defer jsc.JSStringRelease(k);
+    _ = jsc.JSObjectSetProperty(ctx, obj, k, jsc.JSValueMakeNumber(ctx, value), jsc.kJSPropertyAttributeNone, null);
+}
+
+/// 在对象上设置布尔属性。
+fn setBooleanProperty(ctx: jsc.JSContextRef, obj: jsc.JSObjectRef, key: [*:0]const u8, value: bool) void {
+    const k = jsc.JSStringCreateWithUTF8CString(key);
+    defer jsc.JSStringRelease(k);
+    _ = jsc.JSObjectSetProperty(ctx, obj, k, jsc.JSValueMakeBoolean(ctx, value), jsc.kJSPropertyAttributeNone, null);
+}
+
+/// 在对象上设置对象属性。
+fn setObjectProperty(ctx: jsc.JSContextRef, obj: jsc.JSObjectRef, key: [*:0]const u8, value: jsc.JSObjectRef) void {
+    const k = jsc.JSStringCreateWithUTF8CString(key);
+    defer jsc.JSStringRelease(k);
+    _ = jsc.JSObjectSetProperty(ctx, obj, k, @ptrCast(value), jsc.kJSPropertyAttributeNone, null);
+}
+
+/// 构建 Node 风格诊断报告对象（可被 JSON.stringify 直接序列化）。
+fn buildReportObject(ctx: jsc.JSContextRef, allocator: std.mem.Allocator) jsc.JSObjectRef {
+    const report_obj = jsc.JSObjectMake(ctx, null, null);
+    const header_obj = jsc.JSObjectMake(ctx, null, null);
+    const permissions_obj = jsc.JSObjectMake(ctx, null, null);
+    const js_stack_obj = jsc.JSObjectMake(ctx, null, null);
+    const env_obj = jsc.JSObjectMake(ctx, null, null);
+    const empty_arr = jsc.JSObjectMakeArray(ctx, 0, undefined, null);
+
+    setNumberProperty(ctx, header_obj, "reportVersion", 1);
+    setStringProperty(ctx, allocator, header_obj, "event", "JavaScript API");
+    setStringProperty(ctx, allocator, header_obj, "trigger", "GetReport");
+    setNumberProperty(ctx, header_obj, "dumpEventTime", @floatFromInt(nowUnixSeconds()));
+
+    if (globals.current_run_options) |opts| {
+        // 诊断报告路径统一输出为「相对当前项目」：
+        // - cwd 固定为 "."，避免泄露绝对路径
+        // - entryPoint 尝试转为相对 cwd 的路径，失败时退回原值
+        setStringProperty(ctx, allocator, header_obj, "cwd", ".");
+
+        const entry_rel = std.fs.path.relative(allocator, "", null, opts.cwd, opts.entry_path) catch opts.entry_path;
+        defer if (entry_rel.ptr != opts.entry_path.ptr) allocator.free(entry_rel);
+        setStringProperty(ctx, allocator, header_obj, "entryPoint", entry_rel);
+
+        setBooleanProperty(ctx, permissions_obj, "allowRead", opts.permissions.allow_read);
+        setBooleanProperty(ctx, permissions_obj, "allowWrite", opts.permissions.allow_write);
+        setBooleanProperty(ctx, permissions_obj, "allowNet", opts.permissions.allow_net);
+        setBooleanProperty(ctx, permissions_obj, "allowEnv", opts.permissions.allow_env);
+        setBooleanProperty(ctx, permissions_obj, "allowRun", opts.permissions.allow_run);
+        setBooleanProperty(ctx, permissions_obj, "allowHrtime", opts.permissions.allow_hrtime);
+        setBooleanProperty(ctx, permissions_obj, "allowFfi", opts.permissions.allow_ffi);
+    } else {
+        setStringProperty(ctx, allocator, header_obj, "cwd", "");
+        setStringProperty(ctx, allocator, header_obj, "entryPoint", "");
+    }
+
+    // 当前 runtime 暂未提供完整 JS/native 栈，先输出稳定占位字段，保持对象结构可扩展。
+    setStringProperty(ctx, allocator, js_stack_obj, "message", "No JavaScript stack collected in shu runtime yet");
+    setObjectProperty(ctx, js_stack_obj, "stack", empty_arr);
+
+    setObjectProperty(ctx, report_obj, "header", header_obj);
+    setObjectProperty(ctx, report_obj, "permissions", permissions_obj);
+    setObjectProperty(ctx, report_obj, "javascriptStack", js_stack_obj);
+    setObjectProperty(ctx, report_obj, "environmentVariables", env_obj);
+    return report_obj;
+}
+
+/// [Allocates] 将 report 对象序列化为 JSON UTF-8 文本；调用方负责 free。
+fn stringifyReportObjectToUtf8(ctx: jsc.JSContextRef, allocator: std.mem.Allocator, report_obj: jsc.JSObjectRef) []const u8 {
+    const global = jsc.JSContextGetGlobalObject(ctx);
+    const k_json = jsc.JSStringCreateWithUTF8CString("JSON");
+    defer jsc.JSStringRelease(k_json);
+    const json_val = jsc.JSObjectGetProperty(ctx, global, k_json, null);
+    const json_obj = jsc.JSValueToObject(ctx, json_val, null) orelse return "";
+
+    const k_stringify = jsc.JSStringCreateWithUTF8CString("stringify");
+    defer jsc.JSStringRelease(k_stringify);
+    const stringify_val = jsc.JSObjectGetProperty(ctx, json_obj, k_stringify, null);
+    const stringify_fn = jsc.JSValueToObject(ctx, stringify_val, null) orelse return "";
+    if (!jsc.JSObjectIsFunction(ctx, stringify_fn)) return "";
+
+    const indent = jsc.JSValueMakeNumber(ctx, 2);
+    var args = [_]jsc.JSValueRef{ @ptrCast(report_obj), jsc.JSValueMakeUndefined(ctx), indent };
+    const json_text_val = jsc.JSObjectCallAsFunction(ctx, stringify_fn, json_obj, 3, &args, null);
+
+    const str_ref = jsc.JSValueToStringCopy(ctx, json_text_val, null);
+    defer jsc.JSStringRelease(str_ref);
+    const max_sz = jsc.JSStringGetMaximumUTF8CStringSize(str_ref);
+    if (max_sz == 0) return "";
+
+    const buf = allocator.alloc(u8, max_sz) catch return "";
+    const n = jsc.JSStringGetUTF8CString(str_ref, buf.ptr, max_sz);
+    if (n == 0) {
+        allocator.free(buf);
+        return "";
+    }
+    return buf[0 .. n - 1];
+}
+
+/// getReport([err])：返回报告对象（Node 风格）；err 参数当前未用于定制堆栈。
 fn getReportCallback(
     ctx: jsc.JSContextRef,
     _: jsc.JSObjectRef,
@@ -61,17 +153,11 @@ fn getReportCallback(
     _: [*]jsc.JSValueRef,
 ) callconv(.c) jsc.JSValueRef {
     const allocator = globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
-    const report = buildReportString(allocator);
-    defer if (report.len > 0) allocator.free(report);
-    if (report.len == 0) return jsc.JSValueMakeUndefined(ctx);
-    const z = allocator.dupeZ(u8, report) catch return jsc.JSValueMakeUndefined(ctx);
-    defer allocator.free(z);
-    const str_ref = jsc.JSStringCreateWithUTF8CString(z.ptr);
-    defer jsc.JSStringRelease(str_ref);
-    return jsc.JSValueMakeString(ctx, str_ref);
+    const report_obj = buildReportObject(ctx, allocator);
+    return @ptrCast(report_obj);
 }
 
-/// writeReport([filename][, err])：无 filename 时写 stdout，否则写文件；大报告（≥REPORT_MAP_THRESHOLD）走 libs_io.mapFileReadWrite 零拷贝
+/// writeReport([filename][, err])：无 filename 时写 stdout，否则写文件；输出为 JSON 文本；大文本（≥REPORT_MAP_THRESHOLD）走 mmap 零拷贝。
 fn writeReportCallback(
     ctx: jsc.JSContextRef,
     _: jsc.JSObjectRef,
@@ -81,7 +167,8 @@ fn writeReportCallback(
     _: [*]jsc.JSValueRef,
 ) callconv(.c) jsc.JSValueRef {
     const allocator = globals.current_allocator orelse return jsc.JSValueMakeUndefined(ctx);
-    const report = buildReportString(allocator);
+    const report_obj = buildReportObject(ctx, allocator);
+    const report = stringifyReportObjectToUtf8(ctx, allocator, report_obj);
     defer if (report.len > 0) allocator.free(report);
     if (report.len == 0) return jsc.JSValueMakeUndefined(ctx);
     if (argumentCount >= 1 and !jsc.JSValueIsUndefined(ctx, arguments[0])) {
