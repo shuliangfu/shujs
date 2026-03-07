@@ -118,7 +118,11 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (std.mem.eql(u8, subcommand, "test")) {
-        try cli_test.runTest(allocator, parse_result.parsed, parse_result.positional, io);
+        // 测试失败属于业务结果，不应打印 Zig 错误栈；仅返回非 0 退出码。
+        cli_test.runTest(allocator, parse_result.parsed, parse_result.positional, io) catch |e| {
+            if (e == error.ScriptExitedNonZero) std.process.exit(1);
+            return e;
+        };
         return;
     }
     if (std.mem.eql(u8, subcommand, "check")) {
