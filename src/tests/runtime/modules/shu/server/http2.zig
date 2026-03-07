@@ -1,7 +1,7 @@
-// http2 单元测试：帧头解析、帧缓冲解析、帧组装（从 server/http2.zig 迁入）
-// 被测模块：src/runtime/modules/shu/server/http2.zig（入口在 src/ 故可直接路径导入）
+// http2 单元测试：帧头解析、帧缓冲解析、帧组装
+// 被测模块：src/libs/http/http2.zig（通过 build 的 http2 模块导入）
 const std = @import("std");
-const http2 = @import("../../../../../runtime/modules/shu/server/http2.zig");
+const http2 = @import("http2");
 
 test "parseFrameHeader: 9 字节帧头" {
     var buf: [9]u8 = undefined;
