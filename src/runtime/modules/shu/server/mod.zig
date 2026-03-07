@@ -16,7 +16,7 @@ const gzip_mod = shu_zlib;
 const build_options = @import("build_options");
 const tls = @import("tls");
 const ws_mod = @import("websocket.zig");
-const http2 = @import("http2.zig");
+const http2 = @import("http2");
 const iocp = @import("iocp.zig");
 const builtin = @import("builtin");
 // 按功能拆分子模块：类型与解析/响应由 types / parse / response 提供，mod 只做协调
