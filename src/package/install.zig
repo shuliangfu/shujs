@@ -145,7 +145,7 @@ fn npmResolveWorker(ctx: *const NpmResolveWorkerCtx) void {
             ctx.results[i] = .{ .err = e };
             if (ctx.result_ready) |ready| ready[i].store(true, .release);
             if (ctx.resolving_progress) |p| {
-                _ = p.count.fetchAdd(1, .monotonic);
+            _ = p.count.fetchAdd(1, .monotonic);
                 p.name_mutex.lock(io) catch {};
                 const name_slice = item.display_name orelse item.name;
                 const copy_len = @min(name_slice.len, 63);
@@ -243,19 +243,19 @@ fn jsrInstallWorker(ctx: *const JsrInstallWorkerCtx) void {
             var link_target_buf: [libs_io.max_path_bytes]u8 = undefined;
             const link_target = libs_io.realpath(hit_dir, &link_target_buf) catch hit_dir;
             libs_io.symLinkAbsolute(link_target, task.pkg_dest, .{}) catch |e| {
-                ctx.results[i] = e;
+                    ctx.results[i] = e;
                 setFirstErrorJsr(ctx, e, task.name, task.version);
             };
-            if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
+                    if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
             if (ctx.last_completed_name) |ln| setLastCompletedName(ln, task.name);
-            continue;
+                    continue;
         }
         const turl = ctx.resolved_tarball_urls.get(task.name) orelse {
             ctx.results[i] = error.JsrTarballUrlMissing;
             setFirstErrorJsr(ctx, error.JsrTarballUrlMissing, task.name, task.version);
-            if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
-            continue;
-        };
+                    if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
+                    continue;
+                };
         var download_ok = false;
         var last_dl_err: anyerror = undefined;
         for (0..INSTALL_NETWORK_RETRIES) |ri| {
@@ -275,12 +275,12 @@ fn jsrInstallWorker(ctx: *const JsrInstallWorkerCtx) void {
             continue;
         }
         const cache_dir_path = cache.getCachedPackageDirPath(a, ctx.cache_root, key) catch |e| {
-            ctx.results[i] = e;
+                ctx.results[i] = e;
             libs_io.deleteFileAbsolute(temp_tgz) catch {};
             setFirstErrorJsr(ctx, e, task.name, task.version);
-            if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
-            continue;
-        };
+                if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
+                continue;
+            };
         if (libs_io.pathDirname(cache_dir_path)) |parent| libs_io.makePathAbsolute(parent) catch {};
         libs_io.makeDirAbsolute(cache_dir_path) catch |e| {
             if (e == error.PathAlreadyExists) {
@@ -295,11 +295,11 @@ fn jsrInstallWorker(ctx: *const JsrInstallWorkerCtx) void {
                             setFirstErrorJsr(ctx, sym_err, task.name, task.version);
                         };
                         if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
-                        if (ctx.last_completed_name) |ln| setLastCompletedName(ln, task.name);
+            if (ctx.last_completed_name) |ln| setLastCompletedName(ln, task.name);
                         break;
                     }
                     std.Io.sleep(io, std.Io.Duration.fromNanoseconds(100_000_000), .awake) catch {};
-                } else {
+        } else {
                     ctx.results[i] = error.CacheDirBusy;
                     setFirstErrorJsr(ctx, error.CacheDirBusy, task.name, task.version);
                 }
@@ -321,14 +321,14 @@ fn jsrInstallWorker(ctx: *const JsrInstallWorkerCtx) void {
         libs_io.deleteFileAbsolute(temp_tgz) catch {};
         if (libs_io.pathDirname(task.pkg_dest)) |parent_dest| libs_io.makePathAbsolute(parent_dest) catch {};
         libs_io.deleteFileAbsolute(task.pkg_dest) catch |err| if (err == error.IsDir) libs_io.deleteTreeAbsolute(a, task.pkg_dest) catch {};
-        var link_target_buf: [libs_io.max_path_bytes]u8 = undefined;
+                    var link_target_buf: [libs_io.max_path_bytes]u8 = undefined;
         const link_target = libs_io.realpath(cache_dir_path, &link_target_buf) catch cache_dir_path;
-        libs_io.symLinkAbsolute(link_target, task.pkg_dest, .{}) catch |e| {
-            ctx.results[i] = e;
+                    libs_io.symLinkAbsolute(link_target, task.pkg_dest, .{}) catch |e| {
+                        ctx.results[i] = e;
             setFirstErrorJsr(ctx, e, task.name, task.version);
-        };
-        if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
-        if (ctx.last_completed_name) |ln| setLastCompletedName(ln, task.name);
+                    };
+            if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
+            if (ctx.last_completed_name) |ln| setLastCompletedName(ln, task.name);
     }
 }
 
@@ -397,28 +397,28 @@ fn npmInstallWorker(ctx: *const NpmInstallWorkerCtx) void {
         };
         var invalid_gzip_retries: u32 = 0;
         retry_extract: while (invalid_gzip_retries < 2) : (invalid_gzip_retries += 1) {
-            if (cache.getCachedPackageDir(a, ctx.cache_root, key)) |hit_dir| {
-                if (libs_io.pathDirname(task.pkg_dest)) |parent| libs_io.makePathAbsolute(parent) catch {};
-                var link_target_buf: [libs_io.max_path_bytes]u8 = undefined;
-                const link_target = libs_io.realpath(hit_dir, &link_target_buf) catch hit_dir;
-                libs_io.symLinkAbsolute(link_target, task.pkg_dest, .{}) catch |e| {
-                    ctx.results[i] = e;
-                    setFirstError(ctx, e, task.name, task.version);
-                };
-                if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
-                if (ctx.last_completed_name) |ln| setLastCompletedName(ln, task.name);
-                break :retry_extract;
-            }
-            const turl_opt = ctx.resolved_tarball_urls.get(task.name);
-            const turl = turl_opt orelse blk: {
-                const u = registry.buildTarballUrl(a, task.registry_url, task.name, task.version) catch |e| {
-                    ctx.results[i] = e;
-                    setFirstError(ctx, e, task.name, task.version);
-                    if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
-                    break :retry_extract;
-                };
-                break :blk u;
+        if (cache.getCachedPackageDir(a, ctx.cache_root, key)) |hit_dir| {
+            if (libs_io.pathDirname(task.pkg_dest)) |parent| libs_io.makePathAbsolute(parent) catch {};
+            var link_target_buf: [libs_io.max_path_bytes]u8 = undefined;
+            const link_target = libs_io.realpath(hit_dir, &link_target_buf) catch hit_dir;
+            libs_io.symLinkAbsolute(link_target, task.pkg_dest, .{}) catch |e| {
+                ctx.results[i] = e;
+                setFirstError(ctx, e, task.name, task.version);
             };
+            if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
+            if (ctx.last_completed_name) |ln| setLastCompletedName(ln, task.name);
+                break :retry_extract;
+        }
+        const turl_opt = ctx.resolved_tarball_urls.get(task.name);
+        const turl = turl_opt orelse blk: {
+            const u = registry.buildTarballUrl(a, task.registry_url, task.name, task.version) catch |e| {
+                ctx.results[i] = e;
+                setFirstError(ctx, e, task.name, task.version);
+                if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
+                    break :retry_extract;
+            };
+            break :blk u;
+        };
             var download_ok = false;
             var last_dl_err: anyerror = undefined;
             for (0..INSTALL_NETWORK_RETRIES) |ri| {
@@ -438,30 +438,30 @@ fn npmInstallWorker(ctx: *const NpmInstallWorkerCtx) void {
                 break :retry_extract;
             }
             // 仅一个 worker 创建缓存目录，避免多线程同时解压到同一目录导致竞态（只写出 node_modules、无 package.json）
-            if (libs_io.pathDirname(cache_dir_path)) |parent| libs_io.makePathAbsolute(parent) catch {};
-            libs_io.makeDirAbsolute(cache_dir_path) catch |e| {
-                if (e == error.PathAlreadyExists) {
+        if (libs_io.pathDirname(cache_dir_path)) |parent| libs_io.makePathAbsolute(parent) catch {};
+        libs_io.makeDirAbsolute(cache_dir_path) catch |e| {
+            if (e == error.PathAlreadyExists) {
                     // 其他 worker 已创建或正在解压；轮询等待 package.json 出现后当作缓存命中建链
                     libs_io.deleteFileAbsolute(temp_tgz) catch {};
-                    for (0..60) |_| {
-                        if (cache.getCachedPackageDir(a, ctx.cache_root, key)) |hit_dir| {
-                            if (libs_io.pathDirname(task.pkg_dest)) |parent_dest| libs_io.makePathAbsolute(parent_dest) catch {};
-                            var link_target_buf: [libs_io.max_path_bytes]u8 = undefined;
-                            const link_target = libs_io.realpath(hit_dir, &link_target_buf) catch hit_dir;
-                            libs_io.symLinkAbsolute(link_target, task.pkg_dest, .{}) catch |sym_err| {
-                                ctx.results[i] = sym_err;
-                                setFirstError(ctx, sym_err, task.name, task.version);
-                            };
-                            if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
+                for (0..60) |_| {
+                    if (cache.getCachedPackageDir(a, ctx.cache_root, key)) |hit_dir| {
+                        if (libs_io.pathDirname(task.pkg_dest)) |parent_dest| libs_io.makePathAbsolute(parent_dest) catch {};
+                        var link_target_buf: [libs_io.max_path_bytes]u8 = undefined;
+                        const link_target = libs_io.realpath(hit_dir, &link_target_buf) catch hit_dir;
+                        libs_io.symLinkAbsolute(link_target, task.pkg_dest, .{}) catch |sym_err| {
+                            ctx.results[i] = sym_err;
+                            setFirstError(ctx, sym_err, task.name, task.version);
+                        };
+                        if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
                             break :retry_extract;
-                        }
-                        std.Io.sleep(io, std.Io.Duration.fromNanoseconds(100_000_000), .awake) catch {}; // 100ms
                     }
+                        std.Io.sleep(io, std.Io.Duration.fromNanoseconds(100_000_000), .awake) catch {}; // 100ms
+                }
                     ctx.results[i] = error.CacheDirBusy;
                     setFirstError(ctx, error.CacheDirBusy, task.name, task.version);
-                } else {
-                    ctx.results[i] = e;
-                    setFirstError(ctx, e, task.name, task.version);
+            } else {
+                ctx.results[i] = e;
+                setFirstError(ctx, e, task.name, task.version);
                 }
                 break :retry_extract;
             };
@@ -469,24 +469,24 @@ fn npmInstallWorker(ctx: *const NpmInstallWorkerCtx) void {
                 logFirstTarballExtractFailure(ctx, temp_tgz, e, task.name, task.version);
                 debugLogTarballExtractFailed(temp_tgz, e);
                 libs_io.deleteFileAbsolute(temp_tgz) catch {};
-                libs_io.deleteTreeAbsolute(a, cache_dir_path) catch {};
+            libs_io.deleteTreeAbsolute(a, cache_dir_path) catch {};
                 if (e == error.InvalidGzip and invalid_gzip_retries < 1) {
                     continue :retry_extract;
                 }
                 ctx.results[i] = e;
                 setFirstError(ctx, if (e == error.ReadFailed) error.TarballExtractFailed else e, task.name, task.version);
-                if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
-                if (ctx.last_completed_name) |ln| setLastCompletedName(ln, task.name);
+            if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
+            if (ctx.last_completed_name) |ln| setLastCompletedName(ln, task.name);
                 break :retry_extract;
             };
             libs_io.deleteFileAbsolute(temp_tgz) catch {};
             // 解压后必须存在 package.json，否则视为失败、不建链
-            const pkg_json_path = libs_io.pathJoin(a, &.{ cache_dir_path, "package.json" }) catch |e| {
-                ctx.results[i] = e;
-                setFirstError(ctx, e, task.name, task.version);
+        const pkg_json_path = libs_io.pathJoin(a, &.{ cache_dir_path, "package.json" }) catch |e| {
+            ctx.results[i] = e;
+            setFirstError(ctx, e, task.name, task.version);
                 break :retry_extract;
-            };
-            libs_io.accessAbsolute(pkg_json_path, .{}) catch {
+        };
+        libs_io.accessAbsolute(pkg_json_path, .{}) catch {
                 // 解压未抛错但 package.json 不存在：打日志并列出解压出的前几项，便于判断是 tar 结构不符（无 package/）还是空解压
                 logInstallFailure("[shu install] extract ok but package.json missing: {s}@{s} dir={s}\n", .{ task.name, task.version, cache_dir_path });
                 var dir_opt = libs_io.openDirAbsolute(cache_dir_path, .{ .iterate = true }) catch null;
@@ -505,22 +505,22 @@ fn npmInstallWorker(ctx: *const NpmInstallWorkerCtx) void {
                     }
                     if (n == 0) logInstallFailure("  (no entries)\n", .{});
                 } else logInstallFailure("  (could not list dir)\n", .{});
-                libs_io.deleteTreeAbsolute(a, cache_dir_path) catch {};
-                ctx.results[i] = error.TarballExtractFailed;
-                setFirstError(ctx, error.TarballExtractFailed, task.name, task.version);
-                if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
+            libs_io.deleteTreeAbsolute(a, cache_dir_path) catch {};
+            ctx.results[i] = error.TarballExtractFailed;
+            setFirstError(ctx, error.TarballExtractFailed, task.name, task.version);
+            if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
                 if (ctx.last_completed_name) |ln| setLastCompletedName(ln, task.name);
                 break :retry_extract;
-            };
-            if (libs_io.pathDirname(task.pkg_dest)) |parent_dest| libs_io.makePathAbsolute(parent_dest) catch {};
-            var link_target_buf: [libs_io.max_path_bytes]u8 = undefined;
-            const link_target = libs_io.realpath(cache_dir_path, &link_target_buf) catch cache_dir_path;
-            libs_io.symLinkAbsolute(link_target, task.pkg_dest, .{}) catch |e| {
-                ctx.results[i] = e;
-                setFirstError(ctx, e, task.name, task.version);
-            };
-            if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
-            if (ctx.last_completed_name) |ln| setLastCompletedName(ln, task.name);
+        };
+        if (libs_io.pathDirname(task.pkg_dest)) |parent_dest| libs_io.makePathAbsolute(parent_dest) catch {};
+        var link_target_buf: [libs_io.max_path_bytes]u8 = undefined;
+        const link_target = libs_io.realpath(cache_dir_path, &link_target_buf) catch cache_dir_path;
+        libs_io.symLinkAbsolute(link_target, task.pkg_dest, .{}) catch |e| {
+            ctx.results[i] = e;
+            setFirstError(ctx, e, task.name, task.version);
+        };
+        if (ctx.install_completed_count) |c| _ = c.fetchAdd(1, .monotonic);
+        if (ctx.last_completed_name) |ln| setLastCompletedName(ln, task.name);
             break :retry_extract;
         }
     }
