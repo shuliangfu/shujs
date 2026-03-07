@@ -318,6 +318,111 @@ pub fn makeRequire(ctx: jsc.JSContextRef, allocator: std.mem.Allocator, parent_d
     return fn_ref;
 }
 
+/// 从异常对象读取 .stack 属性并写入 out_buf，返回写入长度；无 stack 或非字符串则返回 0。调用方保证 out_buf 足够大。
+fn copyErrorStackToBuffer(ctx: jsc.JSContextRef, obj: jsc.JSObjectRef, out_buf: []u8) usize {
+    const k_stack = jsc.JSStringCreateWithUTF8CString("stack");
+    defer jsc.JSStringRelease(k_stack);
+    const stack_val = jsc.JSObjectGetProperty(ctx, obj, k_stack, null);
+    if (jsc.JSValueIsUndefined(ctx, stack_val) or jsc.JSValueIsNull(ctx, stack_val) or !jsc.JSValueIsString(ctx, stack_val)) return 0;
+    const str_ref = jsc.JSValueToStringCopy(ctx, stack_val, null);
+    defer jsc.JSStringRelease(str_ref);
+    const n = jsc.JSStringGetUTF8CString(str_ref, out_buf.ptr, out_buf.len);
+    if (n == 0 or n > out_buf.len) return 0;
+    return n - 1; // 不含末尾 \0
+}
+
+/// 从异常对象读取 lineNumber（或 line）、sourceURL（或 fileName），用于无有效 stack 时拼一行位置。返回是否成功写出到 out（格式 " at (file:line)" 或 " at (file)"）。
+fn copyErrorLocationToBuffer(ctx: jsc.JSContextRef, obj: jsc.JSObjectRef, entry_path: []const u8, out_buf: []u8) usize {
+    var line: i64 = -1;
+    var file: []const u8 = entry_path;
+    var file_buf: [1024]u8 = undefined;
+    const k_line = jsc.JSStringCreateWithUTF8CString("line");
+    defer jsc.JSStringRelease(k_line);
+    const k_lineNumber = jsc.JSStringCreateWithUTF8CString("lineNumber");
+    defer jsc.JSStringRelease(k_lineNumber);
+    const k_sourceURL = jsc.JSStringCreateWithUTF8CString("sourceURL");
+    defer jsc.JSStringRelease(k_sourceURL);
+    const k_fileName = jsc.JSStringCreateWithUTF8CString("fileName");
+    defer jsc.JSStringRelease(k_fileName);
+    const line_val = jsc.JSObjectGetProperty(ctx, obj, k_lineNumber, null);
+    if (jsc.JSValueIsUndefined(ctx, line_val) or jsc.JSValueIsNull(ctx, line_val)) {
+        const line_alt = jsc.JSObjectGetProperty(ctx, obj, k_line, null);
+        if (!jsc.JSValueIsUndefined(ctx, line_alt) and !jsc.JSValueIsNull(ctx, line_alt)) {
+            line = @intFromFloat(jsc.JSValueToNumber(ctx, line_alt, null));
+        }
+    } else {
+        line = @intFromFloat(jsc.JSValueToNumber(ctx, line_val, null));
+    }
+    const url_val = jsc.JSObjectGetProperty(ctx, obj, k_sourceURL, null);
+    if (!jsc.JSValueIsUndefined(ctx, url_val) and !jsc.JSValueIsNull(ctx, url_val) and jsc.JSValueIsString(ctx, url_val)) {
+        const str_ref = jsc.JSValueToStringCopy(ctx, url_val, null);
+        defer jsc.JSStringRelease(str_ref);
+        const n = jsc.JSStringGetUTF8CString(str_ref, &file_buf, file_buf.len);
+        if (n > 0 and n <= file_buf.len) {
+            file = file_buf[0 .. n - 1];
+        }
+    } else {
+        const fn_val = jsc.JSObjectGetProperty(ctx, obj, k_fileName, null);
+        if (!jsc.JSValueIsUndefined(ctx, fn_val) and !jsc.JSValueIsNull(ctx, fn_val) and jsc.JSValueIsString(ctx, fn_val)) {
+            const str_ref = jsc.JSValueToStringCopy(ctx, fn_val, null);
+            defer jsc.JSStringRelease(str_ref);
+            const n = jsc.JSStringGetUTF8CString(str_ref, &file_buf, file_buf.len);
+            if (n > 0 and n <= file_buf.len) {
+                file = file_buf[0 .. n - 1];
+            }
+        }
+    }
+    if (line >= 0) {
+        return (std.fmt.bufPrint(out_buf, "    at ({s}:{d})", .{ file, line }) catch return 0).len;
+    }
+    return (std.fmt.bufPrint(out_buf, "    at ({s})", .{file}) catch return 0).len;
+}
+
+/// 从 JSC 异常对象提取 message、stack、location，交给 errors 统一格式化并写 stderr；不抛 Zig 错误，调用方仍可继续执行 runMicrotasks。
+fn reportScriptExceptionToStderr(ctx: jsc.JSContextRef, module_id: []const u8, exc_val: jsc.JSValueRef) void {
+    var buf: [1024]u8 = undefined;
+    var stack_buf: [4096]u8 = undefined;
+    var loc_buf: [512]u8 = undefined;
+    var msg: []const u8 = "Script threw (unable to get message)";
+    var stack_slice: ?[]const u8 = null;
+    var location_slice: ?[]const u8 = null;
+    if (jsc.JSValueToObject(ctx, exc_val, null)) |obj| {
+        const k_message = jsc.JSStringCreateWithUTF8CString("message");
+        defer jsc.JSStringRelease(k_message);
+        const msg_val = jsc.JSObjectGetProperty(ctx, obj, k_message, null);
+        if (!jsc.JSValueIsUndefined(ctx, msg_val) and !jsc.JSValueIsNull(ctx, msg_val)) {
+            const str_ref = jsc.JSValueToStringCopy(ctx, msg_val, null);
+            defer jsc.JSStringRelease(str_ref);
+            const n = jsc.JSStringGetUTF8CString(str_ref, &buf, buf.len);
+            if (n > 0 and n <= buf.len) {
+                msg = buf[0 .. n - 1];
+            }
+        }
+        const stack_len = copyErrorStackToBuffer(ctx, obj, stack_buf[0..]);
+        if (stack_len > 0) {
+            stack_slice = stack_buf[0..stack_len];
+        }
+        const loc_len = copyErrorLocationToBuffer(ctx, obj, module_id, loc_buf[0..]);
+        if (loc_len > 0) {
+            location_slice = loc_buf[0..loc_len];
+        }
+    }
+    if (stack_slice == null or stack_slice.?.len == 0) {
+        const str_ref = jsc.JSValueToStringCopy(ctx, exc_val, null);
+        defer jsc.JSStringRelease(str_ref);
+        const n = jsc.JSStringGetUTF8CString(str_ref, &buf, buf.len);
+        if (n > 0 and n <= buf.len) {
+            msg = buf[0 .. n - 1];
+        }
+    }
+    errors.reportScriptExceptionToStderr(.{
+        .file_path = module_id,
+        .message = msg,
+        .stack = stack_slice,
+        .location = location_slice,
+    }) catch {};
+}
+
 /// 包装源码并执行，返回 module.exports（仅 CJS；ESM import/export 由单独模块实现）
 fn runModuleWithSource(
     ctx: jsc.JSContextRef,
@@ -366,7 +471,14 @@ fn runModuleWithSource(
         jsc.JSValueMakeString(ctx, filename_js),
         jsc.JSValueMakeString(ctx, dirname_js),
     };
-    _ = jsc.JSObjectCallAsFunction(ctx, fn_obj, null, 5, &args, null);
+    var exception_sentinel: u8 = 0;
+    const no_exc: jsc.JSValueRef = @ptrCast(&exception_sentinel);
+    var exception_slot: [1]jsc.JSValueRef = .{no_exc};
+    _ = jsc.JSObjectCallAsFunction(ctx, fn_obj, null, 5, &args, exception_slot[0..].ptr);
+    // 若脚本执行中抛错（如 require("shu:server") 抛错），捕获并打印到 stderr，然后正常返回，以便引擎仍执行 runMicrotasks()、测试 run() 能跑完并输出 0 用例或汇总，而不是直接退出。
+    if (exception_slot[0] != no_exc and !jsc.JSValueIsUndefined(ctx, exception_slot[0]) and !jsc.JSValueIsNull(ctx, exception_slot[0])) {
+        reportScriptExceptionToStderr(ctx, module_id, exception_slot[0]);
+    }
     const exports_val = jsc.JSObjectGetProperty(ctx, module_obj, k_exports, null);
     return exports_val;
 }
