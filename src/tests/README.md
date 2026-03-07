@@ -32,7 +32,7 @@
   `addImport("xxx", xxx_module)`。
 
 当前已迁入的
-tests：`transpiler/strip_types`、`transpiler/jsx`、`runtime/modules/shu/server/http2`、`runtime/modules/shu/server/websocket`
+tests：`transpiler/strip_types`、`transpiler/jsx`、`runtime/modules/shu/server/http2`（测 libs/http/http2.zig）、`runtime/modules/shu/server/websocket`
 等。统一用 `zig build test` 运行。
 
 ## 如何看到测试结果输出？
